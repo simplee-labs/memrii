@@ -10,7 +10,8 @@ or shared with connected services.
 
 [memrii.me](https://memrii.me) · **App source:** `0.2.4+15` · **Firmware source:** `memrii-fw-3.2.0`
 
-Prebuilt downloads are not currently published in this repository. See [Building](#building).
+Download the signed Android APK from [Releases](https://github.com/simplee-labs/memrii/releases/latest). Firmware updates
+are published separately. To build it yourself, see [Building](#building).
 
 ---
 
