@@ -1,0 +1,112 @@
+package me.memrii.app
+
+import android.companion.AssociationInfo
+import android.companion.CompanionDeviceManager
+import android.companion.CompanionDeviceService
+import android.companion.DevicePresenceEvent
+import android.content.Context
+import android.os.Build
+import android.util.Log
+import androidx.core.content.ContextCompat
+import java.util.Locale
+
+/**
+ * CompanionDeviceService that receives device appear/disappear events from the OS,
+ * even when the app is not running.
+ *
+ * Maintains the GATT connection whenever the device is nearby so that when the
+ * Flutter engine wakes up (from the background sync timer or the user opening the
+ * app) it finds the device already connected and can start syncing immediately.
+ */
+class BleCompanionService : CompanionDeviceService() {
+
+    companion object {
+        private const val TAG = "OmiBle.CompanionSvc"
+    }
+
+    private fun hasBluetoothPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else true
+    }
+
+    private fun handleDeviceAppeared(address: String) {
+        Log.i(TAG, "Device appeared: $address")
+
+        if (!hasBluetoothPermission()) return
+
+        val prefs = applicationContext.getSharedPreferences("ble_config", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("user_disconnected", false)) return
+
+        val saved = prefs.getString("managed_device", null)
+        val requiresBond = if (saved != null) {
+            val parts = saved.split("|")
+            parts.size == 2 && parts[0].equals(address, ignoreCase = true) && parts[1].toBoolean()
+        } else false
+
+        OmiBleForegroundService.startService(
+            applicationContext, address,
+            requiresBond = requiresBond,
+            caller = "CompanionSvc.deviceAppeared"
+        )
+    }
+
+    private fun handleDeviceDisappeared() {
+        Log.i(TAG, "Device disappeared")
+    }
+
+    private fun findAssociation(assocId: Int): AssociationInfo? {
+        val cdm = getSystemService("companiondevice") as? CompanionDeviceManager ?: return null
+        return cdm.myAssociations.find { it.id == assocId }
+    }
+
+    // ---- Lifecycle ----
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.i(TAG, "onCreate")
+
+        if (!hasBluetoothPermission()) return
+
+        val prefs = applicationContext.getSharedPreferences("ble_config", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("user_disconnected", false)) return
+
+        val saved = prefs.getString("managed_device", null) ?: return
+        val parts = saved.split("|")
+        if (parts.size != 2) return
+
+        OmiBleForegroundService.startService(
+            applicationContext, parts[0],
+            requiresBond = parts[1].toBoolean(),
+            caller = "CompanionSvc.onCreateFallback"
+        )
+    }
+
+    // ---- API 31-35: String-based callbacks ----
+
+    override fun onDeviceAppeared(address: String) {
+        super.onDeviceAppeared(address)
+        if (Build.VERSION.SDK_INT < 36) handleDeviceAppeared(address)
+    }
+
+    override fun onDeviceDisappeared(address: String) {
+        super.onDeviceDisappeared(address)
+        if (Build.VERSION.SDK_INT < 36) handleDeviceDisappeared()
+    }
+
+    // ---- API 36+: Object-based event ----
+
+    override fun onDevicePresenceEvent(event: DevicePresenceEvent) {
+        val association = findAssociation(event.associationId)
+        val address = association?.deviceMacAddress?.toString()?.uppercase(Locale.ROOT)
+        when (event.event) {
+            DevicePresenceEvent.EVENT_BLE_APPEARED -> {
+                if (address != null) handleDeviceAppeared(address)
+            }
+            DevicePresenceEvent.EVENT_BLE_DISAPPEARED -> {
+                handleDeviceDisappeared()
+            }
+        }
+        super.onDevicePresenceEvent(event)
+    }
+}

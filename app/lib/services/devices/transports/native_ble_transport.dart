@@ -1,0 +1,546 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart';
+import 'package:omi/gen/pigeon_communicator.g.dart';
+import 'package:omi/services/bridges/ble_bridge.dart';
+import 'package:omi/utils/logger.dart';
+import 'device_transport.dart';
+
+/// The waiting caller's subscription no longer applies: an explicit unsubscribe replaced its
+/// intent, or the link it was issued on is gone and a newer connection generation owns
+/// recovery. Neither is evidence against the current link, so a restore must not act on it.
+class _NotificationSubscriptionSuperseded extends StateError {
+  _NotificationSubscriptionSuperseded() : super('Notification subscription superseded');
+}
+
+/// The `details` of a subscription failure native caused by tearing the link down itself
+/// (OmiBleManager.failPendingSubscriptions / LINK_CLOSED_BY_NATIVE). Native owns that
+/// reconnect, and its disconnect event is queued right behind the failure.
+const _linkClosedByNative = 'link-closed';
+
+/// BLE transport backed by native platform APIs via Pigeon.
+/// Uses the intent-based manageDevice/unmanageDevice API.
+/// Native owns the connection lifecycle (retry, reconnect, bonding).
+/// This transport is long-lived
+class NativeBleTransport extends DeviceTransport {
+  final String _peripheralUuid;
+  final bool requiresBond;
+  final BleHostApi _hostApi = BleHostApi();
+
+  // Bounds a single native GATT read/write. A with-response write on a half-dead
+  // link (firmware app wedged, but the BLE link is still up so Android never
+  // fires a disconnect) never gets its onCharacteristicWrite/Read callback, so
+  // the Pigeon future would otherwise park forever — wedging the WAL sync's read
+  // `finally` (stopStorageSync), which strands the whole sync and freezes the
+  // "Syncing recordings…" foreground notification. Healthy ops finish sub-second;
+  // this only trips on a dead peer, surfacing it as a thrown error so the sync
+  // unwinds into processing instead of hanging.
+  static const Duration _gattOpTimeout = Duration(seconds: 10);
+
+  /// Backstop only when native reports nothing. Native owns retries and normally errors the ready completer
+  /// through onPeripheralDisconnected or retry_exhausted.
+  ///
+  /// The Dart timeout must exceed native's full connect-plus-discovery budget: AUTO_CONNECT_TIMEOUT_MS is 45 s,
+  /// followed by DISCOVERY_TIMEOUT_MS of 15 s. A 75 s backstop leaves margin. A shorter deadline can classify a
+  /// late connection as unsolicited while native is still completing the request.
+  ///
+  /// _handleConnectionState filters 133 and -1 during retries; retry_exhausted is required to finish attempts
+  /// made entirely of those statuses without waiting for this timer.
+  static const Duration _kConnectBackstop = Duration(seconds: 75);
+  final StreamController<DeviceTransportState> _connectionStateController =
+      StreamController<DeviceTransportState>.broadcast();
+
+  /// Characteristic notification streams, keyed by "serviceUuid:charUuid" (lowercased).
+  final Map<String, StreamController<List<int>>> _streamControllers = {};
+  final Map<String, Future<void>> _notificationSubscriptions = {};
+  final Map<String, int> _notificationRevisions = {};
+  final Set<String> _confirmedNotificationKeys = {};
+  int _notificationGeneration = 0;
+
+  /// Discovered services from native.
+  List<BleService> _services = [];
+
+  Completer<List<BleService>>? _deviceReadyCompleter;
+
+  DeviceTransportState _state = DeviceTransportState.disconnected;
+  DateTime? _lastConnectedAt;
+
+  NativeBleTransport(this._peripheralUuid, {this.requiresBond = false}) {
+    BleBridge.instance.registerPeripheral(
+      peripheralUuid: _peripheralUuid,
+      onConnectionState: _handleConnectionState,
+      onDeviceReady: _handleDeviceReady,
+      onCharacteristicValue: _handleCharacteristicValue,
+    );
+  }
+
+  @override
+  String get deviceId => _peripheralUuid;
+
+  @override
+  Stream<DeviceTransportState> get connectionStateStream => _connectionStateController.stream;
+
+  // MARK: - Connection
+
+  @override
+  Future<void> connect({bool requiresBond = false}) async {
+    if (_state == DeviceTransportState.connected) return;
+    if (_state == DeviceTransportState.connecting && _deviceReadyCompleter != null) {
+      Logger.debug('[NativeBleTransport] $_peripheralUuid: already connecting, joining existing attempt');
+      try {
+        await _deviceReadyCompleter!.future;
+      } catch (_) {}
+      return;
+    }
+
+    Logger.debug('[NativeBleTransport] $_peripheralUuid: starting fresh connect (requiresBond=$requiresBond)');
+    _updateState(DeviceTransportState.connecting);
+
+    _deviceReadyCompleter = Completer<List<BleService>>();
+    // Add a catchError to the future to prevent unhandled exceptions if the completer
+    // is failed before someone is actively awaiting it (or if multiple people await it).
+    _deviceReadyCompleter!.future.catchError((_) => <BleService>[]);
+
+    try {
+      await _hostApi.manageDevice(_peripheralUuid, requiresBond);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] $_peripheralUuid: manageDevice failed: $e');
+      final completer = _deviceReadyCompleter;
+      _deviceReadyCompleter = null;
+      if (completer != null && !completer.isCompleted) {
+        completer.completeError(e);
+      }
+      _updateState(DeviceTransportState.disconnected);
+      if (e.toString().contains('bluetooth_off')) {
+        rethrow;
+      }
+      await Future.delayed(const Duration(seconds: 2));
+      rethrow;
+    }
+
+    Logger.debug(
+      '[NativeBleTransport] $_peripheralUuid: manageDevice sent, waiting for device-ready '
+      '(${_kConnectBackstop.inSeconds}s backstop)',
+    );
+    final t0 = DateTime.now();
+    try {
+      _services = await _deviceReadyCompleter!.future.timeout(
+        _kConnectBackstop,
+        onTimeout: () => throw TimeoutException('Device ready timeout after ${_kConnectBackstop.inSeconds}s'),
+      );
+      _deviceReadyCompleter = null;
+      final ms = DateTime.now().difference(t0).inMilliseconds;
+      Logger.debug('[NativeBleTransport] $_peripheralUuid: device ready after ${ms}ms (${_services.length} services)');
+      _updateState(DeviceTransportState.connected);
+    } catch (e) {
+      final ms = DateTime.now().difference(t0).inMilliseconds;
+      Logger.debug('[NativeBleTransport] $_peripheralUuid: connect failed after ${ms}ms: $e');
+      final completer = _deviceReadyCompleter;
+      _deviceReadyCompleter = null;
+      if (completer != null && !completer.isCompleted) {
+        completer.completeError(e);
+      }
+      _updateState(DeviceTransportState.disconnected);
+      if (e.toString().contains('bluetooth_off')) {
+        rethrow;
+      }
+      await Future.delayed(const Duration(seconds: 2));
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> disconnect() async {
+    // Explicit teardown also cancels reconnect intent while already disconnected.
+    _activeSubscriptionKeys.clear();
+    _updateState(DeviceTransportState.disconnecting);
+
+    // Unsubscribe all active streams
+    for (final key in _streamControllers.keys.toList()) {
+      final parts = key.split(':');
+      if (parts.length == 2) {
+        try {
+          await _hostApi.unsubscribeCharacteristic(_peripheralUuid, parts[0], parts[1]);
+        } catch (_) {}
+      }
+    }
+
+    _closeAllStreams();
+    _services = [];
+
+    // Fail any pending completers
+    if (_deviceReadyCompleter != null && !_deviceReadyCompleter!.isCompleted) {
+      _deviceReadyCompleter!.completeError(Exception('Disconnected'));
+      _deviceReadyCompleter = null;
+    }
+
+    try {
+      await _hostApi.unmanageDevice(_peripheralUuid);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] unmanageDevice failed: $e');
+    }
+
+    _updateState(DeviceTransportState.disconnected);
+  }
+
+  @override
+  Future<void> softDisconnect() async {
+    // Drop just the current GATT/link WITHOUT unmanaging the device (unlike
+    // disconnect(), which calls unmanageDevice → USER_DISCONNECTED, cancels native
+    // recovery, and can stop the foreground service). Android: gatt.disconnect() —
+    // the device stays managed, so native tears down the stale gatt (disconnect +
+    // refresh + close) and rebuilds a fresh one on its own. iOS: cancelPeripheral-
+    // Connection — marks it manually-disconnected, so the caller MUST follow with an
+    // explicit reconnect (which clears that flag). The native disconnect callback
+    // drives our state to disconnected.
+    if (_state == DeviceTransportState.disconnected) return;
+    try {
+      await _hostApi.disconnectPeripheral(_peripheralUuid);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] softDisconnect failed: $e');
+    }
+  }
+
+  @override
+  Future<bool> isConnected() async {
+    try {
+      final nativeConnected = await _hostApi.isPeripheralConnected(_peripheralUuid);
+      final bool isStablyConnected =
+          _lastConnectedAt != null && DateTime.now().difference(_lastConnectedAt!).inSeconds > 5;
+
+      if (!nativeConnected && _state == DeviceTransportState.connected && isStablyConnected) {
+        Logger.warning(
+            '[NativeBleTransport] State mismatch detected! Native OS is disconnected but Dart is connected. Forcing cleanup.');
+        // Don't call disconnect() directly as it might interfere with callers waiting on states.
+        // Just trigger the same cleanup path a native disconnection would.
+        _handleConnectionState(false, 'native_state_mismatch');
+        // Also force the native side to drop the stuck GATT object so it can reconnect.
+        try {
+          await _hostApi.disconnectPeripheral(_peripheralUuid);
+        } catch (_) {}
+      }
+      return nativeConnected;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> ping() async {
+    return isConnected();
+  }
+
+  @override
+  Future<bool> requestBond() async {
+    try {
+      return await _hostApi.requestBond(_peripheralUuid);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] requestBond failed: $e');
+      return false;
+    }
+  }
+
+  // MARK: - Characteristic Streams
+
+  @override
+  Future<Stream<List<int>>> getCharacteristicStream(String serviceUuid, String characteristicUuid) async {
+    final key = '${serviceUuid.toLowerCase()}:${characteristicUuid.toLowerCase()}';
+    if (_state != DeviceTransportState.connected || !_hasCharacteristic(serviceUuid, characteristicUuid)) {
+      throw StateError('Characteristic not available: $characteristicUuid');
+    }
+    final generation = _notificationGeneration;
+    final controller = _streamControllers.putIfAbsent(key, () => StreamController<List<int>>.broadcast());
+    final revision = _notificationRevisions[key] ?? 0;
+    final pending = _notificationSubscriptions.putIfAbsent(
+      key,
+      // Native bounds both queue wait and descriptor confirmation, tearing down
+      // the GATT on expiry. Keep its actual future until it settles; a separate
+      // Dart timeout must not abandon an outstanding native subscription.
+      () => _hostApi.subscribeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid),
+    );
+    try {
+      await pending;
+      if (generation != _notificationGeneration ||
+          revision != (_notificationRevisions[key] ?? 0) ||
+          !identical(_streamControllers[key], controller)) {
+        throw _NotificationSubscriptionSuperseded();
+      }
+      if (_confirmedNotificationKeys.add(key)) {
+        Logger.debug('[NativeBleTransport] Notifications ready: $key generation=$generation');
+      }
+      return controller.stream;
+    } catch (e) {
+      if (generation != _notificationGeneration || revision != (_notificationRevisions[key] ?? 0)) {
+        throw _NotificationSubscriptionSuperseded();
+      }
+      if (identical(_notificationSubscriptions[key], pending)) {
+        _notificationSubscriptions.remove(key);
+        _confirmedNotificationKeys.remove(key);
+        if (identical(_streamControllers[key], controller) && !controller.hasListener) {
+          _streamControllers.remove(key);
+          _activeSubscriptionKeys.remove(key);
+          unawaited(controller.close());
+        }
+      }
+      Logger.warning('[NativeBleTransport] Notification setup failed: $key generation=$generation: $e');
+      rethrow;
+    }
+  }
+
+  @override
+  Future<Stream<List<int>>> refreshCharacteristicStream(String serviceUuid, String characteristicUuid) {
+    final key = '${serviceUuid.toLowerCase()}:${characteristicUuid.toLowerCase()}';
+    // Join an in-flight restore; only completed subscriptions need revalidation.
+    if (_confirmedNotificationKeys.remove(key)) _notificationSubscriptions.remove(key);
+    return getCharacteristicStream(serviceUuid, characteristicUuid);
+  }
+
+  @override
+  Future<void> unsubscribeCharacteristic(String serviceUuid, String characteristicUuid) async {
+    final key = '${serviceUuid.toLowerCase()}:${characteristicUuid.toLowerCase()}';
+    _notificationRevisions[key] = (_notificationRevisions[key] ?? 0) + 1;
+    _confirmedNotificationKeys.remove(key);
+    _notificationSubscriptions.remove(key);
+    // Drop the controller first so a later getCharacteristicStream re-creates it
+    // and re-issues the CCCD write. Closing it fires onDone on any live listener.
+    // Also forget the key so an auto-reconnect (_resubscribeAfterReconnect) doesn't
+    // resurrect a stream the caller explicitly stopped.
+    final controller = _streamControllers.remove(key);
+    _activeSubscriptionKeys.remove(key);
+    try {
+      // Await so a native failure surfaces to the caller instead of becoming an
+      // unhandled future error, and so teardown ordering (CCCD=0 before any later
+      // re-subscribe) is preserved.
+      await _hostApi.unsubscribeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] Failed to unsubscribe $serviceUuid:$characteristicUuid: $e');
+    }
+    await controller?.close();
+  }
+
+  bool _hasCharacteristic(String serviceUuid, String characteristicUuid) {
+    final sUuid = serviceUuid.toLowerCase();
+    final cUuid = characteristicUuid.toLowerCase();
+    for (final service in _services) {
+      if (service.uuid.toLowerCase() == sUuid) {
+        return service.characteristicUuids.any((c) => c.toLowerCase() == cUuid);
+      }
+    }
+    return false;
+  }
+
+  @override
+  Future<List<int>> readCharacteristic(String serviceUuid, String characteristicUuid) async {
+    if (!_hasCharacteristic(serviceUuid, characteristicUuid)) return [];
+    try {
+      final data =
+          await _hostApi.readCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid).timeout(_gattOpTimeout);
+      return data.toList();
+    } on TimeoutException catch (_) {
+      // A read that never gets its onCharacteristicRead callback is the wedged-GATT
+      // signature (link up, GATT ops dead) — NOT an empty characteristic. Surface it
+      // distinctly (still returning [] to preserve the callers' empty-on-failure
+      // contract) so a wedge isn't silently read as "device returned nothing".
+      Logger.warning('[NativeBleTransport] readCharacteristic $serviceUuid:$characteristicUuid TIMED OUT after '
+          '${_gattOpTimeout.inSeconds}s — likely a wedged GATT (returning empty)');
+      return [];
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] Failed to read $serviceUuid:$characteristicUuid: $e');
+      return [];
+    }
+  }
+
+  @override
+  Future<void> writeCharacteristic(String serviceUuid, String characteristicUuid, List<int> data) async {
+    if (!_hasCharacteristic(serviceUuid, characteristicUuid)) {
+      throw Exception('Characteristic not available: $characteristicUuid');
+    }
+    try {
+      await _hostApi
+          .writeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid, Uint8List.fromList(data))
+          .timeout(_gattOpTimeout);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] Failed to write characteristic: $e');
+      rethrow;
+    }
+  }
+
+  // MARK: - Dispose
+
+  @override
+  Future<void> dispose() async {
+    // Unregister Dart callbacks first so we don't receive stale events.
+    BleBridge.instance.unregisterPeripheral(_peripheralUuid);
+    // Tell native to release this peripheral so a subsequent manageDevice call
+    // starts a fresh connection cycle (without this, native may silently ignore
+    // a repeated manageDevice for an already-managed peripheral).
+    try {
+      await _hostApi.unmanageDevice(_peripheralUuid);
+    } catch (_) {}
+    _closeAllStreams();
+    _activeSubscriptionKeys.clear();
+    await _connectionStateController.close();
+  }
+
+  // MARK: - Private Helpers
+
+  void _updateState(DeviceTransportState newState) {
+    if (_state != newState) {
+      _state = newState;
+      if (_state == DeviceTransportState.connected) {
+        _lastConnectedAt = DateTime.now();
+      } else if (_state == DeviceTransportState.disconnected) {
+        _lastConnectedAt = null;
+      }
+      _connectionStateController.add(_state);
+    }
+  }
+
+  void _closeAllStreams() {
+    _notificationGeneration++;
+    _notificationRevisions.clear();
+    _confirmedNotificationKeys.clear();
+    _notificationSubscriptions.clear();
+    for (final controller in _streamControllers.values) {
+      controller.close();
+    }
+    _streamControllers.clear();
+  }
+
+  void _addToStream(String serviceUuid, String characteristicUuid, List<int> data) {
+    final key = '${serviceUuid.toLowerCase()}:${characteristicUuid.toLowerCase()}';
+    final controller = _streamControllers[key];
+    if (controller != null && !controller.isClosed) {
+      controller.add(data);
+    }
+  }
+
+  // MARK: - Native Callbacks
+
+  /// Track which characteristics were subscribed so we can re-subscribe on reconnect.
+  final Set<String> _activeSubscriptionKeys = {};
+
+  void _handleConnectionState(bool connected, String? error) {
+    // Native no longer emits a separate "physical connected" event — a successful
+    // connection is signalled via _handleDeviceReady. This callback now only
+    // carries disconnects; ignore any stray connected==true.
+    if (connected) return;
+
+    // Ignore transient GATT status errors during connection phase to allow native retry to work.
+    final bool isConnecting = _deviceReadyCompleter != null && !_deviceReadyCompleter!.isCompleted;
+    if (isConnecting && error != null && (error.contains('133') || error.contains('-1'))) {
+      Logger.debug(
+          '[NativeBleTransport] $_peripheralUuid: ignoring transient GATT error during connect (native will retry): $error');
+      return;
+    }
+    Logger.debug(
+        '[NativeBleTransport] $_peripheralUuid: disconnected (error=$error isConnecting=$isConnecting state=$_state)');
+
+    // Remember active subscriptions before closing streams
+    if (_state == DeviceTransportState.disconnecting) {
+      _activeSubscriptionKeys.clear();
+    } else if (_streamControllers.isNotEmpty) {
+      _activeSubscriptionKeys
+        ..clear()
+        ..addAll(_streamControllers.keys);
+    }
+
+    _closeAllStreams();
+    _services = [];
+    _updateState(DeviceTransportState.disconnected);
+
+    // Fail pending completer
+    if (_deviceReadyCompleter != null && !_deviceReadyCompleter!.isCompleted) {
+      _deviceReadyCompleter!.completeError(error ?? 'Disconnected before ready');
+    }
+  }
+
+  void _handleDeviceReady(List<BleService> services) {
+    // A ready carrying an empty service table is not a usable link, and must never be
+    // latched as connected. readCharacteristic short-circuits to [] whenever
+    // _hasCharacteristic misses, so with _services empty the app looks connected while
+    // the capability read returns 0 (Device Settings → Customization collapses to its one
+    // ungated row) and every storage write throws (nothing ever syncs). Worse, connect()
+    // early-returns while _state is connected, so nothing re-drives the link and the
+    // session stays stranded until the app is force-closed.
+    //
+    // Native's manageDevice used to produce exactly this by taking its
+    // "Dart restarted, native kept the link" shortcut in the window between
+    // STATE_CONNECTED and onServicesDiscovered (fixed there too — it now gates on
+    // hasDiscoveredServices). Keep the guard here regardless: an empty table is never
+    // worth adopting, and native's own discovery fires a real ready moments later.
+    //
+    // Drop the event and leave any pending completer alone, rather than failing it. The
+    // real ready is what should resolve connect(), and it lands within a second or so;
+    // erroring here instead would make connect() throw for something that immediately
+    // succeeded, and push the caller through a spurious disconnected → connected
+    // transition. Nothing can hang on this: a genuine disconnect fails the pending
+    // completer in _handleConnectionState, and connect() times out at _kConnectBackstop
+    // regardless —
+    // well outside native's 15s discovery timeout, which drops a stuck link into the
+    // ordinary retry path long before then.
+    if (services.isEmpty) {
+      Logger.warning('[NativeBleTransport] $_peripheralUuid: device-ready carried 0 services — ignoring, '
+          'waiting for the real discovery');
+      return;
+    }
+
+    _services = services;
+    if (_deviceReadyCompleter != null && !_deviceReadyCompleter!.isCompleted) {
+      Logger.debug(
+          '[NativeBleTransport] $_peripheralUuid: device ready (initial connect path, ${services.length} services)');
+      _deviceReadyCompleter!.complete(services);
+    } else {
+      Logger.debug(
+          '[NativeBleTransport] $_peripheralUuid: device ready (auto-reconnect path, ${services.length} services)');
+    }
+    _updateState(DeviceTransportState.connected);
+    _resubscribeAfterReconnect(services);
+  }
+
+  bool _isResubscribing = false;
+
+  void _resubscribeAfterReconnect(List<BleService> services) {
+    if (_isResubscribing) return;
+    _isResubscribing = true;
+
+    try {
+      _services = services;
+
+      // Re-create stream controllers and re-subscribe to previously active characteristics
+      final generation = _notificationGeneration;
+      for (final key in _activeSubscriptionKeys.toList()) {
+        final parts = key.split(':');
+        if (parts.length == 2) {
+          unawaited(getCharacteristicStream(parts[0], parts[1]).then<void>((_) {}, onError: (Object e) {
+            Logger.warning('[NativeBleTransport] Notification restore failed for $key: $e');
+            if (e is _NotificationSubscriptionSuperseded) return;
+            // Native tore this link down itself and is already reconnecting; its disconnect
+            // event follows this failure and moves the transport. Acting here instead would
+            // drop "the current link" late — and if this isolate was frozen long enough for
+            // native's retry to have connected again, disconnectPeripheral would drop that
+            // fresh link rather than the dead one.
+            if (e is PlatformException && e.details == _linkClosedByNative) return;
+            if (generation != _notificationGeneration || _state != DeviceTransportState.connected) return;
+            // Keep Android in charge of reconnect; report the unusable transport
+            // immediately so consumers stop issuing storage commands on it.
+            unawaited(softDisconnect());
+            _handleConnectionState(false, 'notification_restore_failed');
+          }));
+        }
+      }
+
+      _updateState(DeviceTransportState.connected);
+    } catch (e) {
+      Logger.debug('[NativeBleTransport] Failed to re-subscribe after reconnect: $e');
+      _updateState(DeviceTransportState.disconnected);
+    } finally {
+      _isResubscribing = false;
+    }
+  }
+
+  void _handleCharacteristicValue(String serviceUuid, String characteristicUuid, Uint8List value) {
+    _addToStream(serviceUuid, characteristicUuid, value);
+  }
+}

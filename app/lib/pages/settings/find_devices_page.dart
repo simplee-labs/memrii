@@ -1,0 +1,622 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/backend/schema/bt_device/bt_device.dart';
+import 'package:omi/providers/device_provider.dart';
+import 'package:omi/services/devices.dart';
+import 'package:omi/services/services.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/gen/pigeon_communicator.g.dart';
+import 'package:omi/widgets/dialog.dart';
+
+class FindDevicesPage extends StatefulWidget {
+  const FindDevicesPage({super.key});
+
+  @override
+  State<FindDevicesPage> createState() => _FindDevicesPageState();
+}
+
+class _FindDevicesPageState extends State<FindDevicesPage> {
+  List<BtDevice> _discoveredDevices = [];
+  bool _isScanning = false;
+
+  // Ids the OS holds a pairing key for, filled in by [_refreshBondStates]. Empty
+  // until the first answer lands, which renders every row unbonded: the mark is an
+  // indicator, so a row that appears a frame ahead of its answer costs nothing.
+  Set<String> _bondedIds = {};
+  // Bumped per query so a slow answer cannot overwrite a newer one. Two can be in
+  // flight — a scan settling while a connect lands — and the later-*started* query
+  // is the one that saw the newer device list, not necessarily the one that returns
+  // last.
+  int _bondQueryGeneration = 0;
+
+  // Held so the listener can be removed in dispose — build() reads the provider
+  // through watch() as before, which is what repaints the marks.
+  DeviceProvider? _deviceProvider;
+  bool _closing = false;
+  bool _wasConnected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _startScan();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final provider = Provider.of<DeviceProvider>(context, listen: false);
+    if (identical(provider, _deviceProvider)) return;
+    _deviceProvider?.removeListener(_onDeviceProviderChanged);
+    _deviceProvider = provider..addListener(_onDeviceProviderChanged);
+    // Cover a page opened onto an already-live link — the listener alone would sit
+    // until the provider happened to notify about something else. Post-frame because
+    // popping is illegal mid-build, and because the route has to have been built
+    // before it can be popped.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onDeviceProviderChanged());
+  }
+
+  @override
+  void dispose() {
+    _deviceProvider?.removeListener(_onDeviceProviderChanged);
+    super.dispose();
+  }
+
+  /// Close this page the moment an Omi is connected, however that happened.
+  ///
+  /// Nothing here is reachable while connected — every route in (the drawer item,
+  /// the recordings-page bluetooth icon, the Connect Omi button) is gated on being
+  /// disconnected — so a connected user left sitting on the scan list is stranded on
+  /// a page they could not have opened. The case that needs it is the post-update
+  /// one: Done lands the user here to accept the pairing request, and the request is
+  /// accepted from the system dialog, not from this page, so nothing here would
+  /// otherwise dismiss it.
+  ///
+  /// Also refresh the bond marks, but only on the transition: a connect is the one
+  /// event that moves them, while the provider notifies on plenty that doesn't
+  /// (battery, sync progress, connecting status). The close attempt is *not*
+  /// transition-gated — it has to be retried on every notification, because the one
+  /// that arrives while a dialog covers this page is declined below and there may
+  /// never be another transition to trigger it.
+  void _onDeviceProviderChanged() {
+    if (_closing || !mounted) return;
+    final isConnected = _deviceProvider?.isConnected ?? false;
+    final justConnected = isConnected && !_wasConnected;
+    _wasConnected = isConnected;
+    if (!isConnected) return;
+    if (justConnected) unawaited(_refreshBondStates());
+    _closePage();
+  }
+
+  void _closePage() {
+    if (_closing || !mounted) return;
+    // A tap-initiated connect stacks a loading dialog on top of this page, and
+    // popping now would take the dialog instead of us. Deferring loses nothing:
+    // that path closes both routes itself, and sets _closing before it does.
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return;
+    final navigator = Navigator.of(context);
+    // Defensive: this page is always pushed onto something (Settings, the
+    // recordings page, or the home route the update screen resets to before
+    // pushing it), but popping a lone route would leave a blank navigator, which
+    // is a worse failure than staying put.
+    if (!navigator.canPop()) return;
+    _closing = true;
+    navigator.pop();
+  }
+
+  /// Ask the OS which devices it holds a pairing key for.
+  ///
+  /// The stored preference cannot answer this. It still names the device after a
+  /// DFU wipes the bond — which is exactly when this page is open — so gating the
+  /// mark on it would promise a pairing that no longer exists.
+  /// `getBondedDeviceIds` enumerates `BluetoothAdapter.bondedDevices`, a local
+  /// lookup that touches neither the radio nor the link a sync may be using, and
+  /// returns them uppercased to match the ids native hands out.
+  ///
+  /// Called at both ends of every scan and on a connect. Between them those cover
+  /// every moment the answer can move while this page is up: only a pairing or an
+  /// unpairing changes it, this page's own unpair (_forgetDevice) ends in a rescan,
+  /// and one made outside the app is picked up by the Refresh button. The pair of
+  /// calls per scan is not redundant — the opening one is the fast answer and the
+  /// closing one is the correct one; see the call site in [_startScan]'s finally.
+  Future<void> _refreshBondStates() async {
+    final generation = ++_bondQueryGeneration;
+    Set<String> bonded;
+    try {
+      bonded = (await BleHostApi().getBondedDeviceIds()).map((id) => id.toUpperCase()).toSet();
+    } catch (e) {
+      // No platform guard: the call itself is the platform check. Bluetooth off, the
+      // permission not granted yet, or a platform with no implementation at all (iOS)
+      // all land here, and all mean the same thing — no marks rather than wrong ones.
+      Logger.debug('FindDevicesPage: bonded device list unavailable: $e');
+      bonded = {};
+    }
+    // A query started later has already published a fresher answer — drop this one
+    // rather than winding the marks back.
+    if (!mounted || generation != _bondQueryGeneration) return;
+    setState(() => _bondedIds = bonded);
+  }
+
+  Future<void> _startScan({bool userInitiated = false}) async {
+    if (_isScanning) return;
+
+    // Every row must come from a scan that ran since this page opened. The service
+    // caches its last discovery across page opens, and a device that was seen minutes
+    // ago is exactly the trap this page exists to avoid: it is still tappable, and
+    // after a reboot (a firmware update, a Reboot Omi, a flat battery) tapping it can
+    // only fail. Better to show nothing and scan than to show a row that lies.
+    //
+    // Both halves have to go, since build() merges the service's cache with this
+    // page's own list. Cleared ahead of the early returns below, so a scan that
+    // defers to a running background scan — _forgetDevice's rescan reaches here
+    // ungated by isScanning — or that fails the permission gate drops the previous
+    // rows too, instead of leaving them on screen and tappable until some later scan
+    // happens to succeed.
+    ServiceManager.instance().device.clearDiscoveredDevices();
+    // Refreshed here, alongside the cache drop and for the same reason: ahead of the
+    // early returns below, so every route in gets it — page open, the Scan/Refresh
+    // buttons, and _forgetDevice's rescan, which is the one that just unpaired and
+    // would otherwise leave its own mark up whenever a background scan makes it
+    // return early. The bonded set is the OS's, not this scan's, so it does not wait
+    // on the scan finishing.
+    unawaited(_refreshBondStates());
+    // Unconditional, because either half being non-empty is enough to leave rows
+    // painted, and the service half is not observable from here — a guard on
+    // _discoveredDevices alone skips the repaint exactly when the cache was the stale
+    // one. Safe from the initState call: setState there lands on an element already
+    // marked dirty for its first build, so markNeedsBuild returns early. Every caller
+    // is mounted — initState, both scan buttons, and _forgetDevice, which checks.
+    setState(() => _discoveredDevices = []);
+
+    if (ServiceManager.instance().device.status == DeviceServiceStatus.scanning) {
+      // Only surface the "already scanning" notice for an explicit Scan/Refresh
+      // tap. Automatic scans (page open, post-forget rescan) silently defer to
+      // the running background scan instead of flashing a snackbar.
+      if (userInitiated && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('A background scan is already running. Please wait.')),
+        );
+      }
+      return;
+    }
+
+    // Request permissions. bluetoothScan / bluetoothConnect are Android 12+ (API 31)
+    // runtime permissions; on iOS permission_handler has no strategy for them and
+    // reports permanentlyDenied, which would wedge the gate below and stop scanning
+    // entirely. iOS needs only the single CoreBluetooth authorization and no location
+    // grant for BLE, so branch the request and the gate by platform.
+    final List<Permission> toRequest = Platform.isAndroid
+        ? [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location]
+        : [Permission.bluetooth];
+    final Map<Permission, PermissionStatus> statuses = await toRequest.request();
+
+    // Android scanning requires scan+connect (location is best-effort, as before);
+    // iOS requires the bluetooth authorization.
+    final List<Permission> mustGrant =
+        Platform.isAndroid ? [Permission.bluetoothScan, Permission.bluetoothConnect] : [Permission.bluetooth];
+    if (mustGrant.any((p) => statuses[p]?.isGranted != true)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Bluetooth permissions are required to find Omi devices.')),
+        );
+      }
+      return;
+    }
+
+    // The page can be gone by the time the answer lands. The permission prompt is a
+    // system window, not a Flutter route, so this page stays `isCurrent` behind it and
+    // a connect arriving meanwhile still runs _closePage and pops it — and on Android
+    // the request does not return until the user has answered, which can be a long
+    // way after that. Every setState past this point would then land on a disposed
+    // state; the ones inside the scan below already check, this one did not.
+    if (!mounted) return;
+    setState(() {
+      _isScanning = true;
+      _discoveredDevices = [];
+    });
+
+    try {
+      // Warmup: give BLE stack a moment to settle before scanning
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      var devices = await ServiceManager.instance().device.discover();
+
+      // Auto-retry once on empty results
+      if (devices.isEmpty && mounted) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        devices = await ServiceManager.instance().device.discover();
+      }
+
+      if (mounted) {
+        setState(() {
+          _discoveredDevices = devices;
+        });
+      }
+    } catch (e) {
+      Logger.error('FindDevicesPage: Error scanning for devices: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error scanning: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isScanning = false;
+        });
+        // Ask again now the scan is over. The query at the top of this method is the
+        // one that answers fast, but it is also the one most likely to answer wrong,
+        // for two reasons that both resolve by the time we get here:
+        //
+        // - It can run without the permission its answer needs. On Android 12+
+        //   `BluetoothAdapter.bondedDevices` requires BLUETOOTH_CONNECT, and native
+        //   turns the refusal into an empty list rather than an error — so on a visit
+        //   that has to *ask* for the permission, the first query publishes "nothing
+        //   is bonded" and, with only that one call, nothing ever corrected it. The
+        //   scan below it cannot have run without the grant, so reaching here means
+        //   the answer is now askable.
+        // - It can run before the OS has finished an unpair. _forgetDevice awaits
+        //   removeBond, but that returns before Android's BOND_NONE lands, so the
+        //   rescan it kicks off re-reads the device it just unpaired as still bonded
+        //   and leaves a grey "Paired" check on it. A whole scan is far longer than
+        //   that gap (the service's own fallback for a missing BOND_NONE broadcast is
+        //   3 s).
+        //
+        // Kept as well as the first call, not instead of it: that one covers the
+        // early returns above, where no scan runs to reach this. Two answers in
+        // flight is what _bondQueryGeneration is for.
+        unawaited(_refreshBondStates());
+      }
+    }
+  }
+
+  Future<void> _connectToDevice(BtDevice device) async {
+    final deviceService = ServiceManager.instance().device;
+    // Companion Device Pairing defaults ON (see preferences.companionDeviceEnabled):
+    // companion status exempts the app from aggressive OEM battery-manager freezing so the
+    // foreground service can recover from a ghost-GATT wedge on its own. We establish the
+    // CompanionDeviceManager association BEFORE connecting (it never arms presence
+    // observation — that path, the OnePlus/Oppo/Realme passive-link contention, was removed).
+    // hasCompanionDeviceAssociation() gates the chooser to first-connect only, so an existing
+    // association is never re-prompted. Users on an OEM where a bare association still hurts
+    // can turn it off in App Settings. Background reconnect runs on the periodic sync
+    // alarm/worker regardless.
+    final isAndroid = TargetPlatform.android == Theme.of(context).platform;
+    if (isAndroid &&
+        SharedPreferencesUtil().companionDeviceEnabled &&
+        !(await deviceService.hasCompanionDeviceAssociation())) {
+      if (!mounted) return;
+      bool? confirm = await showDialog<bool>(
+        context: context,
+        builder: (c) => getDialog(
+          context,
+          () => Navigator.of(context).pop(false),
+          () => Navigator.of(context).pop(true),
+          'Pair with Android',
+          'To ensure a reliable connection, Android requires a system pairing association. This will show a system dialog to pair with ${device.name}.',
+          confirmText: 'Pair',
+        ),
+      );
+      if (confirm == true) {
+        try {
+          final associatedAddress = await deviceService.requestCompanionDeviceAssociation(device.id);
+          if (associatedAddress.isEmpty) return; // User cancelled or failed
+        } catch (e) {
+          Logger.error('FindDevicesPage: Companion association failed: $e');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Pairing failed: $e')),
+            );
+          }
+          return;
+        }
+      } else {
+        return;
+      }
+    }
+
+    // Show connecting indicator
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => const Center(
+        child: CircularProgressIndicator(color: Colors.deepPurpleAccent),
+      ),
+    );
+
+    try {
+      final connection =
+          await ServiceManager.instance().device.ensureConnection(device.id, force: true, requiresBond: true);
+      if (connection == null) {
+        throw Exception(
+            "Connection timed out. If it's nearby, toggle your phone's Bluetooth off and on to clear the system cache.");
+      }
+
+      // Save paired device — state transitions (setConnectedDevice, setIsConnected, WAL sync, etc.)
+      // are handled by DeviceProvider._onDeviceConnected via the onDeviceConnectionStateChanged callback.
+      SharedPreferencesUtil().btDevice = device;
+
+      if (mounted) {
+        // Claim the close before making it, so the connection-state listener —
+        // which fires from setIsConnected during ensureConnection — doesn't pop a
+        // second route behind these two.
+        _closing = true;
+        Navigator.of(context).pop(); // Close loading dialog
+        Navigator.of(context).pop(); // Go back to settings
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Connected to ${device.name}')),
+        );
+      }
+    } catch (e) {
+      Logger.error('FindDevicesPage: Error connecting to device: $e');
+      if (mounted) {
+        Navigator.of(context).pop(); // Close loading dialog
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to connect: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _forgetDevice() async {
+    Logger.debug('FindDevicesPage: Forget Device tapped');
+    bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (c) => getDialog(
+        context,
+        () => Navigator.of(context).pop(false),
+        () => Navigator.of(context).pop(true),
+        'Forget Device',
+        'This clears the stored Bluetooth pairing so the app can rediscover the device fresh. Use this if the device is visible but refuses to connect (e.g. after a firmware update wiped bonding keys). You will need to reconnect afterwards.',
+        confirmText: 'Forget',
+      ),
+    );
+    if (confirm != true || !mounted) return;
+
+    final prefs = SharedPreferencesUtil();
+    final deviceId = prefs.btDevice.id;
+
+    final provider = Provider.of<DeviceProvider>(context, listen: false);
+
+    ServiceManager.instance().wal.getSyncs().cancelSync();
+    ServiceManager.instance().wal.getSyncs().setDevice(null);
+
+    if (deviceId.isNotEmpty) {
+      await ServiceManager.instance().device.forgetDevice(deviceId);
+      try {
+        await BleHostApi().unmanageDevice(deviceId);
+      } catch (_) {}
+    }
+
+    await prefs.btDeviceSet(BtDevice(id: '', name: '', type: DeviceType.omi, rssi: 0));
+    prefs.deviceName = '';
+
+    provider.setIsConnected(false);
+    await provider.setConnectedDevice(null);
+    provider.updateConnectingStatus(false);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Device forgotten — scan to reconnect')),
+    );
+    _startScan();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = context.watch<DeviceProvider>();
+    final isBluetoothEnabled = provider.isBluetoothEnabled;
+    final isServiceScanning = ServiceManager.instance().device.status == DeviceServiceStatus.scanning;
+    final isScanning = _isScanning || isServiceScanning;
+
+    // The page only populates _discoveredDevices from its own _startScan, but a
+    // background scan (Reset Connection / periodicConnect) populates the service
+    // list instead. Merge both — deduped by id — so background-scan results are
+    // shown rather than leaving the page on "No devices found" after one runs.
+    // The service half can only hold results from a scan that ran since this page
+    // opened, because _startScan drops the cache first (see there).
+    final mergedById = <String, BtDevice>{
+      for (final d in ServiceManager.instance().device.devices) d.id: d,
+      for (final d in _discoveredDevices) d.id: d,
+    };
+    final displayDevices = mergedById.values.toList();
+
+    // Gate on the stored pairing (source of truth, also what _forgetDevice reads),
+    // not provider.pairedDevice — that field is null at cold start and only hydrates
+    // after a successful connect or a disconnect transition, so a provider gate would
+    // hide the button in exactly the "stored device that refuses to connect" case it
+    // exists for. We still read provider above via watch() so this rebuilds on changes.
+    final hasPairedDevice = SharedPreferencesUtil().btDevice.id.isNotEmpty;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D0D0D),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0D0D0D),
+        title: const Text('Find Devices', style: TextStyle(color: Colors.white)),
+        actions: [
+          if (isScanning)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.only(right: 16.0),
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                ),
+              ),
+            )
+          else if (isBluetoothEnabled)
+            IconButton(
+              icon: const Icon(Icons.refresh, color: Colors.white),
+              onPressed: () => _startScan(userInitiated: true),
+              tooltip: 'Refresh devices',
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: !isBluetoothEnabled
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FaIcon(FontAwesomeIcons.bluetooth, size: 60, color: Colors.grey.shade700),
+                        const SizedBox(height: 24),
+                        const Text(
+                          'Bluetooth is Off',
+                          style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Please enable Bluetooth to scan for devices',
+                          style: TextStyle(color: Colors.grey, fontSize: 16),
+                        ),
+                      ],
+                    ),
+                  )
+                : isScanning && displayDevices.isEmpty
+                    ? const Center(
+                        child: CircularProgressIndicator(
+                          color: Colors.deepPurpleAccent,
+                        ),
+                      )
+                    : displayDevices.isEmpty
+                        ? Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                FaIcon(FontAwesomeIcons.bluetooth, size: 64, color: Colors.grey.shade800),
+                                const SizedBox(height: 24),
+                                const Text(
+                                  'No Omi devices found nearby.',
+                                  style: TextStyle(color: Colors.grey, fontSize: 16),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'Make sure your Omi is turned on.',
+                                  style: TextStyle(color: Colors.grey, fontSize: 14),
+                                ),
+                                const SizedBox(height: 32),
+                                ElevatedButton(
+                                  onPressed: () => _startScan(userInitiated: true),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.deepPurpleAccent,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                  child: const Text('Scan Again'),
+                                ),
+                              ],
+                            ),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.all(16),
+                            itemCount: displayDevices.length,
+                            itemBuilder: (context, index) {
+                              final device = displayDevices[index];
+                              final isConnectedDevice =
+                                  provider.isConnected && provider.connectedDevice?.id == device.id;
+                              final isBonded = _bondedIds.contains(device.id.toUpperCase());
+                              return Card(
+                                color: const Color(0xFF1C1C1E),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                                margin: const EdgeInsets.only(bottom: 12),
+                                child: ListTile(
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                                  leading: const CircleAvatar(
+                                    backgroundColor: Colors.deepPurpleAccent,
+                                    child: FaIcon(FontAwesomeIcons.microchip, color: Colors.white, size: 18),
+                                  ),
+                                  title: Text(
+                                    device.name,
+                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                                  ),
+                                  subtitle: Text(
+                                    device.id,
+                                    style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+                                  ),
+                                  trailing: DeviceStatusIcon(
+                                    isConnected: isConnectedDevice,
+                                    isBonded: isBonded,
+                                  ),
+                                  onTap: () => _connectToDevice(device),
+                                ),
+                              );
+                            },
+                          ),
+          ),
+          if (hasPairedDevice)
+            Padding(
+              padding: EdgeInsets.fromLTRB(16, 8, 16, MediaQuery.of(context).padding.bottom + 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _forgetDevice,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent.withValues(alpha: 0.1),
+                    foregroundColor: Colors.redAccent,
+                    elevation: 0,
+                    side: const BorderSide(color: Colors.redAccent, width: 1),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                  child: const Text(
+                    'Reset Connection',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Row trailing mark: green check = connected, grey check = the OS holds a pairing
+/// key for it but the link is down, chevron = a stranger.
+///
+/// The grey one is the useful case on this page. Several Omis in a room look
+/// identical apart from a MAC address nobody has memorised, and this page is only
+/// ever open because none of them is connected — so "the OS holds a key for this
+/// one" is the only thing left that picks yours out. Reset Connection is where it
+/// earns its keep: the row you want is the one that is paired and still will not
+/// connect.
+///
+/// Note it does **not** help immediately after a firmware update, which is the one
+/// thing it looks like it should do: the flash wipes the phone's bond too
+/// (`releasePairingOnSuccess`), so the Omi the user is hunting for is unmarked
+/// like every other, until the re-pair lands and turns it green.
+///
+/// `isConnected` wins when both are set, which is the normal state of a live link
+/// (connected devices are also bonded) — never render the weaker of the two facts.
+class DeviceStatusIcon extends StatelessWidget {
+  final bool isConnected;
+  final bool isBonded;
+
+  const DeviceStatusIcon({super.key, required this.isConnected, required this.isBonded});
+
+  @override
+  Widget build(BuildContext context) {
+    if (isConnected) {
+      return const Tooltip(
+        message: 'Connected',
+        child: Icon(Icons.check_circle, color: Color(0xFF4ADE80)),
+      );
+    }
+    if (isBonded) {
+      return Tooltip(
+        message: 'Paired — not connected',
+        child: Icon(Icons.check_circle, color: Colors.grey.shade600),
+      );
+    }
+    return const Icon(Icons.chevron_right, color: Colors.grey);
+  }
+}

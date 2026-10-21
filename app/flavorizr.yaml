@@ -1,0 +1,17 @@
+# iOS is unsupported. Keep flavor ios: blocks absent so regeneration cannot recreate a partial deleted Xcode
+# project. Restoring iOS requires deliberate bundle identities, signing and native platform code.
+flavors:
+  prod:
+    app:
+      name: "memrii"
+      icon: "assets/images/app_launcher_icon.png"
+    android:
+      applicationId: "me.memrii.app"
+      icon: "assets/images/app_launcher_icon.png"
+  dev:
+    app:
+      name: "memrii dev"
+      icon: "assets/images/app_launcher_icon.png"
+    android:
+      icon: "assets/images/app_launcher_icon.png"
+      applicationId: "me.memrii.app.dev"

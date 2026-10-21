@@ -1,0 +1,487 @@
+import 'dart:typed_data';
+
+import 'package:omi/services/devices/device_crash_log.dart';
+
+/// One 16-byte diagnostic event drained from the firmware's on-device event ring
+/// (BLE 0x19B10063). The firmware records these for the health events that the
+/// aggregate drop counters (0x19B10062) only total — giving per-event timing and
+/// cause context (see firmware `diag_log.h` for the event-code table).
+///
+/// Wire layout (little-endian, matching `diag_event_t`):
+///   [u32 seq][u32 uptime_ms][u8 code][u8 backend][u16 arg0][u32 arg1]
+class DiagLogRecord {
+  /// Monotonic sequence assigned by the firmware at enqueue. The ack key: acking
+  /// `seq` drops every record with seq <= that value.
+  final int seq;
+
+  /// Device uptime (ms) at the event — `k_uptime_get_32()`.
+  final int uptimeMs;
+
+  /// Event code — see [label]. APPEND-ONLY on the firmware side; an unknown code
+  /// (newer firmware than this app) renders generically rather than being dropped.
+  final int code;
+
+  /// Storage backend active at the event: 0 = LittleFS, 1 = ring. Not meaningful
+  /// for pre-storage events (codec drops report 0).
+  final int backend;
+
+  /// Event-specific — see the per-code notes in [description].
+  final int arg0;
+
+  /// Event-specific — see the per-code notes in [description].
+  final int arg1;
+
+  const DiagLogRecord({
+    required this.seq,
+    required this.uptimeMs,
+    required this.code,
+    required this.backend,
+    required this.arg0,
+    required this.arg1,
+  });
+
+  static const int sizeBytes = 16;
+
+  /// Parse one record from [data] starting at [offset]. Returns null if fewer than
+  /// [sizeBytes] bytes remain.
+  static DiagLogRecord? fromBytes(List<int> data, int offset) {
+    if (offset + sizeBytes > data.length) return null;
+    final bd = ByteData.sublistView(Uint8List.fromList(data), offset, offset + sizeBytes);
+    return DiagLogRecord(
+      seq: bd.getUint32(0, Endian.little),
+      uptimeMs: bd.getUint32(4, Endian.little),
+      code: bd.getUint8(8),
+      backend: bd.getUint8(9),
+      arg0: bd.getUint16(10, Endian.little),
+      arg1: bd.getUint32(12, Endian.little),
+    );
+  }
+
+  /// Why a rotation happened, as carried in `arg0` of a `DIAG_EMPTY_BIN_ROTATION`
+  /// record. Mirror of the firmware `rotate_reason_t` — keep in sync (append-only).
+  ///
+  /// On a normal bin the reason is just context. On an EMPTY bin it is the whole
+  /// story, because the reasons are not equally interesting: most say a rotation
+  /// landed where nothing was being written (any silent stretch in auto mode), which
+  /// is routine. The two stop reasons are the exceptions — `priority stop` and
+  /// `manual recording stop` each close a bin that should hold at least the recording's
+  /// own markers, and an accepted marker force-drains its block immediately, so an
+  /// empty one means they never reached the card — dropped, or left buffered by a full
+  /// SD queue and carried into the next bin.
+  static String rotateReasonLabel(int reason) {
+    switch (reason) {
+      case 1:
+        return 'first bin after mount';
+      case 2:
+        return 'bin age';
+      case 3:
+        return 'BLE connect';
+      case 4:
+        return 'app rotate command';
+      case 5:
+        return 'priority recording start';
+      case 6:
+        return 'priority recording stop — markers dropped';
+      case 7:
+        return 'time sync';
+      case 8:
+        return 'storage cleared';
+      case 9:
+        return 'active bin deleted';
+      case 10:
+        // Reads like `priority stop`: this bin should hold the manual recording's
+        // own 0xFFFFFFFC, so an empty one means the markers never reached the card.
+        return 'Session recording stop — markers dropped';
+      case 11:
+        return 'BLE connect (idle — no write to trigger it)';
+      default:
+        // 0 is the firmware's own "unknown", and is also what a pre-oo-3.0.2 build
+        // sends. Both mean the same thing to a reader: nothing is claimed.
+        return 'unattributed';
+    }
+  }
+
+  /// Short, stable label for the event code. Mirror of the firmware
+  /// `diag_event_code_t` table — keep in sync (append-only).
+  String get label {
+    switch (code) {
+      case 1:
+        return 'empty_bin_rotation';
+      case 2:
+        return 'marker_write_drop';
+      case 3:
+        return 'marker_pause_gate_save';
+      case 4:
+        return 'priority_record_start';
+      case 5:
+        return 'priority_record_stop';
+      case 6:
+        return 'session_end_marker_emit';
+      case 7:
+        return 'sd_block_drop';
+      case 8:
+        return 'codec_drop';
+      case 9:
+        return 'write_blocked';
+      case 10:
+        return 'ring_io_error';
+      case 11:
+        return 'backend_mount';
+      case 12:
+        return 'bond_state';
+      case 13:
+        return 'adv_start_fail';
+      case 14:
+        return 'adv_watchdog_rescue';
+      case 15:
+        return 'adv_stop_fail';
+      case 16:
+        return 'vad_level';
+      case 17:
+        return 'mic_power_cycle';
+      case 18:
+        return 'mic_state';
+      case 19:
+        return 'imu_power_state';
+      case 20:
+        return 'link_wedge_reboot';
+      case 21:
+        return 'boot';
+      default:
+        return 'code_$code';
+    }
+  }
+
+  /// Legacy storage-backend tag, and the reason it renders as nothing is stronger than
+  /// "there is only one backend now": **the byte reflects whatever each call site
+  /// happened to pass**, so it never carried information in the first place. Counted
+  /// across the firmware (22 emit sites):
+  ///
+  /// - literal `0` — 13 sites: `aad.c` (5), `transport.c` (5), `codec.c` (2), `button.c` (1)
+  /// - `sd_get_active_backend()` — 7 sites, all in `transport.c`
+  /// - `STORAGE_BACKEND_RING` (1) — 2 sites, both in `sd_card.c`
+  ///
+  /// So the same log interleaves records tagged 0 and 1 with no relationship to
+  /// anything. A real 22 h capture showed `vad_level(littlefs)` for exactly this
+  /// reason — aad.c's literal 0 decoded against a backend removed in `oo-2.9.0`, on
+  /// every line of the log you read during an incident.
+  ///
+  /// Both known values therefore render empty. Anything else still shows, in case the
+  /// byte is ever repurposed into something that means one thing everywhere.
+  String get backendLabel {
+    switch (backend) {
+      case 0:
+      case 1:
+        return '';
+      default:
+        return 'b$backend';
+    }
+  }
+
+  /// `" (tag)"` when [backendLabel] carries information, otherwise empty — so a
+  /// description reads cleanly rather than trailing an empty pair of brackets.
+  String get _backendSuffix => backendLabel.isEmpty ? '' : ' ($backendLabel)';
+
+  /// Human-readable one-liner with the code's specific arg meaning. Unknown codes
+  /// fall back to the raw args so a newer device still shows something useful.
+  String get description {
+    switch (code) {
+      case 1:
+        // arg0 = the rotation that closed it (rotate_reason_t), arg1 = closing size.
+        // The reason is the only thing that says whether this bin is worth a second
+        // look: most mean a rotation landed where nothing was being written, which is
+        // routine. Firmware before oo-3.0.2 sent 0 here, which renders as
+        // "unattributed" rather than pretending to know.
+        return 'Empty bin rotation$_backendSuffix — ${rotateReasonLabel(arg0)}, closed with $arg1 B (header only)';
+      case 2:
+        return 'Marker write drop$_backendSuffix — lost inline marker (blockDrops=$arg1)';
+      case 3:
+        return 'Marker kept at SD pause gate$_backendSuffix — block ${arg1}B';
+      case 4:
+        return 'Priority recording start$_backendSuffix — session $arg1';
+      case 5:
+        return 'Priority recording stop$_backendSuffix — session $arg1';
+      case 6:
+        return 'Session-end marker emit$_backendSuffix — session $arg1';
+      case 7:
+        return 'SD block drop$_backendSuffix — audio block lost (blockDrops=$arg1)';
+      case 8:
+        return 'Codec drop — PCM block lost before encode (codecDrops=$arg1)';
+      case 9:
+        // arg0 names the stage the audio died at; arg1 is that stage's running total.
+        // Both emitted reasons mean captured audio was discarded uncounted — the two
+        // sites in the chain that no 0x0062 counter can see.
+        switch (arg0) {
+          case 0:
+            return 'Write blocked$_backendSuffix — tx ring full, encoded frame dropped '
+                'before storage ($arg1 since boot)';
+          case 2:
+            // Emitted only by oo-3.1.1 and earlier — the holding ring it counted was
+            // removed in oo-3.1.3. Kept because those devices are still in the field.
+            return 'Write blocked — VAD backlog full, live mic frame dropped before the '
+                'codec ($arg1 since boot)';
+          case 3:
+            // oo-3.1.3 on. The pre-roll burst was trimmed to fit the encoder ring, so a
+            // recording began with a shorter lead-in. Trimmed frames are never submitted,
+            // which is why this needs its own record: no downstream counter can see them.
+            return 'Write blocked — pre-roll trimmed, lead-in audio dropped before the '
+                'codec ($arg1 since boot)';
+          default:
+            return 'Write blocked$_backendSuffix — arg0=$arg0 arg1=$arg1';
+        }
+      case 10:
+        return 'Ring IO error — arg0=$arg0 arg1=$arg1';
+      case 11:
+        return 'Backend mount$_backendSuffix — arg1=$arg1';
+      case 12:
+        // arg0 = cause (0 boot load / 1 post-DFU wipe / 2 button wipe), arg1 = bonds held after.
+        // "0 key(s)" on a boot load with no preceding wipe is the device having silently lost
+        // its pairing — the origin of the reconnect-forever outage.
+        switch (arg0) {
+          case 0:
+            return 'Bonds at boot — $arg1 key(s) loaded'
+                '${arg1 == 0 ? ' (device is UNPAIRED)' : ''}';
+          // The firmware emits these whether or not bt_unpair() actually succeeded —
+          // an attempted-but-failed wipe is itself worth recording, since the device
+          // then keeps a bond the phone believes is gone. arg1 is the count AFTER, so
+          // a non-zero remainder means the wipe did not take; say that rather than
+          // asserting "wiped" over the top of it.
+          case 1:
+            return arg1 == 0
+                ? 'Bonds wiped by post-update unpair'
+                : 'Post-update unpair FAILED — $arg1 key(s) still on device';
+          case 2:
+            return arg1 == 0 ? 'Bonds wiped by 5-tap gesture' : '5-tap unpair FAILED — $arg1 key(s) still on device';
+          default:
+            return 'Bond state — cause=$arg0, $arg1 key(s)';
+        }
+      case 13:
+        // arg0 = advertising mode (0 fast, 1 slow); arg1 = positive errno magnitude (for example 12 = ENOMEM),
+        // negated for display. The watchdog retries; repeated failures indicate a persistent advertising
+        // problem.
+        return 'Advertising start failed (${arg0 == 1 ? "slow" : "fast"}) — errno -$arg1, watchdog will retry';
+      case 14:
+        // The watchdog inferred advertising was down and restarted it; arg0 is the mode. A failed start or a
+        // successful reassertion is evidence, not proof that the radio was off, so the UI says believed.
+        return 'Advertising watchdog rescue (${arg0 == 1 ? "slow" : "fast"}) — '
+            'believed off the air, restarted';
+      case 15:
+        // The stop half of a mode change failed, so the interval could not be
+        // reconfigured. The previous advertiser is still running — this is NOT an
+        // off-air event, which is why it is a separate code from 13.
+        return 'Advertising stop failed (${arg0 == 1 ? "slow" : "fast"}) — errno -$arg1, interval unchanged';
+      case 16:
+        // Peak-hold AAD input over five minutes: arg0 is maximum average amplitude; arg1 packs minimum in the
+        // upper 16 bits and threshold in the lower 16. Consecutive zero-peak windows help distinguish digital
+        // silence from a quiet room, where occasional sound can clear zero without crossing the recording
+        // threshold.
+        final levelMin = (arg1 >> 16) & 0xFFFF;
+        final levelThreshold = arg1 & 0xFFFF;
+        final verdict = arg0 == 0 ? ' — NO SIGNAL (mic may be wedged)' : '';
+        return 'Mic level: peak $arg0, floor $levelMin (threshold $levelThreshold)$verdict';
+      case 17:
+        // Historical code 17: post-update physical rail-cycle attempt. Current firmware
+        // reserves the code and leaves PDM_EN undriven. arg0 = 1 reported that the
+        // old cycle actually ran; these strings decode old records, not current
+        // reset behavior or proof that every zero peak indicates a hardware wedge.
+        return arg0 == 1
+            ? 'Mic rail power-cycled after firmware update'
+            : 'Mic rail NOT cycled after update — a wedged mic would persist';
+      case 18:
+        // The mic gate opened or closed capture. arg1 is the VAD threshold SNAPSHOT at
+        // the transition, NOT the reason for it: a resume driven by button pre-arm or
+        // a marker's force-wake happens while the threshold is still 32769, so
+        // "resumed @32769" is normal and does not mean capture resumed into standby.
+        //
+        // These exist because a parked mic emits nothing at all — no frames means no
+        // vad_level window ever closes — so a gap in the log is otherwise ambiguous
+        // between "off on purpose" and "died". A `parked` record explains a gap; a
+        // gap with no `parked` before it does not.
+        switch (arg0) {
+          case 0:
+            return 'Mic parked — capture stopped (threshold $arg1)';
+          case 1:
+            return 'Mic resumed — capture started (threshold $arg1)';
+          case 2:
+            return 'Mic resume FAILED — dmic START rejected twice, NOT capturing (threshold $arg1)';
+          case 3:
+            // Distinct from a failed START: the driver said yes and the part still
+            // returned digital zero, which a real room never does. This is the wedge
+            // signature, caught at the one moment it matters.
+            return 'Mic resumed but SILENT — first frames were all zero, mic likely wedged (threshold $arg1)';
+          default:
+            return 'Mic state — arg0=$arg0 threshold=$arg1';
+        }
+      case 19:
+        {
+          // Read back from the LSM6DS3TR-C rather than assumed. Nothing in the firmware
+          // consumes motion data — only the 24-bit timestamp counter.
+          //
+          // The healthy reading is NOT "both off", which is what this originally looked
+          // for. The gyro is off (the driver writes ODR_G = 0 at init, so the ~1 mA
+          // free-running gyro this record was added to hunt never existed), but the accel
+          // is deliberately ON at 12.5 Hz: the part gates its internal timebase when both
+          // halves are powered down, which stops the timestamp counter and breaks the
+          // cross-restart time bridge. So `accel OFF` is a FAULT here, not tidiness — and
+          // the thing worth watching is whether it is in low-power mode, since
+          // high-performance costs ~170 uA at any rate for samples nobody reads.
+          //
+          // Bit 15 carries "could not read" rather than a magic arg1 value, because the
+          // all-good reading is arg1 == 0 — byte-for-byte what a failed read would send.
+          final accelSetFailed = (arg0 & 0x1) != 0;
+          final gyroSetFailed = (arg0 & 0x2) != 0;
+          if ((arg0 & 0x8000) != 0) {
+            final accelRc = (arg1 >> 8) & 0xFF;
+            final gyroRc = arg1 & 0xFF;
+            return 'IMU power state UNREADABLE — I2C register read failed '
+                '(set rc accel=$accelRc gyro=$gyroRc, as signed bytes)';
+          }
+          final accelOdr = (arg1 >> 28) & 0x0F; // CTRL1_XL[7:4]
+          final gyroOdr = (arg1 >> 20) & 0x0F; // CTRL2_G[7:4]
+          final accelLowPower = ((arg1 >> 8) & 0x10) != 0; // CTRL6_C bit 4 XL_HM_MODE
+          final gyroLowPower = (arg1 & 0x80) != 0; // CTRL7_G bit 7 G_HM_MODE
+          // The high-performance-disable bits only mean anything on a part that is
+          // running; on a powered-down one they say nothing, so they are not shown.
+          final gyroPart = gyroOdr == 0
+              ? 'gyro OFF'
+              : 'gyro RUNNING (ODR=0x${gyroOdr.toRadixString(16)}'
+                  '${gyroLowPower ? ', low-power' : ', high-perf'}) — ~1 mA, nothing reads it';
+          // Inverted against the gyro on purpose: the accel is the timestamp counter's
+          // keep-alive, so OFF is the bad answer and the mode is what costs.
+          final accelPart = accelOdr == 0
+              ? 'accel OFF — timestamp counter STOPPED, restart time bridge is dead'
+              : 'accel ODR=0x${accelOdr.toRadixString(16)}'
+                  '${accelLowPower ? ' low-power' : ' HIGH-PERF (~170 uA, nothing reads it)'}';
+          // A refused request is worth naming separately from the resulting state: it
+          // says the driver is the problem, not the part.
+          final refused = [
+            if (accelSetFailed) 'accel',
+            if (gyroSetFailed) 'gyro',
+          ];
+          final rcNote = refused.isEmpty ? '' : ' [driver refused: ${refused.join(' + ')}]';
+          return 'IMU: $gyroPart, $accelPart$rcNote';
+        }
+      case 20:
+        {
+          // Written by the boot AFTER the one that rebooted itself (oo-3.1.4, firmware
+          // transport.c "Lost-disconnect recovery"), from a flash record — so its
+          // uptime is this boot's, not the moment of the wedge. arg1 includes the time
+          // spent waiting for silence, since the reboot never interrupts a recording.
+          // arg0 107 (ENOTCONN) says the controller had already let the link go and
+          // only the host's disconnect callback was missing.
+          final err = arg0 == 0 ? 'request accepted' : 'request failed -$arg0${arg0 == 107 ? ' (ENOTCONN)' : ''}';
+          return 'Rebooted itself: a BLE disconnect was never reported ($err), '
+              'rebooted ${(arg1 / 1000).round()} s after asking';
+        }
+      case 21:
+        {
+          // First record of every boot (oo-3.1.4). The ring survives restarts, so this
+          // is the line between one boot's records and the next — and uptimes before
+          // it run on an earlier boot's clock.
+          // arg0 describes the RING: 0 is also a ring that failed its checks while the
+          // rest of retained RAM (mute) survived, so do not claim the RAM was empty.
+          final kept = arg0 == 1 ? "previous boot's events kept" : 'earlier events not kept';
+          return 'Boot — ${DeviceCrashLog.describeResetCause(arg1)}; $kept';
+        }
+      default:
+        return 'Event code=$code backend=$backend arg0=$arg0 arg1=$arg1';
+    }
+  }
+
+  Map<String, dynamic> toJson() => {
+        'seq': seq,
+        'uptimeMs': uptimeMs,
+        'code': code,
+        'label': label,
+        'backend': backend,
+        'arg0': arg0,
+        'arg1': arg1,
+      };
+
+  @override
+  String toString() => '#$seq @${uptimeMs}ms $label$_backendSuffix arg0=$arg0 arg1=$arg1';
+}
+
+/// A single 0x19B10063 read: the 12-byte snapshot header plus whatever full records
+/// fit in this ATT read. On a single-read transport (Android, MTU-bounded) [records]
+/// is a batch and the caller acks + reads again; on a long-read transport (iOS) the
+/// whole snapshot arrives at once. Either way the drain loop terminates when a read
+/// yields zero records.
+///
+/// Header layout (little-endian, from firmware `diag_log.h`):
+///   [u8 record_size=16][u8 reserved][u16 record_count][u32 dropped_count][u32 max_seq]
+class DiagLogSnapshot {
+  /// Firmware record size (16). A mismatch means a wire-format change — the caller
+  /// should stop rather than misparse.
+  final int recordSize;
+
+  /// Total records in the firmware's snapshot (may exceed [records].length when the
+  /// read was MTU-bounded).
+  final int recordCount;
+
+  /// Keep-newest overwrites since the last ack — records lost because the phone was
+  /// away while the ring filled. Nonzero = some events were never captured.
+  final int droppedCount;
+
+  /// Highest seq in the firmware's snapshot (the overall ack ceiling).
+  final int maxSeq;
+
+  /// The full records actually contained in this read (trailing partial bytes are
+  /// discarded).
+  final List<DiagLogRecord> records;
+
+  const DiagLogSnapshot({
+    required this.recordSize,
+    required this.recordCount,
+    required this.droppedCount,
+    required this.maxSeq,
+    required this.records,
+  });
+
+  static const int headerSize = 12;
+
+  /// Parse a 0x0063 read. Returns null if the payload is shorter than the header
+  /// (too-short read tells us nothing — treat as "not available", not empty).
+  static DiagLogSnapshot? parse(List<int> data) {
+    if (data.length < headerSize) return null;
+    final bd = ByteData.sublistView(Uint8List.fromList(data), 0, headerSize);
+    final recordSize = bd.getUint8(0);
+    final recordCount = bd.getUint16(2, Endian.little);
+    final droppedCount = bd.getUint32(4, Endian.little);
+    final maxSeq = bd.getUint32(8, Endian.little);
+
+    final records = <DiagLogRecord>[];
+    // Floor to whole records — a MTU-bounded read can end mid-record; the next read
+    // re-fetches that record whole.
+    final effectiveSize = recordSize == DiagLogRecord.sizeBytes ? recordSize : DiagLogRecord.sizeBytes;
+    final available = data.length - headerSize;
+    final n = available >= 0 ? available ~/ effectiveSize : 0;
+    for (int i = 0; i < n; i++) {
+      final r = DiagLogRecord.fromBytes(data, headerSize + i * effectiveSize);
+      if (r == null) break;
+      records.add(r);
+    }
+    return DiagLogSnapshot(
+      recordSize: recordSize,
+      recordCount: recordCount,
+      droppedCount: droppedCount,
+      maxSeq: maxSeq,
+      records: records,
+    );
+  }
+
+  /// Highest seq among the records actually received in this read — the ack target
+  /// after processing this batch (0 when the batch is empty).
+  int get lastReceivedSeq => records.isEmpty ? 0 : records.last.seq;
+}
+
+/// Aggregate result of a full drain (all batches concatenated). Returned by the
+/// connection-layer drain helper.
+class DiagLogDrainResult {
+  final List<DiagLogRecord> records;
+  final int droppedCount;
+
+  const DiagLogDrainResult({required this.records, required this.droppedCount});
+
+  bool get isEmpty => records.isEmpty && droppedCount == 0;
+}

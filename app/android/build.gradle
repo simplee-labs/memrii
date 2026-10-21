@@ -1,0 +1,60 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+    subprojects {
+        afterEvaluate { project ->
+            if (project.hasProperty('android')) {
+                project.android {
+                    if (namespace == null) {
+                        namespace project.group
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Several bundled plugins still pin Java 8 (audio_session, just_audio,
+// disk_space_2, flutter_secure_storage, opus_flutter_android), which makes the
+// JDK-21 javac warn that source/target 8 is obsolete. Move every Android
+// subproject onto a single modern target (17) instead of just hiding the
+// notice. :app is excluded — it manages its own Java/Kotlin 21 and must not be
+// downgraded. Java and Kotlin must move together or AGP raises "Inconsistent
+// JVM-target compatibility" (e.g. disk_space_2 at Kotlin 1.8, mcumgr_flutter
+// at Kotlin 11).
+subprojects {
+    if (project.path == ':app') {
+        return
+    }
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+            }
+        }
+    }
+    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

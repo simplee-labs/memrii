@@ -1,0 +1,595 @@
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/pm/device_runtime.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/drivers/watchdog.h>
+#include <zephyr/random/random.h>
+
+#include "lib/core/transport.h"
+#include "lib/core/button.h"
+#include "lib/core/led.h"
+#include "lib/core/mic.h"
+#include "lib/core/haptic.h"
+#include "lib/core/utils.h"
+#include "lib/core/lib/battery/battery.h"
+#include "lib/core/sd_card.h"
+#include "lib/core/storage.h"
+#include "lib/core/settings.h"
+#include "lib/core/codec.h"
+#include "lib/core/config.h"
+#include "lib/core/diag_log.h"
+#include "lib/core/retained.h"
+#ifdef CONFIG_OMI_ENABLE_MONITOR
+#include "lib/core/monitor.h"
+#endif
+#include "rtc.h"
+#include "imu.h"
+
+#include "spi_flash.h"
+#include "wdog_facade.h"
+
+#ifdef CONFIG_HWINFO
+#include <zephyr/drivers/hwinfo.h>
+#endif
+
+#include <zephyr/mgmt/mcumgr/grp/img_mgmt/img_mgmt.h>
+#include <zephyr/mgmt/mcumgr/mgmt/callbacks.h>
+#include <zephyr/mgmt/mcumgr/grp/img_mgmt/img_mgmt_callbacks.h>
+
+#include "aad.h"
+
+/* AAD is not optional in this fork — it is the whole capture policy, not the
+ * ultra-low-power add-on its Kconfig help describes. aad.c owns the software VAD
+ * gate as well as the hardware wake line (CONFIG_OMI_ENABLE_VAD_GATE is referenced
+ * by no source file; only aad.c consumes its OMI_VAD_* tunables), so building
+ * without it means:
+ *   - no VAD at all — mic_handler() below feeds every frame to the codec, so the
+ *     device records continuously into a 480 MB card off a 150 mAh cell;
+ *   - no manual mode, which is the app's DEFAULT mode and is driven entirely by
+ *     the 65535/32769 threshold writes that land in aad_set_threshold();
+ *   - no 0xFFFFFFFC session-end markers (emitted from that same finalize path),
+ *     so the app cannot finalize a recording without Force Process;
+ *   - no Priority Recording.
+ * That is a broken device, not a reduced one. It has also not compiled since the
+ * unguarded aad_is_recording() / aad_set_threshold() calls appeared, so the
+ * configuration is provably untested. Fail the build instead of shipping it.
+ * Compare button.c, which forbids the AAD-without-offline-storage combination for
+ * the same reason. */
+#ifndef CONFIG_OMI_ENABLE_T5838_AAD
+#error "CONFIG_OMI_ENABLE_T5838_AAD is required — see the comment above (set it in omi.conf)"
+#endif
+
+LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
+
+#ifdef CONFIG_OMI_ENABLE_BATTERY
+#define BATTERY_FULL_THRESHOLD_PERCENT 98 // 98%
+extern uint8_t battery_percentage;
+#endif
+
+/* Set when the SD card fails to become ready within SD_BOOT_TIMEOUT_MS. The
+ * device keeps running (BLE/mic) but cannot record. set_led_state() then
+ * blinks the LED red, ignoring stealth/mute/marker/button states, so the user
+ * can tell a fault (blinking red) apart from mute (solid red). */
+static volatile bool sd_fatal_error = false;
+#define SD_BOOT_TIMEOUT_MS 90000
+
+static enum mgmt_cb_return ota_mgmt_callback(uint32_t event, enum mgmt_cb_return prev_status,
+                                             int32_t *rc, uint16_t *group, bool *abort_more,
+                                             void *data, size_t data_size)
+{
+    if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STARTED) {
+        LOG_INF("OTA Upload Started — Waking SPI3 bus");
+        sd_set_ota_active(true);
+    } else if (event == MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED) {
+        LOG_INF("OTA Upload Stopped/Finished — Releasing SPI3 bus");
+        sd_set_ota_active(false);
+    } else if (event == MGMT_EVT_OP_IMG_MGMT_DFU_PENDING) {
+        /* The image is fully transferred and marked for boot, so a flash of the
+         * MCUboot primary slot is about to happen. Arm the one-shot bond wipe now
+         * — the device learns a DFU landed from mcumgr directly rather than being
+         * told by the app, so there is no arm command to lose and no write ACK to
+         * misread. transport_start() consumes it on the next boot.
+         *
+         * PENDING rather than STARTED/STOPPED on purpose: STARTED also fires for
+         * an upload that then aborts (which must leave pairing untouched), and
+         * STOPPED fires on both completion and abort. PENDING is the only one of
+         * the three that means "this is really going to be flashed".
+         *
+         * This does write NVS shortly before the reboot, which is the pattern
+         * oo-2.7.3 removed as a suspected cause of bond loss. Harmless here: if
+         * the write corrupts a bond, the outcome is the wipe it was arming. */
+        LOG_INF("OTA image transferred — arming post-flash bond wipe");
+        /* Return ignored on purpose; app_settings_arm_dfu_bond_wipe() already
+         * LOG_ERRs a persist failure. A review asked for the failure to be
+         * handled here — by wiping bonds immediately, or by failing the DFU — on
+         * the grounds that an unarmed device plus an app that clears the phone
+         * bond gives the unrecoverable mismatch. The reasoning is right but the
+         * remedy is worse: bt_unpair() drops this link, so the reset command
+         * never lands and the DFU fails. If settings_save_one() is failing it
+         * will fail on the retry too, which turns "updates, then needs a 5-tap"
+         * into "can never update at all". Failing the DFU outright has the same
+         * shape. Nor is the trigger demonstrable: this NVS holds a handful of
+         * small keys in two GC'd sectors, so a write error means the flash
+         * hardware is already gone. Left as-is deliberately. */
+        (void) app_settings_arm_dfu_bond_wipe();
+    }
+    return MGMT_CB_OK;
+}
+
+static struct mgmt_callback ota_mgmt_cb = {
+    .callback = ota_mgmt_callback,
+    .event_id = (MGMT_EVT_OP_IMG_MGMT_DFU_STARTED | MGMT_EVT_OP_IMG_MGMT_DFU_STOPPED |
+                 MGMT_EVT_OP_IMG_MGMT_DFU_PENDING),
+};
+
+atomic_t is_connected = ATOMIC_INIT(0);
+bool is_charging = false;
+bool is_off = false;
+
+static bool blink_toggle = false;
+
+static void mic_handler(int16_t *buffer)
+{
+    /* The VAD gate. Returning false means AAD is asleep (silence) and the frame is
+     * held in pre-roll instead — this is what keeps the codec and the SD write path
+     * idle for most of the day. */
+    if (!aad_process_audio(buffer, MIC_BUFFER_SAMPLES)) {
+        return;
+    }
+
+    int err = codec_receive_pcm(buffer, MIC_BUFFER_SAMPLES);
+    if (err) {
+        LOG_ERR("Failed to process PCM data: %d", err);
+    }
+}
+
+static void boot_led_sequence(void)
+{
+    led_start_breathing();
+    LOG_INF("[BOOT] LEDs breathing white — waiting for SD + mic");
+}
+
+static void boot_warming_sequence(void)
+{
+    const int delay_ms = 10;
+    int64_t wait_start_ms = k_uptime_get();
+
+    /* Spin while LEDs are breathing until sd_worker finishes the card power-on +
+     * ring mount. Fast and roughly constant — it no longer scales with how much
+     * audio is on the card, as it did while the filesystem's allocator pre-warm
+     * (up to ~50 s at 200 MB) ran here.
+     * Bounded: if the SD never initializes (card fault / unrecoverable corruption,
+     * which returns the sd_worker thread before it sets sd_boot_ready), do NOT
+     * spin forever feeding the watchdog — give up, flag fatal, and let the device
+     * come up without storage so the red-LED fault indicator can run. */
+    while (!sd_is_boot_ready()) {
+        watchdog_feed();
+        k_msleep(delay_ms);
+        if ((k_uptime_get() - wait_start_ms) >= SD_BOOT_TIMEOUT_MS) {
+            LOG_ERR("[BOOT] SD not ready after %d ms — starting WITHOUT storage (FATAL)",
+                    SD_BOOT_TIMEOUT_MS);
+            sd_fatal_error = true;
+            return;
+        }
+    }
+    LOG_INF("[BOOT] SD ready after %lld ms — starting mic", k_uptime_get() - wait_start_ms);
+}
+
+static void boot_ready_fade(void)
+{
+    const int steps = 100; // 100 steps * 10 ms = 1000 ms fade
+    const int delay_ms = 10;
+
+    /* SD + mic are ready — solid white for 1s, then fade down to off. */
+    uint8_t start = app_settings_get_dim_ratio();
+    LOG_INF("[BOOT] Solid white for 1s, then fading to off (from dim_ratio=%u)", start);
+
+    set_led_pwm(LED_RED, start);
+    set_led_pwm(LED_GREEN, start);
+    set_led_pwm(LED_BLUE, start);
+    k_msleep(1000);
+
+    for (int i = steps; i >= 0; i--) {
+        float t = (float) i / steps;
+        uint8_t level = (uint8_t) (t * start);
+        set_led_pwm(LED_RED, level);
+        set_led_pwm(LED_GREEN, level);
+        set_led_pwm(LED_BLUE, level);
+        k_msleep(delay_ms);
+    }
+    led_off();
+    LOG_INF("[BOOT] Ready — total boot time %lld ms", k_uptime_get());
+}
+
+void set_led_state()
+{
+    if (is_off) {
+        led_off();
+        return;
+    }
+
+    // Fatal SD fault: blink red. Overrides stealth/mute/marker/charging and is
+    // unaffected by any button press, so a fault (blinking red) is distinguishable
+    // from mute (solid red). Toggles each ~500ms loop pass (see k_msleep below).
+    if (sd_fatal_error) {
+        set_led_red(blink_toggle);
+        set_led_green(false);
+        set_led_blue(false);
+        blink_toggle = !blink_toggle;
+        return;
+    }
+
+    // Priority 1: Marker Flash (Transient, overrides stealth)
+    if (marker_flash_count > 0) {
+        set_led_red(marker_flash_color == MARKER_FLASH_WHITE || marker_flash_color == MARKER_FLASH_RED);
+        set_led_green(marker_flash_color == MARKER_FLASH_WHITE || marker_flash_color == MARKER_FLASH_GREEN);
+        set_led_blue(marker_flash_color == MARKER_FLASH_WHITE);
+        return;
+    }
+
+    // Stealth gate: LEDs off unless the user has enabled them. is_led_enabled is
+    // the single source of truth — mute force-enables it (see mute_apply()) so a
+    // mute tap gives feedback even from the default-off state, yet the user can
+    // still toggle the LED back off mid-mute (BUTTON_ACTION_TOGGLE_LED writes
+    // is_led_enabled directly). Charging bypasses this gate at display time so
+    // the charge indicator shows in stealth without mutating is_led_enabled —
+    // otherwise charging's save/restore would race mute's and could drop the red
+    // mute indicator on charge-stop while still muted.
+    if (!is_led_enabled && !is_charging) {
+        led_off();
+        return;
+    }
+
+    // Base Color Determination (Priority: Mute > Low Bat > Connect > Active)
+    bool r = false, g = false, b = false;
+
+    uint16_t thr = aad_get_threshold();
+    bool in_manual = (thr == 32769 || thr == 65535);
+
+    if (is_muted) {
+        r = true; // Solid Red
+    } else if (battery_ready && battery_percentage < 10) {
+        r = true; b = true; // Purple
+    } else if (atomic_get(&is_connected) && app_settings_get_connected_led()) {
+        b = true; // Solid Blue — connected wins over mode state (unless the user turned it off)
+    } else if (in_manual) {
+        if (thr == 65535) {
+            r = true; g = true; // Yellow — manual recording active (disconnected)
+        }
+        // manual standby disconnected: all off
+    } else if (aad_is_recording()) {
+        r = true; g = true; // Yellow — auto recording active (disconnected)
+    }
+    // idle disconnected: all off
+
+    // Final state based on charging
+    if (is_charging) {
+        if (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT) {
+            // Full: Solid Green
+            set_led_red(false);
+            set_led_green(true);
+            set_led_blue(false);
+        } else {
+            // Charging: Blink between Green and Base Color
+            if (blink_toggle) {
+                set_led_red(false);
+                set_led_green(true);
+                set_led_blue(false);
+            } else {
+                set_led_red(r);
+                set_led_green(g);
+                set_led_blue(b);
+            }
+            blink_toggle = !blink_toggle;
+        }
+    } else {
+        // Normal Use: Solid Base Color
+        set_led_red(r);
+        set_led_green(g);
+        set_led_blue(b);
+    }
+}
+
+#ifdef CONFIG_HWINFO
+static void log_reset_cause(uint32_t cause)
+{
+    if (cause == 0) {
+        LOG_INF("[BOOT] Reset cause: unknown/none (0x00000000)");
+        return;
+    }
+    if (cause & RESET_WATCHDOG) {
+        LOG_WRN("[BOOT] Reset cause: WATCHDOG TIMEOUT (0x%08x) — firmware hung for >30 s", cause);
+    }
+    if (cause & RESET_CPU_LOCKUP) {
+        LOG_WRN("[BOOT] Reset cause: CPU LOCKUP / HARDFAULT (0x%08x)", cause);
+    }
+    if (cause & RESET_SOFTWARE) {
+        LOG_INF("[BOOT] Reset cause: software reset (0x%08x)", cause);
+    }
+    if (cause & RESET_PIN) {
+        LOG_INF("[BOOT] Reset cause: pin/button reset (0x%08x)", cause);
+    }
+    if (cause & RESET_POR) {
+        LOG_INF("[BOOT] Reset cause: power-on reset (0x%08x)", cause);
+    }
+    if (cause & RESET_BROWNOUT) {
+        LOG_WRN("[BOOT] Reset cause: brownout / low voltage (0x%08x)", cause);
+    }
+}
+#endif
+
+static int suspend_unused_modules(void)
+{
+    flash_off();
+    return 0;
+}
+
+int main(void)
+{
+    int ret;
+    printk("Starting memrii firmware (Omi hardware) ...\n");
+
+    /* Initialize unique session ID for this boot session. Race-safe vs.
+     * the button-tap marker path which may also lazy-init on boot (B18). */
+    if (atomic_get(&device_session_id) == 0) {
+        uint32_t sid;
+        do {
+            sid = sys_rand32_get();
+        } while (sid == 0);
+        /* atomic_cas returns false if another path beat us; their ID wins. */
+        (void)atomic_cas(&device_session_id, 0, (atomic_val_t)sid);
+    }
+
+    ret = led_start();
+    if (ret) printk("LED failed %d\n", ret);
+    boot_led_sequence();
+
+    haptic_init();
+    play_haptic_milli(100);
+
+    app_settings_init();
+
+    /* Seed the LED master gate from its persisted default. is_led_enabled is
+     * volatile RAM (a button gesture toggles it for the session only), so
+     * without this it is off after every reboot. Safe to write here: the button
+     * thread — the only other writer — is not started until button_init() far
+     * below. */
+    is_led_enabled = app_settings_get_led_boot_enabled();
+
+    /* Validate retained RAM (mute + the diagnostic event ring) before anything reads or
+     * writes it. A slice that does not carry this firmware's signature is reset. */
+    const bool retained_kept = retained_init();
+
+    /* Adopt the previous boot's diagnostic event ring if it survived, otherwise start
+     * it empty — before any thread could enqueue (no-op when CONFIG_OMI_DIAG_LOG is
+     * off). Starts disabled — the app enables it at runtime. */
+    const bool diag_kept = diag_log_init();
+    uint32_t boot_cause = 0;
+
+#ifdef CONFIG_OMI_ENABLE_MONITOR
+    /* Same reason, and it must stay AHEAD of transport_start(): the pusher that
+     * starts there feeds monitor_inc_tx_queue_write() / monitor_inc_storage_write(),
+     * and monitor_init() calls monitor_reset() — so initialising later would zero
+     * counts that had already accrued. */
+    monitor_init();
+#endif
+
+#ifdef CONFIG_HWINFO
+    {
+        uint32_t this_cause = 0;
+        hwinfo_get_reset_cause(&this_cause);
+        hwinfo_clear_reset_cause();
+        boot_cause = this_cause;
+
+        /* this_cause = why THIS boot started = how the PREVIOUS session ended.
+         * prev_cause = NVS value = why the PREVIOUS boot started = how boot-before-that ended.
+         * Log both for full history, but only warn on this_cause for the current-session crash. */
+        uint32_t prev_cause = app_settings_get_last_reset_cause();
+        uint64_t prev_uptime = app_settings_get_last_reset_uptime_ms();
+
+        if (this_cause & (RESET_WATCHDOG | RESET_CPU_LOCKUP)) {
+            LOG_WRN("[BOOT] *** PREVIOUS SESSION CRASHED (cause: 0x%08x, ran ~%llu ms) ***",
+                    this_cause, prev_uptime);
+            log_reset_cause(this_cause);
+        } else {
+            LOG_INF("[BOOT] This boot cause: 0x%08x (prev session ran ~%llu ms)", this_cause, prev_uptime);
+            log_reset_cause(this_cause);
+        }
+
+        if (prev_cause != 0) {
+            LOG_INF("[BOOT] Boot-before-last cause: 0x%08x", prev_cause);
+        }
+
+        /* Snapshot previous session's final uptime before overwriting the main record.
+         * This is the value the BLE diagnostics char returns so the app can show
+         * "crashed after Xh Ym" rather than current-session uptime (which starts at 0). */
+        app_settings_save_crash_session_uptime(prev_uptime);
+
+        /* Overwrite NVS with this boot's cause; uptime starts at 0 and is updated in the main loop */
+        app_settings_save_last_reset(this_cause, 0);
+
+    }
+#endif
+
+    /* First record of every boot. The ring now survives restarts, so this is what tells
+     * a reader where one boot's records (and their uptime clock) end. Forced: the gate
+     * is closed until the app connects. */
+    diag_log_event_forced(DIAG_BOOT, 0, diag_kept ? 1 : 0, boot_cause);
+
+    app_sd_init();
+    init_rtc();
+
+#ifdef CONFIG_LSM6DSL
+    /* Recover UTC time using IMU timestamp delta if we just rebooted. */
+    lsm6dsl_time_boot_adjust_rtc();
+#endif
+
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    storage_init();
+#endif
+
+    // Initialize battery
+#ifdef CONFIG_OMI_ENABLE_BATTERY
+    ret = battery_init();
+    if (ret) {
+        /* Log and continue. Returning here left main() dead BEFORE watchdog_init(),
+         * so the device ran with no LED state machine and no uptime bookkeeping —
+         * and recording needs none of the ADC. A missing battery reading costs the
+         * charge indicator and the critical-voltage shutdown, not the recorder. */
+        LOG_ERR("Battery init failed (err %d) — continuing without battery monitoring", ret);
+    } else {
+        LOG_INF("Battery initialized");
+    }
+#endif
+
+    suspend_unused_modules();
+
+    ret = watchdog_init();
+    if (ret) LOG_ERR("WD failed %d", ret);
+
+    ret = button_init();
+    if (ret) LOG_ERR("BTN failed %d", ret);
+    // Button work is now interrupt-driven; no startup polling needed.
+
+    ret = transport_start();
+    if (ret) LOG_ERR("BLE failed %d", ret);
+
+    mgmt_callback_register(&ota_mgmt_cb);
+
+    boot_warming_sequence();
+
+    /* Did the last boot reboot itself to recover a link wedge (transport.c, "Lost-
+     * disconnect recovery")? Reported from its flash record, so the evidence does not
+     * depend on the retained ring. Consumed here, directly before the mute restore that
+     * is its other use, so the record is not cleared seconds before anything acts on it. */
+    bool wedge_muted = false;
+    uint32_t wedge_mute_since = 0;
+    {
+        uint16_t err_magnitude = 0;
+        uint32_t waited_ms = 0;
+        if (app_settings_take_wedge_reboot(&wedge_muted, &wedge_mute_since, &err_magnitude, &waited_ms)) {
+            LOG_WRN("[BOOT] Previous boot rebooted itself: BLE disconnect never reported (err %d, %u ms)",
+                    -(int) err_magnitude,
+                    waited_ms);
+            diag_log_event_forced(DIAG_LINK_WEDGE_REBOOT, 0, err_magnitude, waited_ms);
+        }
+    }
+
+    /* Put back a mute that was on when the device last went down — before the mic
+     * starts, and after the SD card is ready so the mute-on marker reaches it.
+     *
+     * Retained RAM is the record whenever it survived: it tracked every mute change up
+     * to the moment the device went down, a reboot, a crash or a power-off. The wedge
+     * record is only the backstop for when it did not, so a stale one — a clear that
+     * failed to persist, re-reported on every later boot — can never override a mute the
+     * user has changed since. */
+    {
+        uint32_t mute_since = 0;
+        bool muted = retained_mute_get(&mute_since);
+        if (!retained_kept && wedge_muted) {
+            muted = true;
+            mute_since = wedge_mute_since;
+        }
+        if (muted) {
+            mute_restore_at_boot(mute_since);
+        }
+    }
+
+    /* The one and only mic registration, and it must stay between transport_start()
+     * and mic_start(). set_mic_callback() is a bare assignment, so whichever call runs
+     * last wins; transport_start() used to make a second one (on_mic_audio, feeding the
+     * codec directly) that this line silently overwrote — removed in oo-3.1.3, because a
+     * dead VAD-less capture path sitting seven lines above the live one is a reordering
+     * away from recording continuously with no gate, no pre-roll, and no
+     * mic_last_frame_uptime_ms, i.e. diagnostics reporting a dead mic while the card
+     * fills. The ordering against mic_start() is separately load-bearing and documented
+     * at each of its own reasons (mic.h, mic.c, aad.c, sd_card.c); this is the callback's
+     * reason, which none of those cover. */
+    set_mic_callback(mic_handler);
+    ret = mic_start();
+    if (ret) {
+        /* Do NOT return: this point is past watchdog_init(), so leaving main() means
+         * nothing ever feeds the watchdog and the device reboots every 30 s, forever.
+         * Come up deaf but reachable instead — the same choice sd_fatal_error makes
+         * for a dead card — so the fault can be read over BLE and flashed out of. */
+        LOG_ERR("Mic failed %d — continuing without capture", ret);
+    }
+
+    /* Honour a mute that arrived before the mic existed. transport_start() runs
+     * earlier in this function, so a phone can connect and write the mute
+     * characteristic (or the user can tap the gesture) while mic_running is still
+     * false — mute_apply() sets is_muted and calls mic_pause(), which finds nothing
+     * to stop, and mic_start() then happily begins capturing on a device the user
+     * has muted. Narrow window, but the failure is capture-while-muted, so it gets
+     * closed rather than argued about.
+     *
+     * Read and act under mic_state_lock, which mute_apply() now also holds across
+     * its own is_muted write. Without that this reconciliation is itself a
+     * check-then-act: an unmute landing between the read and the pause would resume
+     * capture and then have it stopped here, leaving is_muted false with a stopped
+     * mic and nothing to resume it — the mirror of the bug being fixed. Under the
+     * lock the two orderings are the only possibilities, and both end consistent. */
+    k_mutex_lock(&mic_state_lock, K_FOREVER);
+    if (is_muted) {
+        LOG_WRN("Muted before the mic started — pausing capture to honour it");
+        mic_pause();
+    }
+    k_mutex_unlock(&mic_state_lock);
+
+#ifdef CONFIG_OMI_ENABLE_T5838_AAD
+    ret = aad_start();
+    if (ret) {
+        LOG_ERR("AAD start failed (%d)", ret);
+    }
+#endif
+
+    led_stop_breathing();
+
+    /* On fatal SD fault, skip the green-ish ready fade and let the main loop
+     * drive the solid-red fault indicator instead. */
+    if (!sd_fatal_error) {
+        boot_ready_fade();
+    }
+
+    LOG_INF("Ready\n");
+
+    /* Save uptime every 10 minutes so the next boot can report session length on crash.
+     * Re-reads the cause we saved at boot (hwinfo was already cleared by then). */
+#ifdef CONFIG_HWINFO
+    static uint32_t uptime_save_ticks = 0;
+    static const uint32_t UPTIME_SAVE_INTERVAL_MS = 10 * 60 * 1000;
+    uint32_t this_boot_cause = app_settings_get_last_reset_cause();
+#endif
+
+    while (1) {
+        watchdog_feed();
+
+
+#ifdef CONFIG_OMI_ENABLE_MONITOR
+        monitor_log_metrics();
+#endif
+
+        set_led_state();
+
+        // Transient effect handling
+        if (marker_flash_count > 0) {
+            marker_flash_count--;
+        }
+
+#ifdef CONFIG_HWINFO
+        {
+            uint32_t now_ms = (uint32_t)k_uptime_get();
+            if ((now_ms - uptime_save_ticks) >= UPTIME_SAVE_INTERVAL_MS) {
+                uptime_save_ticks = now_ms;
+                app_settings_save_last_reset(this_boot_cause, (uint64_t)now_ms);
+            }
+        }
+#endif
+
+        k_msleep(500); // More responsive loop for blinking
+    }
+
+    return 0;
+}

@@ -1,0 +1,146 @@
+import 'dart:async';
+import 'package:omi/services/devices/device_connection.dart';
+import 'package:omi/services/devices/discovery/device_locator.dart';
+export 'package:omi/services/devices/discovery/device_locator.dart';
+import 'package:omi/utils/logger.dart';
+
+/// Which kind of capture device a [BtDevice] is — one value per `DeviceAdapter`.
+///
+/// Stored in the persisted device by index (`toJson`), so values are only ever appended:
+/// reordering or removing one would re-type every paired device already saved.
+enum DeviceType {
+  omi;
+
+  /// The persisted index read back, or [omi] for anything unreadable. A device saved
+  /// before the type was read back at all carries index 0, which is [omi].
+  static DeviceType fromIndex(Object? index) =>
+      index is int && index >= 0 && index < DeviceType.values.length ? DeviceType.values[index] : DeviceType.omi;
+}
+
+/// Mirrors the firmware capability bitfield in `omi/firmware/omi/src/lib/core/
+/// features.h`, read from the Features service (`0021`). Keep the two in step.
+class OmiFeatures {
+  static const int speaker = 1 << 0;
+  static const int accelerometer = 1 << 1;
+  static const int button = 1 << 2;
+  static const int battery = 1 << 3;
+  static const int usb = 1 << 4;
+  static const int haptic = 1 << 5;
+  static const int offlineStorage = 1 << 6;
+  static const int ledDimming = 1 << 7;
+  static const int micGain = 1 << 8;
+  static const int vadThreshold = 1 << 9;
+  static const int priorityRecordCap = 1 << 10;
+  static const int recordToggle = 1 << 11;
+  // On-device diagnostic event log (BLE 0x0063 drain / 0x0064 control) is
+  // compiled into the firmware. Gates the Debug Tools event-log toggle.
+  static const int diagLog = 1 << 12;
+  // The LED service (0x0080) exists: the connected (solid blue) indicator can
+  // be turned off, and the LED master gate has a persisted boot value. Gates
+  // both Customization switches — older firmware has neither.
+  static const int ledService = 1 << 13;
+  // The recording-state characteristic (0x0083, inside the LED service) exists:
+  // the device reports a manual / Priority Recording live, read on connect and
+  // notified on change. Gates the Priority Recording banner (oo-3.1.4).
+  static const int recordingState = 1 << 14;
+
+  static bool hasFeature(int features, int feature) {
+    return (features & feature) != 0;
+  }
+}
+
+class BtDevice {
+  final String id;
+  final String name;
+  final int rssi;
+  final DeviceType type;
+  // Protocol-agnostic discovery locator for post-discovery connection
+  final DeviceLocator? locator;
+  final String? modelNumber;
+  final String? firmwareRevision;
+  final String? hardwareRevision;
+  final String? manufacturerName;
+  final String? serialNumber;
+
+  BtDevice({
+    required this.id,
+    required this.name,
+    required this.type,
+    required this.rssi,
+    this.locator,
+    this.modelNumber,
+    this.firmwareRevision,
+    this.hardwareRevision,
+    this.manufacturerName,
+    this.serialNumber,
+  });
+
+  factory BtDevice.empty() => BtDevice(id: '', name: '', type: DeviceType.omi, rssi: 0);
+
+  factory BtDevice.fromJson(Map<String, dynamic> json) {
+    return BtDevice(
+      id: json['id'],
+      name: json['name'],
+      rssi: json['rssi'] ?? 0,
+      type: DeviceType.fromIndex(json['type']),
+      locator: json['locator'] != null ? DeviceLocator.fromJson(json['locator']) : null,
+      modelNumber: json['modelNumber'],
+      firmwareRevision: json['firmwareRevision'],
+      hardwareRevision: json['hardwareRevision'],
+      manufacturerName: json['manufacturerName'],
+      serialNumber: json['serialNumber'],
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'rssi': rssi,
+      'type': type.index,
+      'locator': locator?.toJson(),
+      'modelNumber': modelNumber,
+      'firmwareRevision': firmwareRevision,
+      'hardwareRevision': hardwareRevision,
+      'manufacturerName': manufacturerName,
+      'serialNumber': serialNumber,
+    };
+  }
+
+  BtDevice copyWith({
+    String? id,
+    String? name,
+    int? rssi,
+    DeviceType? type,
+    DeviceLocator? locator,
+    String? modelNumber,
+    String? firmwareRevision,
+    String? hardwareRevision,
+    String? manufacturerName,
+    String? serialNumber,
+  }) {
+    return BtDevice(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      rssi: rssi ?? this.rssi,
+      type: type ?? this.type,
+      locator: locator ?? this.locator,
+      modelNumber: modelNumber ?? this.modelNumber,
+      firmwareRevision: firmwareRevision ?? this.firmwareRevision,
+      hardwareRevision: hardwareRevision ?? this.hardwareRevision,
+      manufacturerName: manufacturerName ?? this.manufacturerName,
+      serialNumber: serialNumber ?? this.serialNumber,
+    );
+  }
+
+  Future<BtDevice> getDeviceInfo(DeviceConnection? conn) async {
+    if (conn == null) return this;
+
+    try {
+      return await conn.performGetDeviceInfo(conn);
+    } catch (e) {
+      Logger.error('Error getting device info: $e');
+      return this;
+    }
+  }
+}

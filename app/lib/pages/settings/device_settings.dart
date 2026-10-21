@@ -1,0 +1,1764 @@
+import 'package:omi/gen/pigeon_communicator.g.dart';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:provider/provider.dart';
+
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/backend/schema/bt_device/bt_device.dart';
+import 'package:omi/pages/dfuota/firmware_update.dart';
+import 'package:omi/utils/device.dart';
+import 'package:omi/utils/logger.dart';
+import 'package:omi/providers/device_provider.dart';
+import 'package:omi/services/services.dart';
+import 'package:omi/services/devices/device_connection.dart';
+import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/services/wals/wal_interfaces.dart';
+import 'package:omi/pages/settings/button_config_page.dart';
+import 'package:omi/widgets/dialog.dart';
+
+/// The firmware-owned settings this page can edit, used to keep one row's edit
+/// from discarding another row's in-flight read. See [_DeviceSettingsState._userChanged].
+enum _Setting { dimRatio, micGain, vadThreshold, priorityCap, connectedLed, ledBoot }
+
+class DeviceSettings extends StatefulWidget {
+  const DeviceSettings({super.key});
+
+  @override
+  State<DeviceSettings> createState() => _DeviceSettingsState();
+}
+
+class _DeviceSettingsState extends State<DeviceSettings> {
+  // Every read this page makes — DIS info, the capability bitfield, each
+  // firmware-owned setting, storage stats — is gated behind this one flag so
+  // the Customization / Device Info / Hardware sections appear together
+  // instead of popping in row by row as each BLE read lands.
+  bool _isLoading = true;
+
+  /// Set when the capability read came back "busy" because a sync holds the BLE
+  /// link, as opposed to failing. The distinction is the whole point: a failed
+  /// capability read returns 0, and 0 is indistinguishable from "this Omi has no
+  /// features", so five rows — LED brightness, mic gain, sensitivity, priority
+  /// cap, LED switches — vanish at once. That is the half-empty page. Say the Omi
+  /// is busy and come back instead.
+  bool _waitingForSync = false;
+  Timer? _syncWaitTimer;
+
+  /// Re-runs the load once the sync that is holding the link finishes.
+  ///
+  /// A poll rather than a listener because the page has no other reason to
+  /// subscribe to sync state, and the check is a field read. Cancelled on
+  /// dispose and as soon as it fires, so at most one is ever live.
+  void _armSyncWait() {
+    _syncWaitTimer?.cancel();
+    _syncWaitTimer = Timer.periodic(const Duration(seconds: 2), (t) async {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (ServiceManager.instance().wal.getSyncs().isSyncing) return;
+      t.cancel();
+      setState(() {
+        _waitingForSync = false;
+        _isLoading = true;
+      });
+      await _loadAll();
+    });
+  }
+
+  double _dimRatio = 100.0;
+  bool? _hasDimmingFeature;
+
+  // LED service (0x0080) settings. Both are firmware-owned — there is no local
+  // pref — so they're read on open and written straight through on toggle. One
+  // capability gate covers both, since they ship in the same firmware.
+  bool? _hasLedServiceFeature;
+
+  // Solid-blue "connected to phone" indicator.
+  bool _connectedLed = true;
+  bool _connectedLedBusy = false;
+
+  // Boot value of the device's LED master gate; false is the historical
+  // behaviour (LEDs off after every reboot).
+  bool _ledBootEnabled = false;
+  bool _ledBootBusy = false;
+
+  double _micGain = 5.0;
+  bool? _hasMicGainFeature;
+
+  late double _vadThreshold;
+  bool? _hasVadThresholdFeature;
+
+  late int _priorityRecordCap; // minutes; 0 = no cap
+  bool? _hasPriorityCapFeature;
+
+  Timer? _debounce;
+  Timer? _micGainDebounce;
+  Timer? _vadThresholdDebounce;
+
+  bool _isWiping = false;
+
+  /// Settings the user has edited on this page, which the initial load must not
+  /// overwrite with a value read before the edit. See [_applyLoaded].
+  ///
+  /// PER-SETTING, not one flag for the page. A single global latch meant editing
+  /// any one row discarded every other row's in-flight read: on the backstop path
+  /// (rows go live at 15 s whether or not the reads landed) touching mic gain
+  /// froze dim ratio, both LED switches and the priority cap at their defaults for
+  /// the life of the page, each silently disagreeing with the device and each
+  /// ready to be written back from that wrong baseline.
+  final Set<_Setting> _userChanged = {};
+
+  @override
+  void initState() {
+    _vadThreshold = SharedPreferencesUtil().autoVadThreshold.toDouble();
+    _priorityRecordCap = SharedPreferencesUtil().priorityRecordMaxMinutes;
+    // Seed synchronously, BEFORE the first frame, so a warm cache means no spinner
+    // at all rather than a spinner that resolves quickly. Safe to run here while
+    // _isLoading is still true: _applyLoaded assigns directly in that state and
+    // never calls setState, which initState forbids.
+    final provider = context.read<DeviceProvider>();
+    _seedFromProviderCache(provider);
+    // The gate exists so the sections appear together instead of row by row. With
+    // the capability bits already in hand there is nothing left to wait for — the
+    // reads _loadAll still runs are a refresh, and they repaint themselves.
+    if (provider.deviceFeatures != null) _isLoading = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadAll());
+    super.initState();
+  }
+
+  /// Refreshes every value the page's sections show, then lifts [_isLoading].
+  ///
+  /// Usually a no-op for the gate: [initState] seeds from the connect-time cache
+  /// and drops the spinner before the first frame, so this runs as a background
+  /// refresh and each value repaints itself through [_applyLoaded]. The gate only
+  /// really holds on a cold cache — the capability read failed at connect, or the
+  /// app started with the device already connected before one happened.
+  ///
+  /// The timeout is a backstop, not a budget: a read that wedges must not leave
+  /// the page on a spinner forever. Falling through renders whatever did land,
+  /// and anything still in flight paints as it arrives (see [_applyLoaded]) —
+  /// which together is the pre-gate behaviour.
+  Future<void> _loadAll() async {
+    final provider = context.read<DeviceProvider>();
+    try {
+      await _loadDeviceData(provider).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      Logger.debug('DeviceSettings: initial load did not complete — $e');
+    }
+    if (mounted) setState(() => _isLoading = false);
+  }
+
+  Future<void> _loadDeviceData(DeviceProvider provider) async {
+    // Only when the provider has nothing. Connect caches DIS, so re-reading on
+    // every open cost five plain GATT reads that could land mid-sync — the same
+    // unguarded-read-into-the-transfer-stream shape everything else here avoids.
+    if ((provider.pairedDevice?.firmwareRevision ?? '').isEmpty) {
+      await provider.getDeviceInfo();
+    }
+    // Battery level comes from the BLE notification listener set up on connect.
+    // Calling updateBatteryLevel() would try to READ the detail characteristic,
+    // which is notify-only (GATT_READ_NOT_PERMITTED). Skip it here.
+    //
+    // SERIAL, not Future.wait. refreshStorageStats takes the storage lock for the
+    // whole listFiles round trip (including a 2 s CCCD settle on first subscribe),
+    // while _loadDeviceSettings' capability read is a NON-BLOCKING tryAcquire — so
+    // run concurrently, the settings read lost the lock to its own page, answered
+    // null three times inside its 1.2 s of retries, and gave up silently. Nothing
+    // is syncing in that case, so the "Waiting for sync" branch never fired
+    // either: the page came up with every capability-gated row missing and no
+    // explanation. They are both serial internally, so ordering them costs only
+    // wall-clock, and the settings go first because they are what the page is for.
+    await _loadDeviceSettings();
+    // NOT awaited, and not part of the gate. Storage stats takes the storage lock
+    // for a full listFiles round trip (seconds), and the Storage row renders
+    // straight off `provider.storageStats` with its own `!= null` guard — so
+    // holding the spinner for it made every other section wait on a value none of
+    // them use. Serialization is still intact: _loadDeviceSettings has completed
+    // and released its read before this starts.
+    unawaited(provider.refreshStorageStats());
+  }
+
+  @override
+  void dispose() {
+    _syncWaitTimer?.cancel();
+    _debounce?.cancel();
+    _micGainDebounce?.cancel();
+    _vadThresholdDebounce?.cancel();
+    super.dispose();
+  }
+
+  /// Applies one value from the initial load.
+  ///
+  /// While the gate is closed nothing is on screen, so the assignment stands
+  /// alone. Once it is open — [_loadAll]'s 15 s backstop can fire mid-chain,
+  /// and a wedged GATT read self-times-out at 10 s — each arrival has to paint
+  /// itself: the reads below are serial, so one slow read would otherwise hold
+  /// an already-landed value off screen for up to its own timeout.
+  ///
+  /// Skipped once the user has changed something. Rows are only tappable after
+  /// the gate opens, so on the normal path this never applies; on the backstop
+  /// path a row can be edited while its own read is still in flight, and that
+  /// read completes holding the pre-edit value.
+  void _applyLoaded(VoidCallback assign, [_Setting? setting]) {
+    if (!mounted) return;
+    // Only the row the user actually touched is protected; everything else still
+    // accepts what the device says.
+    if (setting != null && _userChanged.contains(setting)) return;
+    if (_isLoading) {
+      assign();
+    } else {
+      setState(assign);
+    }
+  }
+
+  /// Applies a change the user made, and hands them the page: see [_applyLoaded].
+  void _applyUserChange(_Setting setting, VoidCallback assign) {
+    _userChanged.add(setting);
+    setState(assign);
+  }
+
+  /// Applies whatever the connect-time read cached, so a row never renders a
+  /// fabricated default it would then write back.
+  ///
+  /// The danger this closes: the rows become tappable when [_isLoading] lifts,
+  /// which the 15 s backstop can force while reads are still in flight. Every
+  /// write here is ABSOLUTE, not a delta — so nudging a slider that is showing a
+  /// default sends a value derived from a baseline that was never the device's
+  /// (you move 5→6; the device was at 2 and is now 6). Seeding first means the
+  /// baseline is real even when the reads never land.
+  void _seedFromProviderCache(DeviceProvider provider) {
+    final f = provider.deviceFeatures;
+    if (f != null) {
+      _hasDimmingFeature = OmiFeatures.hasFeature(f, OmiFeatures.ledDimming);
+      _hasMicGainFeature = OmiFeatures.hasFeature(f, OmiFeatures.micGain);
+      _hasVadThresholdFeature = OmiFeatures.hasFeature(f, OmiFeatures.vadThreshold);
+      _hasPriorityCapFeature = OmiFeatures.hasFeature(f, OmiFeatures.priorityRecordCap);
+      _hasLedServiceFeature = OmiFeatures.hasFeature(f, OmiFeatures.ledService);
+    }
+    final dim = provider.deviceLedDimRatio;
+    if (dim != null) _applyLoaded(() => _dimRatio = dim.toDouble(), _Setting.dimRatio);
+    final gain = provider.deviceMicGain;
+    if (gain != null) _applyLoaded(() => _micGain = gain.toDouble(), _Setting.micGain);
+    final thr = provider.deviceVadThreshold;
+    // 32769/65535 are the manual-mode sentinels, not a sensitivity — the slider
+    // only means anything for a real auto value.
+    if (thr != null && thr != 32769 && thr != 65535) {
+      _applyLoaded(() => _vadThreshold = thr.toDouble(), _Setting.vadThreshold);
+    }
+    final cap = provider.devicePriorityRecordCap;
+    if (cap != null) _applyLoaded(() => _priorityRecordCap = cap, _Setting.priorityCap);
+    final led = provider.deviceConnectedLed;
+    if (led != null) _applyLoaded(() => _connectedLed = led, _Setting.connectedLed);
+    final boot = provider.deviceLedBootEnabled;
+    if (boot != null) _applyLoaded(() => _ledBootEnabled = boot, _Setting.ledBoot);
+  }
+
+  /// Reads the capability bitfield and then each supported setting. Every value
+  /// lands through [_applyLoaded]; a failed read simply leaves the default.
+  Future<void> _loadDeviceSettings() async {
+    if (!mounted) return;
+    final deviceProvider = context.read<DeviceProvider>();
+    final pairedDevice = deviceProvider.pairedDevice;
+    if (pairedDevice == null || pairedDevice.id.isEmpty) return;
+
+    // force: true — ensureConnection never establishes a link without it
+    // (`if (!force) return null;`), so this page would declare the Omi absent at
+    // any moment one was not already up, without trying. Forcing is a no-op when
+    // already connected, and only one Omi is ever paired.
+    var connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id, force: true);
+    if (connection == null) return;
+
+    // getFeaturesIfIdle, never getFeatures. Two reasons, and the second is why
+    // this page used to come up half empty:
+    //
+    //   * getFeatures reads unguarded, and a plain GATT read racing the storage
+    //     notify stream drops the link on Android with Error 133. The old retry
+    //     loop repeated that read up to three times on an already-degraded link.
+    //   * getFeatures returns 0 on failure, and 0 reads as "this Omi has no
+    //     features" — so one unanswered read silently hid every capability-gated
+    //     row rather than reporting anything. The guarded twin returns null,
+    //     which can be told apart from a real answer of zero.
+    //
+    // Retry on null only while no sync is running: there a null is a transient
+    // GATT hiccup worth another go. Once a transfer holds the lock, retrying is
+    // pointless — wait for it and say so.
+    // Seed from the connect-time cache first, so the page is correct even when
+    // every read below fails. Values only move when the app writes them or the
+    // button toggles the LED gate, so a cached value is right until this session
+    // changes it — and the reads that follow refresh it anyway.
+    _seedFromProviderCache(deviceProvider);
+
+    final syncs = ServiceManager.instance().wal.getSyncs();
+    int? features = deviceProvider.deviceFeatures ?? await connection.getFeaturesIfIdle();
+    for (int i = 0; i < 2 && features == null && mounted && !syncs.isSyncing; i++) {
+      await Future.delayed(const Duration(milliseconds: 600));
+      features = await connection.getFeaturesIfIdle();
+    }
+    if (!mounted) return;
+    if (features == null) {
+      if (syncs.isSyncing) {
+        Logger.debug('DeviceSettings: a sync holds the link — waiting for it rather than reading past it.');
+        setState(() => _waitingForSync = true);
+        _armSyncWait();
+      }
+      // Not syncing and still no answer: a genuinely degraded link. Leave the
+      // capabilities unset, exactly as a zero read did before.
+      return;
+    }
+    // Re-bound as final so it promotes to non-null past the guard above; the
+    // loop variable can't, being reassigned.
+    final int deviceFeatures = features;
+
+    _applyLoaded(() {
+      _hasDimmingFeature = OmiFeatures.hasFeature(deviceFeatures, OmiFeatures.ledDimming);
+      _hasMicGainFeature = OmiFeatures.hasFeature(deviceFeatures, OmiFeatures.micGain);
+      _hasVadThresholdFeature = OmiFeatures.hasFeature(deviceFeatures, OmiFeatures.vadThreshold);
+      _hasPriorityCapFeature = OmiFeatures.hasFeature(deviceFeatures, OmiFeatures.priorityRecordCap);
+      _hasLedServiceFeature = OmiFeatures.hasFeature(deviceFeatures, OmiFeatures.ledService);
+    });
+
+    if (_hasDimmingFeature == true) {
+      final ratio = await connection.getLedDimRatio();
+      if (!mounted) return;
+      if (ratio != null) _applyLoaded(() => _dimRatio = ratio.toDouble(), _Setting.dimRatio);
+    }
+
+    if (_hasLedServiceFeature == true) {
+      // A failed read leaves the default — matches the firmware defaults
+      // (connected indicator on, LEDs off at boot).
+      final enabled = await connection.getConnectedLed();
+      if (!mounted) return;
+      if (enabled != null) _applyLoaded(() => _connectedLed = enabled, _Setting.connectedLed);
+
+      final ledBoot = await connection.getLedBootEnabled();
+      if (!mounted) return;
+      if (ledBoot != null) _applyLoaded(() => _ledBootEnabled = ledBoot, _Setting.ledBoot);
+    }
+
+    if (_hasMicGainFeature == true) {
+      final gain = await connection.getMicGain();
+      if (!mounted) return;
+      if (gain != null) _applyLoaded(() => _micGain = gain.toDouble(), _Setting.micGain);
+    }
+
+    if (_hasVadThresholdFeature == true) {
+      final threshold = await connection.getVadThreshold();
+      if (!mounted) return;
+      if (threshold != null) _applyLoaded(() => _vadThreshold = threshold.toDouble(), _Setting.vadThreshold);
+    }
+
+    if (_hasPriorityCapFeature == true) {
+      final cap = await connection.getPriorityRecordCap();
+      if (!mounted) return;
+      if (cap != null) {
+        _applyLoaded(() {
+          _priorityRecordCap = cap;
+          // Persist the DEVICE's value, not just the row. The processor now cuts a
+          // Priority Recording at this cap when its 0xFFFFFFFC is lost, so a pref
+          // that has drifted from the device would cut a legitimate recording at the
+          // wrong length. They drift on a fresh install against an Omi whose cap was
+          // set by a previous one: the pref falls back to its 120 default while the
+          // device still holds, say, 480. Every other write path sets both.
+          SharedPreferencesUtil().priorityRecordMaxMinutes = cap;
+        }, _Setting.priorityCap);
+      }
+    }
+  }
+
+  void _updateDimRatio(double value) async {
+    final deviceProvider = context.read<DeviceProvider>();
+    final pairedDevice = deviceProvider.pairedDevice;
+    if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+      var connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+      await connection?.setLedDimRatio(value.toInt());
+      // Cache only what the device CONFIRMS. performSet* swallows write errors
+      // (the transport surfaces none), so an unverified write-through would
+      // publish a value the Omi never took — and the cache is authoritative on
+      // the next page open. Read back: a match caches it; anything else stores
+      // null, which means UNREAD and sends the next open to the device rather
+      // than to a guess. The row itself is left showing what the user chose —
+      // a slider snapping back under your finger is worse than a stale pixel.
+      final readBack = await connection?.getLedDimRatio();
+      deviceProvider.deviceLedDimRatio = readBack == value.toInt() ? readBack : null;
+    }
+  }
+
+  /// Writes the connected-LED setting straight to the device (it owns the value)
+  /// and confirms it landed by reading back, since the transport swallows write
+  /// errors. Reverts the switch if the device didn't take it.
+  Future<void> _updateConnectedLed(bool enabled) async {
+    // Guard against a second tap landing while the first write/read-back is in
+    // flight: the two would interleave and the loser's revert would restore the
+    // other's optimistic value, leaving the switch disagreeing with the device.
+    if (_connectedLedBusy) return;
+    _connectedLedBusy = true;
+
+    final previous = _connectedLed;
+    _applyUserChange(_Setting.connectedLed, () => _connectedLed = enabled);
+
+    bool ok = false;
+    final provider = context.read<DeviceProvider>();
+    try {
+      final pairedDevice = provider.pairedDevice;
+      if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+        final connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+        if (connection != null) {
+          await connection.setConnectedLed(enabled);
+          final readBack = await connection.getConnectedLed();
+          ok = readBack == enabled;
+          // Write through only on a VERIFIED write. On the revert path below the
+          // device never took the value, so the cache must keep the old one.
+          if (ok) provider.deviceConnectedLed = enabled;
+        }
+      }
+    } finally {
+      _connectedLedBusy = false;
+    }
+    if (!mounted || ok) return;
+
+    _applyUserChange(_Setting.connectedLed, () => _connectedLed = previous);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Could not reach your Omi — try again.')),
+    );
+  }
+
+  /// Sets whether the Omi's LEDs come up on after a reboot. The device applies
+  /// the write to the current session too, so the effect is immediate.
+  Future<void> _updateLedBoot(bool enabled) async {
+    if (_ledBootBusy) return;
+    _ledBootBusy = true;
+
+    final previous = _ledBootEnabled;
+    _applyUserChange(_Setting.ledBoot, () => _ledBootEnabled = enabled);
+
+    bool ok = false;
+    final provider = context.read<DeviceProvider>();
+    try {
+      final pairedDevice = provider.pairedDevice;
+      if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+        final connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+        if (connection != null) {
+          await connection.setLedBootEnabled(enabled);
+          final readBack = await connection.getLedBootEnabled();
+          ok = readBack == enabled;
+          // Write through only on a VERIFIED write. On the revert path below the
+          // device never took the value, so the cache must keep the old one.
+          if (ok) provider.deviceLedBootEnabled = enabled;
+        }
+      }
+    } finally {
+      _ledBootBusy = false;
+    }
+    if (!mounted || ok) return;
+
+    _applyUserChange(_Setting.ledBoot, () => _ledBootEnabled = previous);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Could not reach your Omi — try again.')),
+    );
+  }
+
+  void _updateMicGain(double value) async {
+    final deviceProvider = context.read<DeviceProvider>();
+    final pairedDevice = deviceProvider.pairedDevice;
+    if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+      var connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+      await connection?.setMicGain(value.toInt());
+      // Cache only what the device CONFIRMS. performSet* swallows write errors
+      // (the transport surfaces none), so an unverified write-through would
+      // publish a value the Omi never took — and the cache is authoritative on
+      // the next page open. Read back: a match caches it; anything else stores
+      // null, which means UNREAD and sends the next open to the device rather
+      // than to a guess. The row itself is left showing what the user chose —
+      // a slider snapping back under your finger is worse than a stale pixel.
+      final readBack = await connection?.getMicGain();
+      deviceProvider.deviceMicGain = readBack == value.toInt() ? readBack : null;
+    }
+  }
+
+  void _updateVadThreshold(double value) async {
+    SharedPreferencesUtil().autoVadThreshold = value.toInt();
+    final deviceProvider = context.read<DeviceProvider>();
+    final pairedDevice = deviceProvider.pairedDevice;
+    if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+      var connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+      await connection?.setVadThreshold(value.toInt());
+      // Cache only what the device CONFIRMS. performSet* swallows write errors
+      // (the transport surfaces none), so an unverified write-through would
+      // publish a value the Omi never took — and the cache is authoritative on
+      // the next page open. Read back: a match caches it; anything else stores
+      // null, which means UNREAD and sends the next open to the device rather
+      // than to a guess. The row itself is left showing what the user chose —
+      // a slider snapping back under your finger is worse than a stale pixel.
+      final readBack = await connection?.getVadThreshold();
+      deviceProvider.deviceVadThreshold = readBack == value.toInt() ? readBack : null;
+    }
+  }
+
+  void _updatePriorityCap(int minutes) async {
+    SharedPreferencesUtil().priorityRecordMaxMinutes = minutes;
+    _applyUserChange(_Setting.priorityCap, () => _priorityRecordCap = minutes);
+    // Capture the messenger + provider before the async gap. The cap is armed
+    // device-side at the start of a Priority Recording, so changing it never
+    // affects one already in progress — surface that so it isn't surprising.
+    final messenger = ScaffoldMessenger.of(context);
+    final deviceProvider = context.read<DeviceProvider>();
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('New cap applies to your next Priority Recording, not one already in progress.'),
+      ),
+    );
+    final pairedDevice = deviceProvider.pairedDevice;
+    if (pairedDevice != null && pairedDevice.id.isNotEmpty) {
+      var connection = await ServiceManager.instance().device.ensureConnection(pairedDevice.id);
+      await connection?.setPriorityRecordCap(minutes);
+      // Cache only what the device CONFIRMS. performSet* swallows write errors
+      // (the transport surfaces none), so an unverified write-through would
+      // publish a value the Omi never took — and the cache is authoritative on
+      // the next page open. Read back: a match caches it; anything else stores
+      // null, which means UNREAD and sends the next open to the device rather
+      // than to a guess. The row itself is left showing what the user chose —
+      // a slider snapping back under your finger is worse than a stale pixel.
+      final readBack = await connection?.getPriorityRecordCap();
+      deviceProvider.devicePriorityRecordCap = readBack == minutes ? readBack : null;
+    }
+  }
+
+  Widget _buildSectionHeader(String title, {String? subtitle}) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, right: 4, bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w600),
+          ),
+          if (subtitle != null) ...[
+            const SizedBox(height: 6),
+            Text(subtitle, style: TextStyle(color: Colors.grey.shade400, fontSize: 14)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProfileStyleItem({
+    required IconData icon,
+    required String title,
+    String? chipValue,
+    String? copyValue,
+    VoidCallback? onTap,
+    bool showChevron = true,
+  }) {
+    final content = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+      child: Row(
+        children: [
+          SizedBox(width: 24, height: 24, child: FaIcon(icon, color: const Color(0xFF8E8E93), size: 20)),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Text(
+              title,
+              style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w400),
+            ),
+          ),
+          if (chipValue != null) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(color: const Color(0xFF2A2A2E), borderRadius: BorderRadius.circular(100)),
+              child: Text(
+                chipValue,
+                style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+              ),
+            ),
+            if (showChevron) const SizedBox(width: 8),
+          ],
+          if (showChevron) const Icon(Icons.chevron_right, color: Color(0xFF3C3C43), size: 20),
+        ],
+      ),
+    );
+
+    if (copyValue != null) {
+      return Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () {
+            Clipboard.setData(ClipboardData(text: copyValue));
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('$title copied to clipboard')));
+          },
+          child: content,
+        ),
+      );
+    }
+
+    if (onTap != null) {
+      return Material(
+        color: Colors.transparent,
+        child: InkWell(onTap: onTap, child: content),
+      );
+    }
+    return content;
+  }
+
+  /// Same row layout as [_buildProfileStyleItem], with a switch in place of the
+  /// chip + chevron.
+  Widget _buildSwitchItem({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    required bool value,
+    // Null disables the switch — used when the setting has no observable effect
+    // in the device's current state.
+    required ValueChanged<bool>? onChanged,
+  }) {
+    final enabled = onChanged != null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 24,
+            height: 24,
+            child: FaIcon(icon, color: enabled ? const Color(0xFF8E8E93) : const Color(0xFF48484A), size: 20),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: enabled ? Colors.white : const Color(0xFF8E8E93),
+                    fontSize: 17,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(subtitle, style: const TextStyle(color: Color(0xFF8E8E93), fontSize: 13)),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Switch(value: value, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDeviceInfoSection(BtDevice? device, DeviceProvider provider) {
+    final deviceId = device?.id ?? 'Unknown';
+
+    String truncateId(String id) {
+      if (id.length > 10) {
+        return '${id.substring(0, 4)}•••${id.substring(id.length - 4)}';
+      }
+      return id;
+    }
+
+    return Material(
+      color: const Color(0xFF1C1C1E),
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.batteryFull,
+            title: 'Battery Level',
+            chipValue: provider.batteryLevel >= 0 ? '${provider.batteryLevel}%' : '...',
+            showChevron: false,
+          ),
+          const Divider(height: 1, color: Color(0xFF3C3C43)),
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.fingerprint,
+            title: 'Device ID',
+            chipValue: truncateId(deviceId),
+            copyValue: deviceId,
+            showChevron: false,
+          ),
+          const Divider(height: 1, color: Color(0xFF3C3C43)),
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.download,
+            title: 'Firmware',
+            chipValue: device?.firmwareRevision ?? 'unknown',
+            showChevron: true,
+            onTap: () async {
+              provider.setOnFirmwareUpdatePage(true);
+              FilePickerResult? result = await FilePicker.platform.pickFiles(
+                type: FileType.custom,
+                allowedExtensions: ['zip'],
+              );
+              if (result != null && result.files.single.path != null) {
+                if (mounted) {
+                  Navigator.of(context).push(MaterialPageRoute(
+                    builder: (c) => FirmwareUpdate(
+                      device: device,
+                      localZipPath: result.files.single.path,
+                    ),
+                  ));
+                }
+              } else {
+                provider.setOnFirmwareUpdatePage(false);
+              }
+            },
+          ),
+          // Gate on stats existing (not on freeBytes > 0): a full device reports
+          // freeBytes == 0, and that is exactly when the user needs the wipe entry.
+          if (provider.storageStats != null) ...[
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.microchip,
+              title: 'Storage Free Space',
+              chipValue:
+                  _isWiping ? 'Wiping…' : '${(provider.storageStats!.freeBytes / 1024 / 1024).toStringAsFixed(1)} MB',
+              showChevron: true,
+              onTap: _isWiping ? null : () => _wipeDeviceStorage(provider),
+            ),
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.fileAudio,
+              title: 'File Count',
+              // Current firmware already excludes the open recording from the stat,
+              // so this equals the number of closed/syncable files — no extra -1.
+              chipValue: '${provider.storageStats!.fileCount.clamp(0, 999)}',
+              showChevron: false,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Closes the active bin, deletes every recording on the Omi's SD card, and
+  /// opens a fresh empty file — all atomically via CMD_CLEAR_STORAGE (0x14) on
+  /// the firmware's storage thread (safer than a manual rotate-then-delete,
+  /// which risks GATT 133). Mirrors the proven Debug Tools "Delete Omi
+  /// Segments" flow so the recordings UI and sync-progress prefs stay coherent.
+  Future<void> _wipeDeviceStorage(DeviceProvider provider) async {
+    if (_isWiping) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (c) => getDialog(
+        context,
+        () => Navigator.of(context).pop(false),
+        () => Navigator.of(context).pop(true),
+        "Completely Wipe Omi's Recordings?",
+        "This permanently erases all audio on the Omi device's SD card, including anything not yet synced to "
+            'this phone. Recordings already saved on this phone are kept. This cannot be undone.',
+        confirmText: 'Wipe',
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _isWiping = true);
+    // Blocking progress dialog: CMD_CLEAR_STORAGE can take up to ~65 s, and it
+    // also prevents a second tap from racing the storage lock.
+    if (mounted) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (c) => const AlertDialog(
+          backgroundColor: Color(0xFF1C1C1E),
+          content: Row(
+            children: [
+              SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2.5)),
+              SizedBox(width: 20),
+              Expanded(child: Text('Wiping Omi storage…', style: TextStyle(color: Colors.white, fontSize: 16))),
+            ],
+          ),
+        ),
+      );
+    }
+
+    String message;
+    try {
+      final syncs = ServiceManager.instance().wal.getSyncs();
+      if (syncs.isSyncing) {
+        Logger.debug('DeviceSettings: cancelling active sync before wiping device storage');
+      }
+      await syncs.cancelAndWait();
+
+      Logger.debug('DeviceSettings: wiping device storage via deleteAllPendingWals()');
+      await syncs.deleteAllPendingWals();
+
+      // Reset sync/processing progress state so the recordings page doesn't show
+      // stale progress against a now-empty device.
+      final prefs = SharedPreferencesUtil();
+      await prefs.remove('sp_state');
+      await prefs.remove('sp_synced_count');
+      await prefs.remove('sp_total_count');
+      await prefs.remove('sp_minutes_remaining');
+      await prefs.remove('sp_marker_count');
+      await prefs.remove('sp_last_completed_stage');
+      await prefs.remove('sp_last_active_stage');
+
+      RecordingsManager.notifyRecordingsChanged();
+      await provider.refreshStorageStats();
+      message = "Omi's recordings wiped.";
+    } catch (e) {
+      Logger.error('DeviceSettings: wipe device storage error — $e');
+      message = 'Wipe failed: $e';
+    } finally {
+      if (mounted) setState(() => _isWiping = false);
+    }
+
+    if (!mounted) return;
+    Navigator.of(context).pop(); // dismiss the progress dialog
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Widget _buildHardwareInfoSection(BtDevice? device) {
+    final hardwareRevision = device?.hardwareRevision ?? 'XIAO';
+    final modelNumber = device?.modelNumber ?? 'Omi CV1';
+    final manufacturer = device?.manufacturerName ?? 'Based Hardware';
+
+    return Material(
+      color: const Color(0xFF1C1C1E),
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.gears,
+            title: 'Hardware Revision',
+            chipValue: hardwareRevision,
+            copyValue: hardwareRevision,
+            showChevron: false,
+          ),
+          const Divider(height: 1, color: Color(0xFF3C3C43)),
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.hashtag,
+            title: 'Model Number',
+            chipValue: modelNumber,
+            copyValue: modelNumber,
+            showChevron: false,
+          ),
+          const Divider(height: 1, color: Color(0xFF3C3C43)),
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.industry,
+            title: 'Manufacturer',
+            chipValue: manufacturer,
+            copyValue: manufacturer,
+            showChevron: false,
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showBrightnessSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(color: const Color(0xFF3C3C43), borderRadius: BorderRadius.circular(2)),
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'LED Brightness',
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                        Text(
+                          '${_dimRatio.round()}%',
+                          style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+                    SliderTheme(
+                      data: SliderThemeData(
+                        activeTrackColor: Colors.white,
+                        inactiveTrackColor: Colors.grey.shade800,
+                        thumbColor: Colors.white,
+                        overlayColor: Colors.white.withValues(alpha: 0.1),
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12, elevation: 2),
+                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 24),
+                        trackHeight: 6,
+                      ),
+                      child: Slider(
+                        value: _dimRatio,
+                        min: 0,
+                        max: 100,
+                        divisions: 100,
+                        onChanged: (double value) {
+                          setSheetState(() {});
+                          _applyUserChange(_Setting.dimRatio, () => _dimRatio = value);
+                          _debounce?.cancel();
+                          _debounce = Timer(const Duration(milliseconds: 300), () {
+                            _updateDimRatio(value);
+                          });
+                        },
+                        onChangeEnd: (double value) {
+                          _debounce?.cancel();
+                          _updateDimRatio(value);
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Off', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                        Text('Max', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showMicGainSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            String getGainLabel(int level) {
+              const labels = ['Mute', '-20dB', '-10dB', '+0dB', '+6dB', '+10dB', '+20dB', '+30dB', '+40dB'];
+              return level >= 0 && level < labels.length ? labels[level] : '';
+            }
+
+            String getGainDescription(int level) {
+              const descriptions = [
+                'Microphone is muted',
+                'Very quiet - for loud environments',
+                'Quiet - for moderate noise',
+                'Neutral - balanced recording',
+                'Slightly boosted - normal use',
+                'Boosted - for quiet environments',
+                'High - for distant or soft voices',
+                'Very high - for very quiet sources',
+                'Maximum - use with caution',
+              ];
+              return level >= 0 && level < descriptions.length ? descriptions[level] : '';
+            }
+
+            final currentLevel = _micGain.round();
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(color: const Color(0xFF3C3C43), borderRadius: BorderRadius.circular(2)),
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Mic Gain',
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                        Text(
+                          getGainLabel(currentLevel),
+                          style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(getGainDescription(currentLevel), style: TextStyle(color: Colors.grey.shade500, fontSize: 13)),
+                    const SizedBox(height: 24),
+                    SliderTheme(
+                      data: SliderThemeData(
+                        activeTrackColor: Colors.white,
+                        inactiveTrackColor: Colors.grey.shade800,
+                        thumbColor: Colors.white,
+                        overlayColor: Colors.white.withValues(alpha: 0.1),
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12, elevation: 2),
+                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 24),
+                        trackHeight: 6,
+                      ),
+                      child: Slider(
+                        value: _micGain,
+                        min: 0,
+                        max: 8,
+                        divisions: 8,
+                        onChanged: (double value) {
+                          setSheetState(() {});
+                          _applyUserChange(_Setting.micGain, () => _micGain = value);
+                          _micGainDebounce?.cancel();
+                          _micGainDebounce = Timer(const Duration(milliseconds: 300), () {
+                            _updateMicGain(value);
+                          });
+                        },
+                        onChangeEnd: (double value) {
+                          _micGainDebounce?.cancel();
+                          _updateMicGain(value);
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Mute', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                        Text('Max', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildPresetButton('Quiet', 2, currentLevel, () {
+                            setSheetState(() {});
+                            _applyUserChange(_Setting.micGain, () => _micGain = 2.0);
+                            _updateMicGain(2.0);
+                          }),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _buildPresetButton('Normal', 4, currentLevel, () {
+                            setSheetState(() {});
+                            _applyUserChange(_Setting.micGain, () => _micGain = 4.0);
+                            _updateMicGain(4.0);
+                          }),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _buildPresetButton('High', 6, currentLevel, () {
+                            setSheetState(() {});
+                            _applyUserChange(_Setting.micGain, () => _micGain = 6.0);
+                            _updateMicGain(6.0);
+                          }),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildPresetButton(String label, int level, int currentLevel, VoidCallback onTap) {
+    final isSelected = level == currentLevel;
+    return Material(
+      color: isSelected ? Colors.white.withValues(alpha: 0.1) : const Color(0xFF2A2A2E),
+      borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            border: Border.all(color: isSelected ? Colors.white.withValues(alpha: 0.5) : Colors.transparent, width: 1),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                color: isSelected ? Colors.white : Colors.grey.shade400,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _getMicGainLabel(int level) {
+    const labels = ['Mute', '-20dB', '-10dB', '+0dB', '+6dB', '+10dB', '+20dB', '+30dB', '+40dB'];
+    return level >= 0 && level < labels.length ? labels[level] : '';
+  }
+
+  void _showVadThresholdSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final currentValue = _vadThreshold.round().clamp(0, 1000);
+            final String label = currentValue == 0 ? 'Always On' : '$currentValue';
+
+            void setValue(int raw) {
+              setSheetState(() {});
+              _applyUserChange(_Setting.vadThreshold, () => _vadThreshold = raw.toDouble());
+              _updateVadThreshold(raw.toDouble());
+            }
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(color: const Color(0xFF3C3C43), borderRadius: BorderRadius.circular(2)),
+                    ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'AAD Sensitivity',
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                        Text(
+                          label,
+                          style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      currentValue == 0
+                          ? 'Records everything, no silence skipping'
+                          : 'Adjust how easily the device wakes up and starts recording.',
+                      style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                    ),
+                    const SizedBox(height: 24),
+                    SliderTheme(
+                      data: SliderThemeData(
+                        activeTrackColor: Colors.white,
+                        inactiveTrackColor: Colors.grey.shade800,
+                        thumbColor: Colors.white,
+                        overlayColor: Colors.white.withValues(alpha: 0.1),
+                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 12, elevation: 2),
+                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 24),
+                        trackHeight: 6,
+                      ),
+                      child: Slider(
+                        value: currentValue.toDouble(),
+                        min: 0,
+                        max: 1000,
+                        divisions: 20,
+                        onChanged: (double value) {
+                          setSheetState(() {});
+                          _applyUserChange(_Setting.vadThreshold, () => _vadThreshold = value);
+                          _vadThresholdDebounce?.cancel();
+                          _vadThresholdDebounce = Timer(const Duration(milliseconds: 300), () {
+                            _updateVadThreshold(_vadThreshold);
+                          });
+                        },
+                        onChangeEnd: (double value) {
+                          _vadThresholdDebounce?.cancel();
+                          _updateVadThreshold(_vadThreshold);
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Always On', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                        Text('Max', style: TextStyle(color: Colors.grey.shade500, fontSize: 12)),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildPresetButton('-', -1, currentValue, () {
+                            if (currentValue > 0) setValue((currentValue - 50).clamp(0, 1000));
+                          }),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          flex: 2,
+                          child: _buildPresetButton('Default (250)', 250, currentValue, () => setValue(250)),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _buildPresetButton('+', -1, currentValue, () {
+                            if (currentValue < 1000) setValue((currentValue + 50).clamp(0, 1000));
+                          }),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // Preset durations for the Priority Recording safety cap (minutes; 0 = no cap).
+  static const List<int> _priorityCapPresets = [30, 60, 120, 240, 480, 0];
+
+  String _formatPriorityCap(int minutes) {
+    if (minutes <= 0) return 'No cap';
+    if (minutes < 60) return '${minutes}m';
+    if (minutes % 60 == 0) return '${minutes ~/ 60}h';
+    return '${minutes ~/ 60}h ${minutes % 60}m';
+  }
+
+  void _showPriorityCapSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(color: const Color(0xFF3C3C43), borderRadius: BorderRadius.circular(2)),
+                  ),
+                ),
+                const Text(
+                  'Priority Recording Cap',
+                  style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  "A Priority Recording force-captures until you stop it. This safety cap auto-stops a "
+                  "forgotten one so it can't drain the battery or fill the SD card.",
+                  style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                ),
+                const SizedBox(height: 16),
+                ..._priorityCapPresets.map((minutes) {
+                  final selected = _priorityRecordCap == minutes;
+                  return Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () {
+                        Navigator.pop(sheetContext);
+                        if (minutes != _priorityRecordCap) _updatePriorityCap(minutes);
+                      },
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 4),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              minutes == 0 ? 'No cap (battery / SD only)' : _formatPriorityCap(minutes),
+                              style: TextStyle(
+                                color: selected ? Colors.white : Colors.grey.shade300,
+                                fontSize: 16,
+                                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                              ),
+                            ),
+                            if (selected) const Icon(Icons.check, color: Colors.white, size: 20),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildCustomizationSection() {
+    return Material(
+      color: const Color(0xFF1C1C1E),
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          // LED Brightness
+          if (_hasDimmingFeature == true) ...[
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.lightbulb,
+              title: 'LED Brightness',
+              chipValue: '${_dimRatio.round()}%',
+              onTap: _showBrightnessSheet,
+            ),
+          ],
+          // LED master gate + the solid-blue "phone is connected" indicator.
+          if (_hasLedServiceFeature == true) ...[
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildSwitchItem(
+              icon: FontAwesomeIcons.powerOff,
+              title: 'LEDs On',
+              subtitle: 'Applies now and after every restart',
+              value: _ledBootEnabled,
+              onChanged: (v) => _updateLedBoot(v),
+            ),
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            // Deliberately NOT gated on _ledBootEnabled. That field is the boot
+            // default, not the live gate — the button gesture can have LEDs on
+            // right now on a device whose default is off, in which case changing
+            // this has an immediate visible effect. The app cannot read the live
+            // gate (0x0082 returns the stored default by design), so disabling
+            // the row would claim knowledge we don't have and block a setting
+            // that does work.
+            _buildSwitchItem(
+              icon: FontAwesomeIcons.bluetooth,
+              title: 'Connected LED',
+              subtitle: 'Solid blue while your phone is connected',
+              value: _connectedLed,
+              onChanged: (v) => _updateConnectedLed(v),
+            ),
+          ],
+          // Mic Gain
+          if (_hasMicGainFeature == true) ...[
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.microphone,
+              title: 'Mic Gain',
+              chipValue: _getMicGainLabel(_micGain.round()),
+              onTap: _showMicGainSheet,
+            ),
+          ],
+          // AAD Sensitivity (hidden in manual mode — recording is tap-triggered, not voice-activated)
+          if (_hasVadThresholdFeature == true && !SharedPreferencesUtil().manualMode) ...[
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.earListen,
+              title: 'AAD Sensitivity',
+              chipValue: _vadThreshold <= 0 ? 'Always On' : '${_vadThreshold.round()}',
+              onTap: _showVadThresholdSheet,
+            ),
+          ],
+          // Priority Recording Cap (auto mode only — Priority Recording is an auto-mode action)
+          if (_hasPriorityCapFeature == true && !SharedPreferencesUtil().manualMode) ...[
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            _buildProfileStyleItem(
+              icon: FontAwesomeIcons.stopwatch,
+              title: 'Priority Recording Cap',
+              chipValue: _formatPriorityCap(_priorityRecordCap),
+              onTap: _showPriorityCapSheet,
+            ),
+          ],
+          const Divider(height: 1, color: Color(0xFF3C3C43)),
+          _buildProfileStyleItem(
+            icon: FontAwesomeIcons.handPointer,
+            title: 'Button Configuration',
+            chipValue: 'Customize',
+            onTap: () {
+              Navigator.of(context).push(MaterialPageRoute(builder: (c) => const ButtonConfigPage()));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Shared flow for the remote power commands (Reboot / Shutdown): confirm,
+  /// stop any in-flight sync so the write doesn't race a live transfer on the
+  /// shared storage characteristic, send [sendCommand] over the connection, and
+  /// report the outcome. Keeps the two entry points from drifting.
+  Future<void> _sendPowerCommand(
+    DeviceProvider provider, {
+    required String title,
+    required String message,
+    required String confirmText,
+    required Future<bool> Function(DeviceConnection conn) sendCommand,
+    required String successMsg,
+  }) async {
+    final pairedDeviceId = provider.pairedDevice?.id ?? SharedPreferencesUtil().btDevice.id;
+    if (pairedDeviceId.isEmpty) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (c) => getDialog(
+        context,
+        () => Navigator.of(context).pop(false),
+        () => Navigator.of(context).pop(true),
+        title,
+        message,
+        confirmText: confirmText,
+      ),
+    );
+    if (confirmed != true) return;
+
+    // The power-command write shares the storage characteristic with file
+    // transfers, so stop any in-flight sync (and wait for it to unwind) first.
+    await ServiceManager.instance().wal.getSyncs().cancelAndWait();
+
+    bool ok = false;
+    try {
+      final connection = await ServiceManager.instance().device.ensureConnection(pairedDeviceId);
+      ok = connection != null && await sendCommand(connection);
+    } catch (_) {
+      ok = false;
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(ok ? successMsg : 'Could not reach your Omi — try again.')),
+    );
+  }
+
+  /// Remote cold-reboot the Omi via CMD_REBOOT (0x16). The device ACKs, then
+  /// restarts and drops the link for a few seconds; the native BLE layer
+  /// auto-reconnects once it re-advertises. Useful to recover a wedged device
+  /// without clearing the pairing (unlike Unpair).
+  Future<void> _rebootDevice(DeviceProvider provider) => _sendPowerCommand(
+        provider,
+        title: 'Reboot Omi?',
+        message: 'Restart your Omi now. It will disconnect for a few seconds and reconnect automatically. '
+            'An in-progress recording not yet written to the SD card may lose its last few seconds.',
+        confirmText: 'Reboot',
+        sendCommand: (conn) => conn.sendRebootCommand(),
+        successMsg: 'Rebooting your Omi…',
+      );
+
+  /// Remote power-off the Omi via CMD_POWER_OFF (0x17). The device ACKs, shuts
+  /// down (ship mode) and stays off until a button press or charger wakes it —
+  /// so, unlike Reboot, it does not reconnect on its own.
+  Future<void> _shutdownDevice(DeviceProvider provider) => _sendPowerCommand(
+        provider,
+        title: 'Shut down Omi?',
+        message: 'Power your Omi off now. It will disconnect and stay off until you turn it back on with the '
+            "button — it won't reconnect on its own. An in-progress recording not yet written to the SD card "
+            'may lose its last few seconds.',
+        confirmText: 'Shut Down',
+        sendCommand: (conn) => conn.sendShutdownCommand(),
+        successMsg: 'Shutting down your Omi…',
+      );
+
+  Widget _buildActionsSection(DeviceProvider provider) {
+    return Material(
+      color: const Color(0xFF1C1C1E),
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          if (provider.isConnected) ...[
+            // Reboot and Shutdown wait behind the same gate as the sections
+            // above: both send a command over the storage characteristic the
+            // initial reads are still using, and neither is worth offering
+            // before the page can say whether the Omi is answering at all.
+            // Unpair is deliberately *not* gated — it is the way out of a
+            // device that never finishes answering, so it has to stay tappable
+            // for the whole of that wait.
+            if (!_isLoading) ...[
+              const Divider(height: 1, color: Color(0xFF3C3C43)),
+              // Remote cold-reboot — recover a wedged device without unpairing.
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () => _rebootDevice(provider),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: FaIcon(FontAwesomeIcons.arrowsRotate, color: Colors.white70, size: 20),
+                        ),
+                        SizedBox(width: 16),
+                        Text(
+                          'Reboot Omi',
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w400),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const Divider(height: 1, color: Color(0xFF3C3C43)),
+              // Remote power-off (ship mode) — stays off until a button/charger wake.
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () => _shutdownDevice(provider),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: FaIcon(FontAwesomeIcons.powerOff, color: Colors.white70, size: 20),
+                        ),
+                        SizedBox(width: 16),
+                        Text(
+                          'Shutdown Omi',
+                          style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w400),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+            const Divider(height: 1, color: Color(0xFF3C3C43)),
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () async {
+                  final pairedDeviceId = provider.pairedDevice?.id ?? SharedPreferencesUtil().btDevice.id;
+
+                  // Cancel any in-progress sync immediately.
+                  final walSync = ServiceManager.instance().wal.getSyncs();
+                  walSync.cancelSync();
+                  walSync.setDevice(null);
+
+                  if (pairedDeviceId.isNotEmpty) {
+                    // Use forgetDevice() to explicitly clear associations
+                    await ServiceManager.instance().device.forgetDevice(pairedDeviceId);
+
+                    // Explicitly tell native to stop managing this device
+                    try {
+                      final BleHostApi hostApi = BleHostApi();
+                      await hostApi.unmanageDevice(pairedDeviceId);
+                    } catch (_) {}
+                  }
+
+                  await SharedPreferencesUtil().btDeviceSet(BtDevice(id: '', name: '', type: DeviceType.omi, rssi: 0));
+                  SharedPreferencesUtil().deviceName = '';
+
+                  provider.setIsConnected(false);
+                  await provider.setConnectedDevice(null);
+                  provider.updateConnectingStatus(false);
+
+                  if (mounted) {
+                    Navigator.of(context).pop();
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(const SnackBar(content: Text('Your Omi has been unpaired')));
+                  }
+                },
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: FaIcon(FontAwesomeIcons.linkSlash, color: Colors.redAccent, size: 20),
+                      ),
+                      SizedBox(width: 16),
+                      Text(
+                        'Unpair Device',
+                        style: TextStyle(color: Colors.redAccent, fontSize: 17, fontWeight: FontWeight.w400),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDisconnectedOverlay(bool isBluetoothEnabled) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(32),
+      decoration: BoxDecoration(color: const Color(0xFF1C1C1E), borderRadius: BorderRadius.circular(14)),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(color: const Color(0xFF2A2A2E), borderRadius: BorderRadius.circular(16)),
+            child: Center(
+                child: FaIcon(!isBluetoothEnabled ? FontAwesomeIcons.bluetooth : FontAwesomeIcons.linkSlash,
+                    color: Colors.grey.shade500, size: 24)),
+          ),
+          const SizedBox(height: 20),
+          Text(
+            !isBluetoothEnabled ? 'Bluetooth is Off' : 'Device Not Connected',
+            style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            !isBluetoothEnabled
+                ? 'Please turn on Bluetooth to connect\nyour Omi device'
+                : 'Connect your Omi device to access\ndevice settings and customization',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 14, height: 1.4),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Stand-in for the Customization / Device Info / Hardware sections while
+  /// their reads are in flight, so they can appear together rather than one
+  /// row at a time.
+  Widget _buildLoadingPlaceholder() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 48),
+      // The page's Column aligns its children to the start, so the placeholder
+      // has to centre itself — without this it shrink-wraps the text and sits
+      // against the left edge, off-axis from everything else on the screen.
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2.5, color: Color(0xFF8E8E93)),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              _waitingForSync ? 'Waiting for sync to complete…' : 'Loading…',
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 15),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceHeader(BtDevice? device, bool isConnected) {
+    return Center(
+      child: Column(
+        children: [
+          const SizedBox(height: 20),
+          Hero(
+            tag: 'device_image',
+            child: Image.asset(
+              DeviceUtils.getDeviceImagePathWithState(isConnected: isConnected),
+              width: 180,
+              height: 180,
+              fit: BoxFit.contain,
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text(
+            device?.name ?? 'Omi CV1',
+            style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: isConnected ? Colors.greenAccent : Colors.redAccent,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                isConnected ? 'Connected' : 'Disconnected',
+                style: TextStyle(
+                  color: isConnected ? Colors.greenAccent : Colors.redAccent,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 40),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<DeviceProvider>(
+      builder: (context, provider, child) {
+        return Scaffold(
+          backgroundColor: const Color(0xFF0D0D0D),
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF0D0D0D),
+            elevation: 0,
+            leading: IconButton(
+              icon: const FaIcon(FontAwesomeIcons.chevronLeft, size: 18),
+              onPressed: () => Navigator.of(context).pop(),
+              tooltip: 'Back',
+            ),
+            title: const Text(
+              'Device Settings',
+              style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            centerTitle: true,
+          ),
+          body: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildDeviceHeader(provider.pairedDevice, provider.isConnected),
+                if (!provider.isConnected) ...[
+                  _buildDisconnectedOverlay(provider.isBluetoothEnabled),
+                  const SizedBox(height: 32),
+                ],
+                if (provider.isConnected) ...[
+                  if (_isLoading || _waitingForSync)
+                    _buildLoadingPlaceholder()
+                  else ...[
+                    const SizedBox(height: 16),
+                    _buildSectionHeader('Customization'),
+                    _buildCustomizationSection(),
+                    const SizedBox(height: 32),
+                    _buildSectionHeader('Device Info'),
+                    _buildDeviceInfoSection(provider.pairedDevice, provider),
+                    const SizedBox(height: 32),
+                    _buildSectionHeader('Hardware'),
+                    _buildHardwareInfoSection(provider.pairedDevice),
+                    const SizedBox(height: 32),
+                  ],
+                ],
+                _buildActionsSection(provider),
+                const SizedBox(height: 48),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}

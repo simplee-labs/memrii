@@ -1,0 +1,138 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:omi/backend/preferences.dart';
+import 'package:omi/pages/recordings/recordings_banners.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// manualMode labels the mode; flat vad* preferences control processing. Change them together for user switches
+/// and device-mode adoption so an Ambient label cannot retain Session splitting rules.
+void main() {
+  setUp(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.it_nomads.com/flutter_secure_storage'),
+      (MethodCall call) async => call.method == 'readAll' ? <String, String>{} : null,
+    );
+    SharedPreferences.setMockInitialValues({});
+    await SharedPreferencesUtil.init();
+  });
+
+  group('applyRecordingModeDefaults', () {
+    test('manual pins VAD off and the split to 0', () {
+      final p = SharedPreferencesUtil();
+      p.applyRecordingModeDefaults(true);
+
+      expect(p.vadEnabled, isFalse);
+      expect(p.vadSplitSeconds, 0);
+      expect(p.vadMinSpeechSeconds, 0, reason: 'manual keeps everything; no noise filter');
+    });
+
+    test('auto restores the values the user last saved for auto', () {
+      final p = SharedPreferencesUtil();
+      p.autoModeVadEnabled = true;
+      p.autoModeVadSplitSeconds = 300;
+      p.autoModeVadMinSpeechSeconds = 10;
+      p.autoModeVadMaxConversationMinutes = 45;
+
+      p.applyRecordingModeDefaults(false);
+
+      expect(p.vadEnabled, isTrue);
+      expect(p.vadSplitSeconds, 300);
+      expect(p.vadMinSpeechSeconds, 10);
+      expect(p.vadMaxConversationMinutes, 45);
+    });
+
+    test('a round trip through manual and back restores auto exactly', () {
+      // The property that makes adopting a mode from a replacement Omi safe: it
+      // must never cost the user the auto settings they had configured.
+      final p = SharedPreferencesUtil();
+      p.autoModeVadSplitSeconds = 600;
+      p.autoModeVadMinSpeechSeconds = 3;
+
+      p.applyRecordingModeDefaults(false);
+      final before = [p.vadSplitSeconds, p.vadMinSpeechSeconds, p.vadEnabled];
+      p.applyRecordingModeDefaults(true);
+      p.applyRecordingModeDefaults(false);
+
+      expect([p.vadSplitSeconds, p.vadMinSpeechSeconds, p.vadEnabled], before);
+    });
+
+    test('a fresh install in manual mode does not run on auto-shaped defaults', () {
+      // The bug this closes. The flat vad* prefs the processor reads carried
+      // their own legacy defaults — Silero on, a 120 s split, a 3 s noise filter,
+      // a 60-minute cap — independent of manualMode, which defaults to true. So a
+      // fresh install was labelled Manual and cut by auto's rules until the user
+      // first saved Recording Settings. main() now applies the mode's rules at
+      // startup; this pins what that has to produce.
+      final p = SharedPreferencesUtil();
+      expect(p.manualMode, isTrue, reason: 'fresh install defaults to manual, matching the firmware');
+      expect(p.vadSplitSeconds, 120, reason: 'the un-reconciled legacy default');
+      expect(p.vadMinSpeechSeconds, 3);
+      expect(p.vadMaxConversationMinutes, 60);
+
+      p.applyRecordingModeDefaults(p.manualMode);
+
+      expect(p.vadEnabled, isFalse, reason: 'manual never runs Silero');
+      expect(p.vadSplitSeconds, 0, reason: 'the button ends a manual recording, not silence');
+      expect(p.vadMinSpeechSeconds, 0, reason: 'manual keeps everything');
+      expect(p.vadMaxConversationMinutes, 0, reason: 'manual is uncapped by default');
+    });
+
+    test('applying twice changes nothing, so running it every launch is safe', () {
+      final p = SharedPreferencesUtil();
+      p.applyRecordingModeDefaults(false);
+      final once = [p.vadEnabled, p.vadSplitSeconds, p.vadMinSpeechSeconds, p.vadMaxConversationMinutes];
+      p.applyRecordingModeDefaults(false);
+      expect([p.vadEnabled, p.vadSplitSeconds, p.vadMinSpeechSeconds, p.vadMaxConversationMinutes], once);
+    });
+
+    test('manualModeUserSet starts false, so a default is not a preference', () {
+      // A fresh install has manualMode true because that is the default. Reporting
+      // a disagreement against an auto Omi there would be noise.
+      expect(SharedPreferencesUtil().manualModeUserSet, isFalse);
+    });
+  });
+
+  group('RecordingModeMismatchBanner', () {
+    Widget host({required bool active, bool manual = false, VoidCallback? review, VoidCallback? dismiss}) =>
+        MaterialApp(
+          home: Scaffold(
+            body: RecordingModeMismatchBanner(
+              active: active,
+              manual: manual,
+              onReview: review ?? () {},
+              onDismiss: dismiss ?? () {},
+            ),
+          ),
+        );
+
+    testWidgets('renders nothing when there is no mismatch', (tester) async {
+      await tester.pumpWidget(host(active: false));
+      expect(find.text('Review'), findsNothing);
+    });
+
+    testWidgets('names the mode now in force', (tester) async {
+      await tester.pumpWidget(host(active: true, manual: true));
+      expect(find.textContaining('set to Session recording'), findsOneWidget);
+
+      await tester.pumpWidget(host(active: true, manual: false));
+      expect(find.textContaining('set to Ambient recording'), findsOneWidget);
+    });
+
+    testWidgets('Review and Dismiss both fire', (tester) async {
+      var reviewed = false;
+      var dismissed = false;
+      await tester.pumpWidget(host(
+        active: true,
+        review: () => reviewed = true,
+        dismiss: () => dismissed = true,
+      ));
+
+      await tester.tap(find.text('Review'));
+      await tester.tap(find.byIcon(Icons.close));
+      expect(reviewed, isTrue);
+      expect(dismissed, isTrue);
+    });
+  });
+}

@@ -1,0 +1,115 @@
+name: omi
+description: "memrii — own your conversations. Local-first capture app."
+
+publish_to: "none" # Remove this line if you wish to publish to pub.dev
+
+version: 0.2.4+15
+
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  provider: ^6.1.2
+
+  # UI
+  flutter_native_splash: ^2.4.0
+  flutter_onnxruntime: ^1.7.1
+
+  # Logging
+  talker_flutter: 5.0.0
+
+  # Devices
+  mcumgr_flutter: ^0.4.2
+  nordic_dfu: ^6.1.4+hotfix
+  flutter_archive: ^6.0.3
+
+  # Utils
+  collection: ^1.19.1
+  http: ^1.4.0
+  http_parser: ^4.0.0
+  intl: 0.20.2
+  permission_handler: ^12.0.0+1
+  share_plus: 11.0.0
+  wakelock_plus: ^1.2.8
+  shared_preferences: 2.5.3
+  flutter_secure_storage: ^9.2.2
+  path: ^1.9.0
+  uuid: ^4.4.0
+  package_info_plus: ^8.0.1
+  device_info_plus: ^11.5.0
+  path_provider: 2.1.5
+  crypto: ^3.0.3
+  opus_flutter: ^3.0.3
+  opus_dart:
+    git:
+      url: https://github.com/mdmohsin7/opus_dart.git
+      ref: dev
+  webview_flutter: 4.13.0
+  just_audio: ^0.9.39
+  file_picker: 8.3.2
+  font_awesome_flutter: ^10.8.0
+  disk_space_2: ^1.0.11
+
+  pigeon: any
+  connectivity_plus: ^7.1.1
+  archive: ^4.0.7
+dependency_overrides:
+  js: ^0.7.1
+  uuid: ^4.4.0
+  opus_flutter_ios:
+    git:
+      url: https://github.com/mdmohsin7/opus_flutter.git
+      path: opus_flutter_ios
+      ref: dev
+  opus_flutter_android:
+    git:
+      url: https://github.com/mdmohsin7/opus_flutter.git
+      path: opus_flutter_android
+  # Vendored copy of flutter_onnxruntime 1.7.1 with the iOS podspec platform
+  # lowered 16.0 -> 15.1 (onnxruntime-objc 1.22.0 only needs 15.1), so the app
+  # installs on iOS 15 devices. Same plugin code/API as the pub.dev release.
+  flutter_onnxruntime:
+    path: third_party/flutter_onnxruntime
+
+dev_dependencies:
+  flutter_launcher_icons: 0.13.1
+  flutter_lints: ^4.0.0
+  lints: ^4.0.0
+  flutter_test:
+    sdk: flutter
+  fake_async: ^1.3.1
+  build_runner: ^2.5.4
+  flutter_flavorizr: ^2.2.3
+  flutter_gen_runner: 5.10.0
+
+  path_provider_platform_interface: any
+  plugin_platform_interface: any
+# Keep iOS generators disabled: enabling them without the native project recreates only a partial Xcode
+# scaffold. Restore the native platform implementation first, then re-enable iOS and remove_alpha_ios together.
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/images/app_launcher_icon.png"
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/models/silero_vad.onnx
+
+flutter_gen:
+  output: lib/gen/
+
+flutter_native_splash:
+  background_image: "assets/images/splash.png"
+  android_12:
+    image: assets/images/splash_icon.png
+    color: "#000000"
+
+  android: true
+  ios: false

@@ -1,0 +1,215 @@
+import 'package:omi/backend/schema/bt_device/bt_device.dart';
+import 'package:omi/services/devices/storage_file.dart';
+import 'package:omi/services/wals/wal.dart';
+import 'package:omi/utils/logger.dart';
+
+class SyncLocalFilesResponse {
+  final List<String> newConversationIds;
+  final List<String> updatedConversationIds;
+  final bool isPartial;
+
+  SyncLocalFilesResponse({
+    required this.newConversationIds,
+    required this.updatedConversationIds,
+    this.isPartial = false,
+  });
+}
+
+enum SyncPhase {
+  downloading,
+  synced,
+}
+
+abstract class IWalSyncProgressListener {
+  void onWalSyncedProgress(double percentage, {double? speedKBps, SyncPhase? phase});
+}
+
+abstract class IWalServiceListener extends IWalSyncListener {
+  void onWalServiceStatusChanged(WalServiceStatus status);
+}
+
+abstract class IWalSyncListener {
+  void onWalUpdated();
+  void onWalSynced(Wal wal);
+  void onStorageStatsUpdated(StorageFileStats stats) {}
+  void onSyncFinished() {}
+  void onDeviceRecordingFailed() {}
+}
+
+abstract class IWalSync {
+  Future<List<Wal>> getMissingWals();
+  Future deleteWal(Wal wal);
+
+  /// Runs a full sync and reports **whether it ran**, not whether it found anything.
+  ///
+  /// - non-null — the sync reached the device. An empty [SyncLocalFilesResponse]
+  ///   means CMD_LIST_FILES was issued, the device **answered**, and the card held
+  ///   nothing; that is a successful sync, not a skipped one.
+  /// - null — the sync **did not run**: no device is registered yet
+  ///   ([SDCardWalSync.hasDevice] is false), one is already in flight, the
+  ///   storage lock never cleared, the user cancelled, or CMD_LIST_FILES went
+  ///   unanswered (timed out, arrived unusable, or the link was already down).
+  ///   Nothing was learned from the device, so callers must NOT record a
+  ///   completed sync — see `RecordingsController._runPipeline`, which routes
+  ///   null to "Skipped".
+  ///
+  /// An unanswered listing is **not** an empty card. It reads as one at the wire
+  /// level — both produce no files — and reporting it as a completed sync is what
+  /// let a device holding hours of audio show as "nothing to sync" while the
+  /// lastSyncCompletedMs stamp suppressed the next automatic attempt.
+  ///
+  /// Keeping "ran and found nothing" distinct from "never asked" is the whole
+  /// point: they were the same value once, and a sync that never issued a single
+  /// command reported to the user as complete. Every implementation must log its
+  /// reason before returning null.
+  ///
+  /// **One rule for every entry point: a sync requested while one is already
+  /// running is denied.** Not queued, not joined. A sync fixes its file list at
+  /// its own CMD_LIST_FILES and never re-lists, so handing a second caller the
+  /// running sync's result gives them an answer that predates anything the device
+  /// has closed since — stale, while looking like a fresh sync. Denying is also
+  /// the only rule that holds for [IWalService.rotateAndSync], which additionally
+  /// must not report success without its rotate. The retry costs nothing:
+  /// `lastSyncSkipped` makes the next check due immediately.
+  Future<SyncLocalFilesResponse?> syncAll({
+    IWalSyncProgressListener? progress,
+  });
+
+  /// Same null contract as [syncAll] — null means the sync did not run.
+  Future<SyncLocalFilesResponse?> syncWal({
+    required Wal wal,
+    IWalSyncProgressListener? progress,
+  });
+  void cancelSync();
+
+  /// No `start()`: WAL state is initialised by [SDCardWalSync.setDevice], which is
+  /// the only place that can do it — it loads the persisted WALs AND rebuilds from
+  /// the device listing. The old `start()` ran at app boot, before any device was
+  /// registered, so it could never reach a listing; what it could do was overwrite
+  /// `_wals` from a `.then()` that raced a running `syncAll()`. Deleted rather than
+  /// guarded against.
+  Future stop();
+}
+
+abstract class IWalService {
+  void start();
+  Future stop();
+
+  void subscribe(IWalServiceListener subscription, Object context);
+  void unsubscribe(Object context);
+
+  /// Returns the SDCardWalSync instance for managing sync operations.
+  SDCardWalSync getSyncs();
+}
+
+enum WalServiceStatus {
+  init,
+  ready,
+  stop,
+}
+
+abstract class SDCardWalSync implements IWalSync {
+  /// [prefetchedFiles] — if provided, skips the CMD_LIST_FILES BLE round-trip
+  /// and uses the supplied list directly (avoids a redundant call when the
+  /// caller already has a fresh file listing, e.g. from [_onDeviceConnected]).
+  Future<void> setDevice(BtDevice? device, {List<StorageFile>? prefetchedFiles});
+  Future<void> deleteAllPendingWals();
+  bool get isSyncing;
+
+  /// True from the instant a full sync is claimed until it settles.
+  ///
+  /// Ask this, not [isSyncing], when deciding whether a new sync can start.
+  /// [isSyncing] is set three awaits into the run — after the connection lookup
+  /// and after up to 3s of storage-lock polling — so for that window a sync is
+  /// claimed and will deny any other, while [isSyncing] still reads false. A UI
+  /// gating on [isSyncing] alone waves the user through into a denial it never
+  /// explains. [isSyncing] keeps its own meaning: a transfer is actually moving,
+  /// which is what the progress counters key off.
+  bool get isSyncInFlight;
+
+  /// True once [setDevice] has registered a device, i.e. once [syncAll] can
+  /// actually reach the card. Deliberately NOT the same as "the link is up":
+  /// `_onDeviceConnected` caches settings and pushes the button config before it
+  /// calls [setDevice], so there is a window — 4.7s on the device this was
+  /// diagnosed from — where BLE is connected, the battery reads fine, and a sync
+  /// started here would return null having asked the device nothing. Callers that
+  /// kick a sync off connect must wait on [deviceReady] rather than a fixed delay.
+  bool get hasDevice;
+
+  /// Completes once [setDevice] has registered a device — the signal a caller
+  /// waits on so a sync started during connect setup runs when the WAL layer is
+  /// ready, instead of returning null and postponing real work to the next cycle.
+  /// `setDevice(null)` resets it to pending, so it tracks the current attachment.
+  Future<void> get deviceReady;
+  Future<void>? get cancelFuture;
+  void setGlobalProgressListener(IWalSyncProgressListener? listener);
+  bool get isDeviceRecordingFailed;
+  double get currentSpeedKBps;
+
+  /// On-disk size (bytes) of the .bin currently being downloaded, read fresh via
+  /// stat; null when no transfer is active. The sync stall-watchdog samples this
+  /// so it can observe intra-file byte progress even when the per-packet progress
+  /// callback is starved by background timer throttling — otherwise a single large
+  /// file over throttled background BLE looks "stalled" for the whole download and
+  /// gets force-recovered mid-transfer.
+  int? get activeTransferBytesOnDisk;
+
+  int get recordingsCount;
+  int get estimatedTotalSegments;
+
+  /// Canonical sync progress for the CURRENT session — the single source both the
+  /// recordings card and the foreground-service notification read, so they always
+  /// agree. [totalSegments] is the monotonic peak of [estimatedTotalSegments] this
+  /// session (the "of N" denominator that never counts down); [syncedSegments] is
+  /// that scaled by the last reported download fraction, so it persists across the
+  /// native downloader's silent inter-file gaps instead of resetting. Both are 0
+  /// when no sync session is active.
+  int get totalSegments;
+  int get syncedSegments;
+
+  /// Lightweight check — returns true if the device has at least one file
+  /// exceeding the sync threshold. Avoids building full WAL objects.
+  /// Fast path: uses in-memory WAL list if already populated by [setDevice].
+  Future<bool> hasFilesToSync();
+
+  /// Send CMD_ROTATE_FILE, wait for ACK (current file sealed, new file open),
+  /// then run a normal sync including short segments below the usual threshold.
+  ///
+  /// Same null contract as [IWalSync.syncAll], including the one rule: denied
+  /// while a sync is already running. One case resolves differently here: a
+  /// rotate that lands and is then followed by an **unanswered listing** reports
+  /// `isPartial`, not null. The rotation is real — the device was reached, and the
+  /// caller's Force Sync cooldown is earned — but nothing was fetched, so the
+  /// caller must still not finalize drafts.
+  ///
+  /// It matters twice over here. Sealing the active bin is what entitles the
+  /// caller to finalize drafts — after a rotate, nothing belonging to them is
+  /// left on the device — so a run that returned success without rotating would
+  /// finalize a recording that stops mid-audio and prune the bins it was built
+  /// from. The UI says a sync is in progress; see
+  /// `RecordingsPage._forceSyncButtonPressed`.
+  Future<SyncLocalFilesResponse?> rotateAndSync({IWalSyncProgressListener? progress});
+
+  /// Bins (paths relative to `raw_segments/`) whose transfer has NOT delivered
+  /// every byte the device advertised — see [Wal.isIncompleteTransfer]. These
+  /// are prefixes awaiting a resumed read, so the processing pass must skip
+  /// them: it prunes every bin it consumes, and pruning one strands its resume.
+  Future<Set<String>> incompleteBinRelPaths();
+}
+
+extension SDCardWalSyncCancel on SDCardWalSync {
+  /// Stop any in-flight sync and wait (bounded) for the transfer to actually
+  /// unwind. [cancelSync] only *requests* cancellation, so a bare call leaves the
+  /// transfer stream still draining; callers that then write to the shared
+  /// storage characteristic (firmware-update arm, reboot/shutdown, wipe) must
+  /// await this first to avoid racing a live transfer. No-op when not syncing.
+  Future<void> cancelAndWait({Duration timeout = const Duration(seconds: 2)}) async {
+    if (!isSyncing) return;
+    cancelSync();
+    await cancelFuture?.timeout(timeout, onTimeout: () {
+      // Proceed anyway, but log it: a caller writing to the shared storage
+      // characteristic right after may now race a transfer that didn't stop.
+      Logger.debug('SDCardWalSync.cancelAndWait: sync did not stop within $timeout — proceeding anyway');
+    });
+  }
+}

@@ -1,0 +1,38 @@
+import 'package:flutter/services.dart';
+
+/// Dart wrapper for the native AAC encoder platform channel.
+///
+/// Call [startEncoder] to begin a DeviceSession, feed PCM bytes via [encodeBuffer] in
+/// batches, then call [finishEncoder] to flush and write the final M4A file.
+///
+/// All methods throw [PlatformException] on native errors — callers should
+/// catch and fall back to WAV to ensure recordings are never lost.
+class AacEncoder {
+  static const _channel = MethodChannel('me.memrii.app/aacEncoder');
+
+  /// Opens a new encoding DeviceSession targeting [outputPath] (must end in `.m4a`).
+  /// Returns an opaque DeviceSession ID string to pass to subsequent calls.
+  static Future<String> startEncoder(int sampleRate, String outputPath, {int bitrate = 32000}) async {
+    final sessionId = await _channel.invokeMethod<String>('startEncoder', {
+      'sampleRate': sampleRate,
+      'outputPath': outputPath,
+      'bitrate': bitrate,
+    });
+    return sessionId!;
+  }
+
+  /// Feed a batch of raw 16-bit little-endian PCM bytes to the encoder.
+  static Future<void> encodeBuffer(String sessionId, Uint8List pcmBytes) async {
+    await _channel.invokeMethod<void>('encodeBuffer', {
+      'sessionId': sessionId,
+      'pcmBytes': pcmBytes,
+    });
+  }
+
+  /// Finalize the encoder: flush, close the file, and rename temp→final.
+  static Future<void> finishEncoder(String sessionId) async {
+    await _channel.invokeMethod<void>('finishEncoder', {
+      'sessionId': sessionId,
+    });
+  }
+}

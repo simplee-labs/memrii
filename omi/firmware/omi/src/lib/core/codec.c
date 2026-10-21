@@ -1,0 +1,217 @@
+#include "codec.h"
+
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/ring_buffer.h>
+#include <zephyr/kernel.h>
+
+#include "config.h"
+#include "diag_log.h"
+#include "utils.h"
+#ifdef CODEC_OPUS
+#include "lib/opus-1.2.1/opus.h"
+#endif
+
+LOG_MODULE_REGISTER(codec, CONFIG_LOG_DEFAULT_LEVEL);
+
+//
+// Output
+//
+
+static volatile codec_callback _callback = NULL;
+
+void set_codec_callback(codec_callback callback)
+{
+    _callback = callback;
+}
+
+//
+// Input
+//
+
+uint8_t codec_ring_buffer_data[AUDIO_BUFFER_SAMPLES * 2]; // 2 bytes per sample
+struct ring_buf codec_ring_buf;
+static K_MUTEX_DEFINE(codec_ring_mutex);
+
+/* Count of PCM blocks dropped before encode because the codec ring buffer was
+ * full (encoder thread starved of CPU). Each drop ~= one mic chunk (~100 ms of
+ * audio). Surfaced over BLE via the diagnostics drops characteristic so the
+ * capture-stage loss is observable in the field without a UART/RTT log. */
+static atomic_t codec_dropped_count = ATOMIC_INIT(0);
+
+uint32_t codec_get_dropped_frames(void)
+{
+    return (uint32_t)atomic_get(&codec_dropped_count);
+}
+
+/* Signaled by codec_receive_pcm() each time a PCM block arrives.
+ * codec_entry() blocks here instead of polling every 10 ms. */
+K_SEM_DEFINE(codec_data_sem, 0, NETWORK_RING_BUF_SIZE);
+
+int codec_receive_pcm(int16_t *data, size_t len) // this gets called after mic data is finished
+{
+    // Invariant: Only accept writes where (incoming_bytes % sample_size == 0)
+    // Here, each sample is 2 bytes (int16_t). 'len' is the number of samples.
+    size_t bytes_to_write = len * 2;
+
+    k_mutex_lock(&codec_ring_mutex, K_FOREVER);
+    if (ring_buf_space_get(&codec_ring_buf) < bytes_to_write) {
+        k_mutex_unlock(&codec_ring_mutex);
+        atomic_inc(&codec_dropped_count);
+        /* backend 0: codec drops happen before the storage stage (backend n/a). */
+        diag_log_event(DIAG_CODEC_DROP, 0, 0, (uint32_t) atomic_get(&codec_dropped_count));
+        LOG_WRN("Codec ring buffer full, dropping %u bytes", (unsigned)bytes_to_write);
+        return -1;
+    }
+
+    int written = ring_buf_put(&codec_ring_buf, (uint8_t *) data, bytes_to_write);
+    k_mutex_unlock(&codec_ring_mutex);
+    if (written != bytes_to_write) {
+        atomic_inc(&codec_dropped_count);
+        diag_log_event(DIAG_CODEC_DROP, 0, 0, (uint32_t) atomic_get(&codec_dropped_count));
+        LOG_ERR("Failed to write %u bytes to codec ring buffer (written %d)", (unsigned)bytes_to_write, written);
+        return -1;
+    }
+
+    k_sem_give(&codec_data_sem);
+    return 0;
+}
+
+size_t codec_pcm_space_get(void)
+{
+    k_mutex_lock(&codec_ring_mutex, K_FOREVER);
+    size_t space = ring_buf_space_get(&codec_ring_buf);
+    k_mutex_unlock(&codec_ring_mutex);
+    return space;
+}
+
+//
+// Thread
+//
+
+int16_t codec_input_samples[CODEC_PACKAGE_SAMPLES];
+uint8_t codec_output_bytes[CODEC_OUTPUT_MAX_BYTES];
+/* 23096 = old 19000 + the 4 KB reclaimed from SD_WORKER_STACK_SIZE (16384→12288).
+ * The Opus/CELT encode path ran at ~17.5 KB (94% of the old 19000) — ~1 KB from
+ * overflow; this lifts headroom to ~5.5 KB (~76%). Net RAM vs before: zero. */
+K_THREAD_STACK_DEFINE(codec_stack, 23096);
+static struct k_thread codec_thread;
+/* Set once codec_thread has been k_thread_create()d. Guards codec_get_stack_used
+ * against a 0x0062 read that races an early BLE connection before codec_start() has
+ * initialized the thread object — k_thread_stack_space_get on an uninitialized
+ * k_thread would read a zeroed stack_info and report a bogus figure. */
+static atomic_t codec_thread_started = ATOMIC_INIT(0);
+uint16_t execute_codec();
+
+/* Peak stack usage (bytes) of the codec/encode thread since boot, for the 0x0062
+ * diagnostics. Defined here — after codec_stack / codec_thread — so both symbols are
+ * in scope. Needs CONFIG_INIT_STACKS (sentinel fill) + CONFIG_THREAD_STACK_INFO
+ * (stack bounds); returns 0 if either is off or the thread isn't up yet. */
+uint32_t codec_get_stack_used(void)
+{
+#if defined(CONFIG_THREAD_STACK_INFO) && defined(CONFIG_INIT_STACKS)
+    size_t unused = 0;
+    if (atomic_get(&codec_thread_started) && k_thread_stack_space_get(&codec_thread, &unused) == 0) {
+        return (uint32_t)(K_THREAD_STACK_SIZEOF(codec_stack) - unused);
+    }
+#endif
+    return 0;
+}
+
+#if CODEC_OPUS
+#if (CONFIG_OPUS_MODE == CONFIG_OPUS_MODE_CELT)
+#define OPUS_ENCODER_SIZE 7180
+#elif (CONFIG_OPUS_MODE == CONFIG_OPUS_MODE_HYBRID)
+#define OPUS_ENCODER_SIZE 10916
+#endif
+__ALIGN(4)
+static uint8_t m_opus_encoder[OPUS_ENCODER_SIZE];
+static OpusEncoder *const m_opus_state = (OpusEncoder *) m_opus_encoder;
+#endif
+
+void codec_entry()
+{
+    uint16_t output_size;
+    while (1) {
+        /* Block until mic delivers at least one PCM block, then drain
+         * the entire ring buffer in one pass before sleeping again.
+         * Eliminates the 10 ms polling delay of the old k_sleep loop. */
+        k_sem_take(&codec_data_sem, K_FOREVER);
+        /* Reset any extra counts accumulated while we were processing the last
+         * batch.  Without this, rapid back-to-back sem_give() calls leave a
+         * non-zero count that causes the next N iterations of the outer loop
+         * to wake immediately and spin on an empty ring buffer. */
+        k_sem_reset(&codec_data_sem);
+
+        while (1) {
+            k_mutex_lock(&codec_ring_mutex, K_FOREVER);
+            bool have_data = ring_buf_size_get(&codec_ring_buf) >= CODEC_PACKAGE_SAMPLES * 2;
+            if (have_data) {
+                ring_buf_get(&codec_ring_buf, (uint8_t *) codec_input_samples, CODEC_PACKAGE_SAMPLES * 2);
+            }
+            k_mutex_unlock(&codec_ring_mutex);
+            if (!have_data) {
+                break;
+            }
+            output_size = execute_codec();
+            if (_callback) {
+                _callback(codec_output_bytes, output_size);
+            }
+        }
+    }
+}
+
+int codec_start()
+{
+
+// OPUS
+#if CODEC_OPUS
+    ASSERT_TRUE(opus_encoder_get_size(1) == sizeof(m_opus_encoder));
+    ASSERT_TRUE(opus_encoder_init(m_opus_state, 16000, 1, CODEC_OPUS_APPLICATION) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_BITRATE(CODEC_OPUS_BITRATE)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_VBR(CODEC_OPUS_VBR)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_VBR_CONSTRAINT(0)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_COMPLEXITY(CODEC_OPUS_COMPLEXITY)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_LSB_DEPTH(16)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_DTX(0)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_INBAND_FEC(0)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_PACKET_LOSS_PERC(0)) == OPUS_OK);
+#endif
+
+    // Thread
+    ring_buf_init(&codec_ring_buf, sizeof(codec_ring_buffer_data), codec_ring_buffer_data);
+    k_thread_create(&codec_thread,
+                    codec_stack,
+                    K_THREAD_STACK_SIZEOF(codec_stack),
+                    (k_thread_entry_t) codec_entry,
+                    NULL,
+                    NULL,
+                    NULL,
+                    K_PRIO_PREEMPT(7),
+                    0,
+                    K_NO_WAIT);
+    atomic_set(&codec_thread_started, 1);
+
+    // Success
+    return 0;
+}
+
+//
+// Opus codec
+//
+
+#if CODEC_OPUS
+
+uint16_t execute_codec()
+{
+    opus_int32 size = opus_encode(
+        m_opus_state, codec_input_samples, CODEC_PACKAGE_SAMPLES, codec_output_bytes, sizeof(codec_output_bytes));
+    if (size < 0) {
+        LOG_WRN("Opus encoding failed: %d", size);
+        return 0;
+    }
+    LOG_DBG("Opus encoding success: %i", size);
+    return size;
+}
+
+#endif

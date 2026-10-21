@@ -1,0 +1,6 @@
+# Copy to key.properties (ignored), or use the MEMRII_* environment variables.
+# Prefer a keystore outside this repository. Paths relative to android/app are allowed.
+storeFile=<path-to-private-keystore>
+keyAlias=memrii-upload
+storePassword=<local-store-password>
+keyPassword=<local-key-password>
