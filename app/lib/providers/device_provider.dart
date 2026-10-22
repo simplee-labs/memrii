@@ -1160,6 +1160,8 @@ class DeviceProvider extends ChangeNotifier
     _keepAliveEverSucceeded = false;
     _foregroundKeepAliveTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
       if (!isConnected || connectedDevice == null) return;
+      // Stands down while a firmware update has the link; see prepareDFU.
+      if (isFirmwareUpdateInProgress) return;
       final conn = await ServiceManager.instance().device.ensureConnection(connectedDevice!.id);
       final ok = (conn != null) && (await conn.sendKeepAlive());
       if (ok) {
@@ -1168,11 +1170,10 @@ class DeviceProvider extends ChangeNotifier
         return;
       }
       _consecutiveKeepAliveFails++;
-      // During DFU the link is saturated with SMP packets, so a keep-alive
-      // write to the storage characteristic can transiently time out. Keep
-      // SENDING (the firmware resets its idle timer only on storage-char
-      // activity), but never force-disconnect — that would abort an otherwise
-      // healthy firmware update. The DFU layer owns connection health here.
+      // Never force-disconnect during a firmware update, which would abort an
+      // otherwise healthy flash; the DFU layer owns connection health there. The
+      // beat stands down for an update (above), but one already waiting on its
+      // write when the update began still gets here, hence the check below.
       //
       // _keepAliveEverSucceeded is the other half of that: recycling rebuilds a
       // GATT, which is a remedy for a link that WAS carrying traffic and wedged.
@@ -1184,10 +1185,10 @@ class DeviceProvider extends ChangeNotifier
       // fails — and the firmware now deliberately holds the link open through that
       // window (transport.c PAIRING_GRACE_MS). Recycling into it would undo, from
       // the phone side, exactly what the firmware is protecting. isFirmwareUpdate-
-      // InProgress does not cover it: on success that flag clears the moment the
-      // update screen sees the re-pair land (FirmwareUpdate._onRepairLatched, and
-      // before that it was the user's Done tap) — either way while the pairing is
-      // still settling, and long before a keep-alive has proved anything.
+      // InProgress does not cover it: on success that flag clears when the user
+      // leaves the update screen (FirmwareUpdate._leaveUpdateScreen, or its
+      // dispose), which can be while the pairing is still settling, and long before
+      // a keep-alive has proved anything.
       if (_consecutiveKeepAliveFails >= 2 && _keepAliveEverSucceeded && !isFirmwareUpdateInProgress) {
         Logger.debug('KeepAlive: 2 consecutive failures on a link that was working, recycling to resync state');
         _consecutiveKeepAliveFails = 0;
@@ -1923,14 +1924,16 @@ class DeviceProvider extends ChangeNotifier
     _resumeReconnectDebounce?.cancel();
     _pauseDisconnectTimer?.cancel();
     _backgroundSyncTimer?.cancel();
-    // Keep _foregroundKeepAliveTimer running: DFU uses the SMP service, not the
-    // Omi storage characteristic, so transport_mark_activity() never fires during
-    // the transfer. Without the keep-alive the firmware's 60 s idle-disconnect
-    // triggers mid-DFU and kills the connection. Newer firmware also defers
-    // idle-disconnect while a DFU image upload is active (sd_get_ota_active), so
-    // this heartbeat is the backstop that flashes a device still running the
-    // older firmware that lacks that defer — keep it until the floor firmware
-    // version guarantees the defer.
+    // _foregroundKeepAliveTimer stays armed but stands down while
+    // isFirmwareUpdateInProgress. Its beat is a write request, and mcumgr shares the
+    // link: Android sends one request at a time per link, so mcumgr's requests wait
+    // behind ours, against mcumgr's 5 s limit. The firmware's idle-disconnect is still
+    // covered. DFU uses the SMP service, not the storage characteristic, so
+    // transport_mark_activity() never fires during the transfer, and firmware that
+    // lacks the upload-time defer (sd_get_ota_active) would drop the link at 60 s.
+    // The native storage keep-alive (OmiBleManager.startStorageKeepAlive) keeps
+    // beating through the update. It runs on every managed link, and as a write
+    // command it never waits on an answer.
 
     final walSync = ServiceManager.instance().wal.getSyncs();
     if (walSync.isSyncing) {
@@ -2759,12 +2762,18 @@ class DeviceProvider extends ChangeNotifier
       Logger.debug('DeviceProvider: Sync already in progress, skipping manual storage refresh.');
       return;
     }
+    // A listing is a notification setup and a run of storage requests, the traffic a
+    // firmware update must not share the link with (see prepareDFU). Device Settings
+    // starts one on open, and it ran into an update's opening handshake.
+    if (isFirmwareUpdateInProgress) return;
 
     var connection = await ServiceManager.instance().device.ensureConnection(dev.id);
     if (connection == null) return;
 
     await connection.acquireStorageLock('refreshStorageStats');
     try {
+      // Again: the lock can take seconds to come free, and an update may have started.
+      if (isFirmwareUpdateInProgress) return;
       final listing = await connection.listFiles();
       final files = listing?.files;
       final stats = await connection.getStorageFileStats();

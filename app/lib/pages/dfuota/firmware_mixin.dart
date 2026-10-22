@@ -22,6 +22,7 @@ import 'package:omi/backend/preferences.dart';
 import 'package:omi/backend/schema/bt_device/bt_device.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'package:omi/providers/device_provider.dart';
+import 'package:omi/services/devices/transports/native_ble_transport.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/services/wals/wal_interfaces.dart';
 import 'package:omi/utils/logger.dart';
@@ -138,6 +139,15 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
   static const Duration _dfuStallTimeout = Duration(seconds: 45);
   bool _dfuTerminated = false;
   String? installErrorMessage;
+
+  // One automatic retry, for an attempt that fails before any firmware was sent (see
+  // [_onMcuAttemptFailed]). [_dfuAttempt] numbers the attempts, so that anything still
+  // arriving from a failed attempt cannot be taken for the retry's: the plugin delivers
+  // every manager's events on channels shared by device, not by session.
+  int _dfuAttempt = 0;
+  bool _dfuUploadReached = false;
+  bool _dfuRetried = false;
+  static const Duration _dfuRetryPause = Duration(seconds: 2);
 
   // Post-flash rediscovery (see [reconnectWhenDeviceReturns]). The window is
   // generous because the reboot is not one reset: the app core swaps its image and
@@ -526,6 +536,10 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
     // stall watchdog here to guarantee no stray timer outlives the manager.
     _dfuStallTimer?.cancel();
     _dfuStallTimer = null;
+    // And give the app its Bluetooth traffic back (an attempt holds it off while mcumgr
+    // runs; see [runMcuAttempt]). Before the await, so a kill that never returns cannot
+    // leave the app unable to read or write its Omi.
+    NativeBleTransport.reclaimLinkFromFirmwareUpdate();
     if (_mcuUpdateManager != null) {
       try {
         await _mcuUpdateManager!.kill();
@@ -617,6 +631,7 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
 
   Future<void> startMCUDfu(BtDevice btDevice, {bool fileInAssets = false, String? zipFilePath}) async {
     _dfuTerminated = false;
+    _dfuRetried = false;
     setState(() {
       isInstalling = true;
       installErrorMessage = null;
@@ -631,20 +646,42 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
       _handleDfuFailure('Firmware file not found. Please try again.');
       return;
     }
-    final bytes = await file.readAsBytes();
+    final List<mcumgr.Image> images;
+    try {
+      images = await processZipFile(await file.readAsBytes());
+    } catch (e) {
+      Logger.debug('DFU setup failed: $e');
+      _handleDfuFailure('Could not start the update. Please try again.');
+      return;
+    }
+    await runMcuAttempt(btDevice, images);
+  }
+
+  /// One mcumgr session for [images]: holds the app's own Bluetooth traffic off the link,
+  /// starts the manager and follows it to success, or to [_onMcuAttemptFailed], which may
+  /// run one more. [startMCUDfu] calls it once the link is prepared and the bundle unpacked.
+  @visibleForTesting
+  Future<void> runMcuAttempt(BtDevice btDevice, List<mcumgr.Image> images) async {
+    final attempt = ++_dfuAttempt;
+    _dfuUploadReached = false;
+    // Pre-flight: also ends an earlier attempt's session, and its hold on the link.
+    await killMcuUpdateManager();
+    // mcumgr's handshake shares the link with the app's own requests, so those stop now
+    // and the ones already sent are waited for (NativeBleTransport.yieldLinkToFirmwareUpdate).
+    // Bounded: the update goes ahead either way, and a handshake that still fails is retried.
+    if (!await NativeBleTransport.yieldLinkToFirmwareUpdate()) {
+      Logger.debug('DFU: ${NativeBleTransport.unansweredNativeOps} app Bluetooth requests still unanswered, '
+          'starting the update anyway');
+    }
     const configuration = mcumgr.FirmwareUpgradeConfiguration(
       estimatedSwapTime: Duration(seconds: 0),
       eraseAppSettings: false,
       pipelineDepth: 1,
     );
-
-    await killMcuUpdateManager();
     final mcumgr.FirmwareUpdateManager updateManager;
-    final List<mcumgr.Image> images;
     try {
       updateManager = await managerFactory!.getUpdateManager(btDevice.id);
       _mcuUpdateManager = updateManager;
-      images = await processZipFile(bytes);
     } catch (e) {
       Logger.debug('DFU setup failed: $e');
       _handleDfuFailure('Could not start the update. Please try again.');
@@ -665,71 +702,107 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
     // NOT an early return when unmounted — the flash must proceed exactly as before.
     if (mounted) setState(() {});
 
-    final updateStream = updateManager.setup();
-
-    updateStream.listen((state) {
-      // Once this attempt has ended (success or _handleDfuFailure), ignore any
-      // event still queued behind it: the state/progress streams and the
-      // watchdog timer are independent async sources, so a success event can
-      // arrive after teardown began (it must not resurrect the success screen)
-      // and stray state events must not re-arm a dead watchdog timer.
-      if (_dfuTerminated) return;
-      if (state == mcumgr.FirmwareUpgradeState.success) {
-        _dfuTerminated = true; // success is terminal
-        Logger.debug('update success');
-        killMcuUpdateManager(); // also cancels the stall watchdog
-        releaseUpdateWakelocks();
-        releasePairingOnSuccess(btDevice);
-        _clearStaleScanResultsOnSuccess();
-        if (mounted) {
-          setState(() {
-            isInstalling = false;
-            isInstalled = true;
-          });
-        }
-      } else {
-        Logger.debug('update state: $state');
-        _armDfuStallWatchdog(); // advancing through stages resets the watchdog
-        // Every image has been sent by the time the upgrade moves past Upload, so
-        // top the bar off. Without this it keeps whatever fraction the last progress
-        // event left — short of 100 % whenever the final bundle image was skipped as
-        // already-present (see [_applyDfuProgress]).
-        if (state == mcumgr.FirmwareUpgradeState.test ||
-            state == mcumgr.FirmwareUpgradeState.confirm ||
-            state == mcumgr.FirmwareUpgradeState.reset) {
-          if (mounted) setState(() => installProgress = 100);
-        }
-      }
-    }, onError: (Object e) {
-      // mcumgr surfaces DFU failures as a stream error (see DeviceUpdateManager).
-      Logger.debug('update error: $e');
-      _handleDfuFailure('Firmware update failed. Please try again.');
-    });
-
-    updateManager.progressStream.listen((progress) {
-      if (_dfuTerminated) return;
-      Logger.debug('progress: $progress');
-      _armDfuStallWatchdog();
-      if (mounted) {
-        setState(() => _applyDfuProgress(progress.bytesSent, progress.imageSize));
-      }
-    });
-
-    updateManager.logger.logMessageStream
-        .where((log) => log.level.rawValue > 1) // Filter debug messages
-        .listen((log) {
-      Logger.debug('dfu log: ${log.message}');
-    });
-
-    // Arm before kicking off the transfer: the initial SMP connect/setup is the
-    // most common place to wedge with progress stuck at 0%.
-    _armDfuStallWatchdog();
     try {
+      updateManager.setup().listen((state) {
+        // Once this attempt has ended (success, _handleDfuFailure, or retired for a
+        // retry), ignore any event still queued behind it: the state/progress streams
+        // and the watchdog timer are independent async sources, so a success event can
+        // arrive after teardown began (it must not resurrect the success screen)
+        // and stray state events must not re-arm a dead watchdog timer.
+        if (attempt != _dfuAttempt || _dfuTerminated) return;
+        if (state == mcumgr.FirmwareUpgradeState.success) {
+          _dfuTerminated = true; // success is terminal
+          Logger.debug('update success');
+          killMcuUpdateManager(); // also cancels the stall watchdog
+          releaseUpdateWakelocks();
+          releasePairingOnSuccess(btDevice);
+          _clearStaleScanResultsOnSuccess();
+          if (mounted) {
+            setState(() {
+              isInstalling = false;
+              isInstalled = true;
+            });
+          }
+        } else {
+          Logger.debug('update state: $state');
+          _armDfuStallWatchdog(); // advancing through stages resets the watchdog
+          if (state == mcumgr.FirmwareUpgradeState.upload) _dfuUploadReached = true;
+          // Every image has been sent by the time the upgrade moves past Upload, so
+          // top the bar off. Without this it keeps whatever fraction the last progress
+          // event left — short of 100 % whenever the final bundle image was skipped as
+          // already-present (see [_applyDfuProgress]).
+          if (state == mcumgr.FirmwareUpgradeState.test ||
+              state == mcumgr.FirmwareUpgradeState.confirm ||
+              state == mcumgr.FirmwareUpgradeState.reset) {
+            _dfuUploadReached = true;
+            if (mounted) setState(() => installProgress = 100);
+          }
+        }
+      }, onError: (Object e) {
+        // mcumgr surfaces DFU failures as a stream error (see DeviceUpdateManager).
+        Logger.debug('update error: $e');
+        _onMcuAttemptFailed(btDevice, images, attempt, 'Firmware update failed. Please try again.');
+      });
+
+      updateManager.progressStream.listen((progress) {
+        if (attempt != _dfuAttempt || _dfuTerminated) return;
+        _dfuUploadReached = true;
+        Logger.debug('progress: $progress');
+        _armDfuStallWatchdog();
+        if (mounted) {
+          setState(() => _applyDfuProgress(progress.bytesSent, progress.imageSize));
+        }
+      });
+
+      updateManager.logger.logMessageStream
+          .where((log) => log.level.rawValue > 1) // Filter debug messages
+          .listen((log) {
+        Logger.debug('dfu log: ${log.message}');
+      });
+
+      // Arm before kicking off the transfer: the initial SMP connect/setup is the
+      // most common place to wedge with progress stuck at 0%.
+      _armDfuStallWatchdog();
       await updateManager.update(images, configuration: configuration);
     } catch (e) {
       Logger.debug('DFU update kickoff failed: $e');
-      _handleDfuFailure('Firmware update failed. Please try again.');
+      _onMcuAttemptFailed(btDevice, images, attempt, 'Firmware update failed. Please try again.');
     }
+  }
+
+  /// Ends the update on [message], or runs one more attempt.
+  ///
+  /// One more only while no firmware has been sent. mcumgr's opening handshake (its
+  /// parameters, the bootloader info and the image list) gives up on a request left
+  /// unanswered for 5 s, and on a link shared with the app a request can wait that long.
+  /// Nothing has been written to the Omi at that point, so going again is safe, and it is
+  /// what the user would do from the error banner anyway. The pause lets Android close the
+  /// failed session's GATT client before the next one connects; a user's own retry has
+  /// that pause built in.
+  ///
+  /// Not retried: a failure once mcumgr has begun sending, or found its images already on
+  /// the Omi (it reached Upload, Test, Confirm or Reset, or reported bytes sent), which is
+  /// left to the user; and a stall, which the watchdog takes straight to
+  /// [_handleDfuFailure], because a stalled session may still be running when it is killed
+  /// and could report into the next one.
+  void _onMcuAttemptFailed(BtDevice btDevice, List<mcumgr.Image> images, int attempt, String message) {
+    if (attempt != _dfuAttempt || _dfuTerminated) return;
+    if (_dfuUploadReached || _dfuRetried || !mounted) {
+      _handleDfuFailure(message);
+      return;
+    }
+    _dfuRetried = true;
+    _dfuAttempt++; // retire the failed attempt: nothing more from it is acted on
+    Logger.debug('DFU: failed before any firmware was sent, trying once more');
+    unawaited(_retryMcuAttempt(btDevice, images));
+  }
+
+  Future<void> _retryMcuAttempt(BtDevice btDevice, List<mcumgr.Image> images) async {
+    await killMcuUpdateManager();
+    await Future.delayed(_dfuRetryPause);
+    // Left the page meanwhile: its dispose killed the manager and gave the link back.
+    if (!mounted || _dfuTerminated) return;
+    await runMcuAttempt(btDevice, images);
   }
 
   Future<void> startLegacyDfu(BtDevice btDevice, {bool fileInAssets = false, String? zipFilePath}) async {

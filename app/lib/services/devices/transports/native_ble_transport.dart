@@ -257,7 +257,7 @@ class NativeBleTransport extends DeviceTransport {
       // Native bounds both queue wait and descriptor confirmation, tearing down
       // the GATT on expiry. Keep its actual future until it settles; a separate
       // Dart timeout must not abandon an outstanding native subscription.
-      () => _hostApi.subscribeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid),
+      () => _countUntilAnswered(_hostApi.subscribeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid)),
     );
     try {
       await pending;
@@ -333,9 +333,15 @@ class NativeBleTransport extends DeviceTransport {
   @override
   Future<List<int>> readCharacteristic(String serviceUuid, String characteristicUuid) async {
     if (!_hasCharacteristic(serviceUuid, characteristicUuid)) return [];
+    if (_linkYieldedToFirmwareUpdate) {
+      Logger.debug(
+          '[NativeBleTransport] read $serviceUuid:$characteristicUuid not sent: a firmware update has the link');
+      return [];
+    }
     try {
       final data =
-          await _hostApi.readCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid).timeout(_gattOpTimeout);
+          await _countUntilAnswered(_hostApi.readCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid))
+              .timeout(_gattOpTimeout);
       return data.toList();
     } on TimeoutException catch (_) {
       // A read that never gets its onCharacteristicRead callback is the wedged-GATT
@@ -356,14 +362,78 @@ class NativeBleTransport extends DeviceTransport {
     if (!_hasCharacteristic(serviceUuid, characteristicUuid)) {
       throw Exception('Characteristic not available: $characteristicUuid');
     }
+    if (_linkYieldedToFirmwareUpdate) {
+      Logger.debug(
+          '[NativeBleTransport] write $serviceUuid:$characteristicUuid not sent: a firmware update has the link');
+      throw StateError('Not sent: a firmware update has the link');
+    }
     try {
-      await _hostApi
-          .writeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid, Uint8List.fromList(data))
+      await _countUntilAnswered(
+              _hostApi.writeCharacteristic(_peripheralUuid, serviceUuid, characteristicUuid, Uint8List.fromList(data)))
           .timeout(_gattOpTimeout);
     } catch (e) {
       Logger.debug('[NativeBleTransport] Failed to write characteristic: $e');
       rethrow;
     }
+  }
+
+  // MARK: - Firmware Update Hand-off
+  //
+  // mcumgr talks to the Omi through a GATT client of its own, over the same link as this
+  // app. Android sends one request at a time on a link, whichever client it comes from,
+  // so a request of ours still waiting for its answer holds mcumgr's next one back, and
+  // mcumgr gives up on a request after 5 s. An update failed in its opening handshake
+  // with one of mcumgr's requests never sent, while Device Settings was still reading
+  // settings and listing storage.
+  //
+  // Static, because every transport shares that one link: the app manages one Omi at a time.
+
+  /// Native operations issued from Dart (reads, writes, notification setup) that native
+  /// has not answered yet: still queued, or in flight, in OmiBleManager's command queue.
+  static int _unansweredNativeOps = 0;
+  static Completer<void>? _nativeOpsAnswered;
+  static bool _linkYieldedToFirmwareUpdate = false;
+
+  /// How many operations [yieldLinkToFirmwareUpdate] is still waiting on, for its caller's log.
+  static int get unansweredNativeOps => _unansweredNativeOps;
+
+  /// Whether reads and writes are being refused for a firmware update.
+  static bool get linkYieldedToFirmwareUpdate => _linkYieldedToFirmwareUpdate;
+
+  /// Refuses this app's reads and writes until [reclaimLinkFromFirmwareUpdate], then waits
+  /// up to [settle] for those already sent to be answered. Returns whether they all were.
+  ///
+  /// A refused read answers empty and a refused write throws, as when the Omi does not
+  /// answer, which every caller already handles. Notification setup is not refused: it is
+  /// how a reconnect restores the link, and a reconnect means the link mcumgr was using is
+  /// gone anyway. The native storage keep-alive is untouched too. It is a write command,
+  /// which waits on no answer, and it keeps firmware that lacks the upload-time idle defer
+  /// from dropping the link mid-update.
+  static Future<bool> yieldLinkToFirmwareUpdate({Duration settle = const Duration(seconds: 10)}) async {
+    _linkYieldedToFirmwareUpdate = true;
+    if (_unansweredNativeOps == 0) return true;
+    try {
+      await (_nativeOpsAnswered ??= Completer<void>()).future.timeout(settle);
+      return true;
+    } on TimeoutException {
+      return false;
+    }
+  }
+
+  /// Lets reads and writes through again. Idempotent: every way an update ends calls it.
+  static void reclaimLinkFromFirmwareUpdate() => _linkYieldedToFirmwareUpdate = false;
+
+  /// Counts [op] as unanswered until native answers it, whatever the Dart timeout around it
+  /// does: native keeps an operation queued or in flight after Dart has given up on it, and
+  /// it is native's operation that occupies the link.
+  static Future<T> _countUntilAnswered<T>(Future<T> op) {
+    _unansweredNativeOps++;
+    op.then<void>((_) {}, onError: (Object _) {}).whenComplete(() {
+      if (--_unansweredNativeOps > 0) return;
+      _nativeOpsAnswered?.complete();
+      _nativeOpsAnswered = null;
+    });
+    return op;
   }
 
   // MARK: - Dispose
