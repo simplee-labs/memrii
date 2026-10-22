@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import org.json.JSONObject
 
 class SyncAlarmReceiver : BroadcastReceiver() {
 
@@ -48,9 +49,10 @@ class SyncAlarmReceiver : BroadcastReceiver() {
         /// Arm (or cancel, at `timestampMs <= 0`) the periodic sync alarm.
         ///
         /// The single funnel for that alarm — DeviceProvider reaches it through
-        /// `setNextSyncTime` (BleHostApiImpl, service or not), the receiver's own re-arm
-        /// below calls it directly, and BootReceiver re-arms through it — so it
-        /// is also the right place to mirror the due-time to disk. `idleNotificationContent`
+        /// `setNextSyncTime` (BleHostApiImpl, service or not, while an Omi is paired — see
+        /// [hasBoundDevice]), the receiver's own re-arm below calls it directly, and
+        /// BootReceiver re-arms through it — so it is also the right place to mirror the
+        /// due-time to disk. `idleNotificationContent`
         /// reads it back to render "Next sync at H:MM" on a headless start, where nothing
         /// Dart-side has pushed a status yet. Persisting here rather than at the call sites
         /// is what makes the rendered time and the armed alarm unable to disagree.
@@ -67,6 +69,21 @@ class SyncAlarmReceiver : BroadcastReceiver() {
             } else {
                 am.cancel(pi)
                 Log.d(TAG, "schedule: cancelled")
+            }
+        }
+
+        /// True when an Omi is paired: the device Dart syncs, read the way BackgroundSyncWorker
+        /// reads it. With none there is nothing to sync, so the sync alarm is neither armed
+        /// nor re-armed — firing would only cold-start the process and the foreground service
+        /// every interval, on a phone that was never paired or whose Omi was forgotten.
+        fun hasBoundDevice(context: Context): Boolean {
+            val json = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                .getString("flutter.btDevice", "") ?: ""
+            if (json.isBlank()) return false
+            return try {
+                JSONObject(json).optString("id").isNotBlank()
+            } catch (e: Exception) {
+                false
             }
         }
 
@@ -116,16 +133,23 @@ class SyncAlarmReceiver : BroadcastReceiver() {
         if (intent.action != ACTION) return
         Log.d(TAG, "onReceive: alarm fired")
 
+        // Nothing to sync — Manual Only, or no Omi paired (never paired, or forgotten while
+        // the alarm was armed). Cancel instead of re-arming, and start nothing: this alarm
+        // would otherwise keep itself alive, waking the process and the service every
+        // interval for a sync that cannot happen. Dart re-arms it once there is one to run.
+        val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val intervalMinutes = prefs.getLong("flutter.backgroundSyncIntervalMinutes", 30L).toInt()
+        if (intervalMinutes <= 0 || !hasBoundDevice(context)) {
+            schedule(context, 0)
+            Log.i(TAG, "onReceive: no paired Omi on auto-sync — sync alarm cancelled")
+            return
+        }
+
         // Re-arm for next cycle. Dart will call setNextSyncTime again after the
         // sync completes, which overwrites this with the exact post-sync timestamp
         // (FLAG_UPDATE_CURRENT). This re-arm only fires if Dart is frozen and
         // can't make that call.
-        val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        val intervalMinutes = prefs.getLong("flutter.backgroundSyncIntervalMinutes", 30L).toInt()
-        if (intervalMinutes > 0) {
-            val nextMs = System.currentTimeMillis() + intervalMinutes * 60_000L
-            schedule(context, nextMs)
-        }
+        schedule(context, System.currentTimeMillis() + intervalMinutes * 60_000L)
 
         if (!OmiBleManager.isInitialized) {
             OmiBleManager.initialize(context.applicationContext as android.app.Application)

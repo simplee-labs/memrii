@@ -329,14 +329,17 @@ class BleHostApiImpl(
     override fun setNextSyncTime(timestampMs: Long) {
         // Armed here, not through the service: on a cold start or after the process was
         // reclaimed the service is often not running yet, and the alarm was then never
-        // armed, leaving background sync to WorkManager alone. The service, when up, only
-        // keeps its recovery-probe bookkeeping in step.
+        // armed, leaving background sync to WorkManager alone. Only for a paired Omi:
+        // DeviceProvider publishes a schedule whether or not one is paired, and an alarm
+        // with nothing to sync would cold-start the process every interval. The service,
+        // when up, only keeps its recovery-probe bookkeeping in step.
+        val armAt = if (timestampMs > 0 && SyncAlarmReceiver.hasBoundDevice(appContext)) timestampMs else 0L
         try {
-            SyncAlarmReceiver.schedule(appContext, timestampMs)
+            SyncAlarmReceiver.schedule(appContext, armAt)
         } catch (e: Exception) {
             Log.w(TAG, "setNextSyncTime: could not arm the sync alarm: ${e.message}")
         }
-        OmiBleForegroundService.instance?.onSyncScheduleChanged(timestampMs)
+        OmiBleForegroundService.instance?.onSyncScheduleChanged(armAt)
     }
 
     override fun setDeviceBattery(level: Long, timestampMs: Long) {
