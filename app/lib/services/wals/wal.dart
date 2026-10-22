@@ -20,12 +20,15 @@ class Wal {
 
   WalStatus status;
   bool isSyncing;
-  // Number of consecutive sync attempts that ended with fewer bytes received than
-  // the device advertised in CMD_LIST_FILES (an incomplete/empty read). Used by the
-  // fast-path completeness guard to retry a short read instead of deleting the
-  // device-side file, and to eventually give up on a genuinely unreadable ("poison")
-  // file so it doesn't block the head-of-line forever. Reset to 0 on a full transfer.
+  // Consecutive sync attempts that failed for a reason of the file's own (a short read,
+  // a lost packet, a read error) without moving it any further. Orders retries: a file
+  // that keeps failing goes after the rest. Reset by progress and by a full transfer.
   int syncFailCount;
+  // When the file first failed for a reason of its own — not a dropped link or a cancel.
+  // Kept, and not moved by progress, until the file is received. Processing stops
+  // waiting for the file [SDCardWalSyncImpl.heldBackGiveUpAfter] after it, or sooner
+  // after [SDCardWalSyncImpl.heldBackGiveUpFailures] failed syncs in a row.
+  int? failingSinceMs;
   // 0 includes legacy native prefixes that may contain synthesized gap bytes.
   // 1 is written only after starting a fresh contiguous native download.
   int nativeIntegrityVersion;
@@ -46,6 +49,7 @@ class Wal {
     this.status = WalStatus.miss,
     this.isSyncing = false,
     this.syncFailCount = 0,
+    this.failingSinceMs,
     this.nativeIntegrityVersion = 0,
     this.lastIntegrityGapOffset,
   });
@@ -98,6 +102,7 @@ class Wal {
       'storage': storage.name,
       'status': status.name,
       'syncFailCount': syncFailCount,
+      'failingSinceMs': failingSinceMs,
       'nativeIntegrityVersion': nativeIntegrityVersion,
       'lastIntegrityGapOffset': lastIntegrityGapOffset,
     };
@@ -118,6 +123,7 @@ class Wal {
       storage: WalStorage.values.firstWhere((e) => e.name == json['storage'], orElse: () => WalStorage.local),
       status: WalStatus.values.firstWhere((e) => e.name == json['status'], orElse: () => WalStatus.miss),
       syncFailCount: json['syncFailCount'] ?? 0,
+      failingSinceMs: json['failingSinceMs'],
       nativeIntegrityVersion: json['nativeIntegrityVersion'] ?? 0,
       lastIntegrityGapOffset: json['lastIntegrityGapOffset'],
     );

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/capture/capture_policy.dart';
@@ -13,6 +14,31 @@ class VadProcessingCancelled implements Exception {
   const VadProcessingCancelled();
   @override
   String toString() => 'VadProcessingCancelled';
+}
+
+/// A recording's audio could not be written. Thrown out of the run instead of being
+/// logged and dropped: the buffered frames are the only record of audio whose source
+/// bins become deletable the moment the buffer clears, so the run has to stop with
+/// them still pending. That is the state a kill leaves, and the checkpoint already
+/// resumes from it.
+class RecordingWriteFailed implements Exception {
+  final Object cause;
+
+  /// The phone is out of space, as opposed to something wrong with this audio.
+  final bool storageFull;
+
+  const RecordingWriteFailed(this.cause, {required this.storageFull});
+
+  /// ENOSPC on Android; ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL on Windows.
+  static bool isStorageFull(Object error) {
+    if (error is RecordingWriteFailed) return error.storageFull;
+    if (error is! FileSystemException) return false;
+    final code = error.osError?.errorCode;
+    return code == 28 || code == 112 || code == 39;
+  }
+
+  @override
+  String toString() => 'RecordingWriteFailed(${storageFull ? 'storage full' : 'write failed'}): $cause';
 }
 
 /// All VAD/processing settings captured from SharedPreferences in the main isolate

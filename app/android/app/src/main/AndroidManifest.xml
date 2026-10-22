@@ -80,6 +80,17 @@
             </intent-filter>
         </receiver>
 
+        <!-- Re-arms the sync alarm after a reboot (which clears alarms) or an update.
+             Not exported: both are system broadcasts. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".BleCompanionService"
             android:exported="true"

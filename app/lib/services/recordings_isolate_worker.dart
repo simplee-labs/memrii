@@ -9,6 +9,7 @@ import 'package:opus_dart/opus_dart.dart';
 import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'package:omi/services/vad_audio_processor.dart';
 import 'package:omi/services/vad_batch_runner_channel.dart';
+import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/debug_log_manager.dart';
 import 'package:omi/utils/logger.dart';
 
@@ -202,6 +203,11 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
   Logger.debug(
       'RecordingsManager isolate: processing run started — ${params.segmentPaths.length} segment(s), backgroundMode=${params.backgroundMode}');
 
+  // Where a failure happened, reported with it. A failed restore means the checkpoint
+  // itself is unusable; a failure inside a segment is attributed to that bin, so a
+  // file that fails every run can be set aside instead of blocking every later one.
+  var phase = 'restore';
+  String? currentBin;
   try {
     if (params.checkpointState != null) {
       await processor.restoreState(params.checkpointState!);
@@ -235,12 +241,14 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
     // can never leave the resume state pointing at a file already gone from disk.
     final pendingDeleteBatch = <String>[];
 
+    phase = 'segment';
     for (int i = params.checkpointResumeIndex; i < params.segmentPaths.length; i++) {
       if (cancelled) {
         break;
       }
 
       final file = File(params.segmentPaths[i]);
+      currentBin = file.path;
       final startTime = DateTime.fromMillisecondsSinceEpoch(
         params.segmentStartTimesMs[i],
       );
@@ -325,13 +333,15 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
           (pendingDeleteBatch.isNotEmpty || nowMs - lastCheckpointMs >= checkpointMinIntervalMs)) {
         try {
           final cpState = await processor.serializeState();
-          await File(params.checkpointPath!).writeAsString(jsonEncode({
-            'version': checkpointVersion,
-            'lastIndex': i,
-            'paths': params.segmentPaths,
-            'state': cpState,
-            'pendingDeletes': [...checkpointPendingDeletes, ...pendingDeleteBatch],
-          }));
+          await AtomicFile.writeString(
+              File(params.checkpointPath!),
+              jsonEncode({
+                'version': checkpointVersion,
+                'lastIndex': i,
+                'paths': params.segmentPaths,
+                'state': cpState,
+                'pendingDeletes': [...checkpointPendingDeletes, ...pendingDeleteBatch],
+              }));
           lastCheckpointMs = nowMs;
           // Checkpoint is durable → safe to release the held deletes now.
           checkpointPendingDeletes.addAll(pendingDeleteBatch);
@@ -349,6 +359,9 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
         await Future.delayed(const Duration(milliseconds: 200));
       }
     }
+
+    currentBin = null;
+    phase = 'flush';
 
     // Skip the draft flush on cancel — flushRemaining triggers another save
     // pass (potentially several seconds), and we already broke out specifically
@@ -393,7 +406,13 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
 
     params.sendPort.send({'type': 'done', 'cancelled': cancelled});
   } catch (e, st) {
-    params.sendPort.send({'type': 'error', 'message': '$e\n$st'});
+    params.sendPort.send({
+      'type': 'error',
+      'message': '$e\n$st',
+      'phase': phase,
+      'bin': currentBin,
+      'storageFull': RecordingWriteFailed.isStorageFull(e),
+    });
   } finally {
     heartbeatTimer.cancel();
     // Persist the priority latch on EVERY exit (clean / cancel / error):

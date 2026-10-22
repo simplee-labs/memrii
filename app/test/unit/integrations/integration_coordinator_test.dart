@@ -34,6 +34,8 @@ class _IdleSync implements SDCardWalSync {
   @override
   Future<Set<String>> incompleteBinRelPaths() async => {};
   @override
+  Future<Set<String>> heldBackBinRelPaths() async => {};
+  @override
   void setGlobalProgressListener(IWalSyncProgressListener? value) => listener = value;
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'package:omi/utils/logger.dart';
 import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/vad_audio_processor.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/backend/preferences.dart';
@@ -655,7 +656,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
             if (_isDisposed) return;
             final discarded = await RecordingsManager.discardedRelBinPaths();
             final covered = await RecordingsManager.coveredBinPaths(_batches.expand((b) => b.rawSegments).toList());
-            final incomplete = await _incompleteBins();
+            final incomplete = {...await _incompleteBins(), ...await _heldBins()};
             final processable = _batches
                 .expand((b) => b.rawSegments)
                 .where((f) => isProcessableBin(f, discarded, covered, incomplete))
@@ -686,7 +687,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
               if (_isDisposed) return;
               final discarded = await RecordingsManager.discardedRelBinPaths();
               final covered = await RecordingsManager.coveredBinPaths(_batches.expand((b) => b.rawSegments).toList());
-              final incomplete = await _incompleteBins();
+              final incomplete = {...await _incompleteBins(), ...await _heldBins()};
               final processable = _batches
                   .expand((b) => b.rawSegments)
                   .where((f) => isProcessableBin(f, discarded, covered, incomplete))
@@ -1212,16 +1213,15 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// settings, or null if nothing establishes one yet. Two independent things
   /// can, and the later of the two wins:
   ///
-  /// **The oldest raw bin on disk.** The sync layer hands files over strictly
-  /// oldest-first and *cannot* skip: `sdcard_wal_sync.dart` reads index 0 only,
-  /// and a file it fails to read or delete stops the cycle rather than advancing
-  /// past it ("we can't skip past this file without deleting it"). So if the
-  /// oldest bin the phone holds starts at X, everything recorded before X has
-  /// already arrived, or was dropped from the device outright — audio cannot
-  /// arrive from further back in time. The one way past a stuck file is the
-  /// poison-drop, which deletes it from the device, so that audio is gone too.
-  /// Read from the UNFILTERED batches: a bin still mid-transfer is real audio and
-  /// must be allowed to hold the watermark down.
+  /// **The oldest audio not yet processed** — the earlier of the oldest raw bin on
+  /// disk and the oldest file still waiting on the Omi. The sync skips a file it
+  /// cannot read yet and fetches the newer ones, so older audio CAN arrive after
+  /// newer audio; what bounds it is that file, which stays on the device until it
+  /// downloads or the device drops it. Everything recorded before that point has
+  /// arrived. A waiting file with no wall-clock time (recorded before the clock was
+  /// set) could be from any time, so it leaves the bins no evidence to give. Bins are
+  /// read from the UNFILTERED batches: a bin still mid-transfer is real audio and must
+  /// be allowed to hold the watermark down.
   ///
   /// **The recordings-retention cutoff.** Everything before it is past its
   /// keep-window, so whatever an entry would have produced is deleted by the next
@@ -1235,16 +1235,40 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// "all processed" and "nothing synced yet", and only the first would justify
   /// retiring anything.
   int? _retirementWatermarkUtcSeconds() {
-    int? watermark;
-    for (final b in _batches) {
-      for (final f in b.rawSegments) {
-        final start = binStartUtcSeconds(f);
-        if (watermark == null || start < watermark) watermark = start;
-      }
+    ({bool unknownTime, int? utcSeconds}) waiting;
+    try {
+      waiting = _walSync.oldestFileWaitingOnDevice;
+    } catch (_) {
+      waiting = (unknownTime: true, utcSeconds: null); // cannot say — assume it could be anything
     }
-    final days = _prefs.keepRecordingsDays;
-    if (days > 0) {
-      final cutoff = DateTime.now().toUtc().subtract(Duration(days: days)).millisecondsSinceEpoch ~/ 1000;
+    return retirementWatermark(
+      bins: _batches.expand((b) => b.rawSegments),
+      waitingOnDevice: waiting,
+      keepRecordingsDays: _prefs.keepRecordingsDays,
+      now: DateTime.now(),
+    );
+  }
+
+  /// The pure half of [_retirementWatermarkUtcSeconds].
+  @visibleForTesting
+  static int? retirementWatermark({
+    required Iterable<File> bins,
+    required ({bool unknownTime, int? utcSeconds}) waitingOnDevice,
+    required int keepRecordingsDays,
+    required DateTime now,
+  }) {
+    int? watermark;
+    for (final f in bins) {
+      final start = binStartUtcSeconds(f);
+      if (watermark == null || start < watermark) watermark = start;
+    }
+    if (waitingOnDevice.unknownTime) {
+      watermark = null;
+    } else if (waitingOnDevice.utcSeconds != null && (watermark == null || waitingOnDevice.utcSeconds! < watermark)) {
+      watermark = waitingOnDevice.utcSeconds;
+    }
+    if (keepRecordingsDays > 0) {
+      final cutoff = now.toUtc().subtract(Duration(days: keepRecordingsDays)).millisecondsSinceEpoch ~/ 1000;
       if (watermark == null || cutoff > watermark) watermark = cutoff;
     }
     return watermark;
@@ -1354,6 +1378,26 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     }
   }
 
+  /// Bins no automatic run decodes for now although their transfer is complete: set
+  /// aside after processing kept failing inside them (see SetAsideBins), or waiting
+  /// for an older file of their boot that is still on the Omi
+  /// ([SDCardWalSync.heldBackBinRelPaths] — not during Force, which decodes what has
+  /// arrived). Counted out of "minutes to process" too, which would otherwise promise
+  /// audio no run takes.
+  Future<Set<String>> _heldBins() async {
+    final held = {...SetAsideBins.relBins()};
+    if (!_isForcePipeline) {
+      try {
+        held.addAll(await _walSync.heldBackBinRelPaths());
+      } catch (e) {
+        // Callers here only size an estimate or pre-filter; the run itself fails closed
+        // on the same read in RecordingsManager.processAll.
+        Logger.error('RecordingsController: could not read the held-back bin set: $e');
+      }
+    }
+    return held;
+  }
+
   Future<void> _runProcessing() async {
     final int gen = _pipelineGeneration;
     _lastActiveStage = 'processing';
@@ -1396,9 +1440,10 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       return;
     }
 
+    final heldBins = await _heldBins();
+    final notYet = {...incompleteBins, ...heldBins};
     var processableBatches = _batches.map((b) {
-      final filtered =
-          b.rawSegments.where((f) => isProcessableBin(f, discardedBins, coveredBins, incompleteBins)).toList();
+      final filtered = b.rawSegments.where((f) => isProcessableBin(f, discardedBins, coveredBins, notYet)).toList();
       if (filtered.length == b.rawSegments.length) return b;
       return Batch(
         dateString: b.dateString,
@@ -1420,6 +1465,8 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
         final rel = f.path.split('/raw_segments/').last;
         if (incompleteBins.contains(rel)) {
           excluded.add('$rel (mid-transfer)');
+        } else if (heldBins.contains(rel)) {
+          excluded.add('$rel (held)');
         } else if (discardedBins.contains(rel)) {
           excluded.add('$rel (discarded)');
         } else if (coveredBins.contains(f.path)) {
@@ -1834,7 +1881,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
           _batches,
           await RecordingsManager.discardedRelBinPaths(),
           await RecordingsManager.coveredBinPaths(rawSegments),
-          await _incompleteBins(),
+          {...await _incompleteBins(), ...await _heldBins()},
         );
         _toProcessMinutes = acc.toProcessMinutes;
         _draftMinutes = acc.draftMinutes;
@@ -1867,7 +1914,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
           _batches,
           await RecordingsManager.discardedRelBinPaths(),
           await RecordingsManager.coveredBinPaths(rawSegments),
-          await _incompleteBins(),
+          {...await _incompleteBins(), ...await _heldBins()},
         );
         _toProcessMinutes = acc.toProcessMinutes;
         _draftMinutes = acc.draftMinutes;

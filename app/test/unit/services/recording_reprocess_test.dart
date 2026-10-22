@@ -36,12 +36,14 @@ void main() {
     docs = Directory.systemTemp.createTempSync('recording_reprocess');
     PathProviderPlatform.instance = MockPathProvider()..tempPath = docs.path;
     RecordingsManager.incompleteBinResolverForTest = () async => const {};
+    RecordingsManager.heldBackBinResolverForTest = () async => const {};
     RecordingsManager.reprocessSyncInFlightForTest = () => false;
     manager = RecordingsManager();
   });
 
   tearDown(() {
     RecordingsManager.incompleteBinResolverForTest = null;
+    RecordingsManager.heldBackBinResolverForTest = null;
     RecordingsManager.reprocessSyncInFlightForTest = null;
     RecordingsManager.forgetUploadsInFlightForTest();
     docs.deleteSync(recursive: true);
@@ -155,10 +157,10 @@ void main() {
     });
   }
 
-  test('source bins survive while another original or draft remains in the session', () async {
+  test('source bins survive while a remaining draft names them', () async {
     final raw = writeBin(start);
     final original = oldRecording(bins: [relativeBin(start)]);
-    final draft = oldRecording(time: start.add(const Duration(minutes: 1)), draft: true);
+    final draft = oldRecording(time: start.add(const Duration(minutes: 1)), draft: true, bins: [relativeBin(start)]);
     final crop =
         await manager.saveCroppedConversation(original, const Duration(seconds: 2), const Duration(seconds: 5));
     await RecordingsManager.deleteConversation(crop);
@@ -167,6 +169,21 @@ void main() {
     expect(raw.existsSync(), isTrue, reason: 'an open draft still needs the source bins');
     await RecordingsManager.deleteConversation(draft);
     expect(raw.existsSync(), isFalse);
+  });
+
+  test('deleting a recording leaves audio of the same boot that is still waiting to be processed', () async {
+    final consumed = writeBin(start);
+    final waiting = writeBin(start.add(const Duration(minutes: 10)));
+    final original = oldRecording(bins: [relativeBin(start)]);
+
+    await RecordingsManager.deleteConversation(original);
+
+    expect(consumed.existsSync(), isFalse, reason: 'its own audio goes with it');
+    expect(waiting.existsSync(), isTrue,
+        reason: 'unprocessed audio of the same boot was never part of the deleted recording');
+    await RecordingsManager.forceProcessAll();
+    expect(await recordings(), hasLength(1),
+        reason: 'the waiting audio becomes its recording, and the deleted one is not rebuilt');
   });
 
   test('full reprocessing removes every old edit and rebuilds all consumed bins from the beginning', () async {

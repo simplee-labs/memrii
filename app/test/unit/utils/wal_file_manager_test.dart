@@ -268,5 +268,53 @@ void main() {
       expect(wals.length, 1);
       expect(wals.first.device, 'device_1');
     });
+
+    group('a torn wals.json', () {
+      Wal wal(String device, int offset) => Wal(
+            device: device,
+            fileNum: 0,
+            walOffset: offset,
+            storageTotalBytes: 1000,
+            timerStart: 1234567890,
+            storage: WalStorage.sdcard,
+          );
+
+      test('saveWals replaces the file in one step and leaves no staging file', () async {
+        await WalFileManager.saveWals([wal('device_1', 100)]);
+        await WalFileManager.saveWals([wal('device_1', 200)]);
+
+        expect(File('${tempDir.path}/wals.json.tmp').existsSync(), isFalse);
+        final wals = await WalFileManager.loadWals();
+        expect(wals.single.walOffset, 200);
+      });
+
+      test('a half-written main file is answered from the backup, keeping the resume offset', () async {
+        await WalFileManager.saveWals([wal('device_1', 100)]);
+        await WalFileManager.saveWals([wal('device_1', 200)]); // backup now holds offset 100
+
+        final file = File('${tempDir.path}/wals.json');
+        final content = await file.readAsString();
+        await file.writeAsString(content.substring(0, content.length ~/ 2));
+
+        final wals = await WalFileManager.loadWals();
+        expect(wals.single.walOffset, 100, reason: 'one save behind, but never a restart from 0');
+      });
+
+      test('an emptied main file is answered from the backup', () async {
+        await WalFileManager.saveWals([wal('device_1', 100)]);
+        await WalFileManager.saveWals([wal('device_1', 200)]);
+        await File('${tempDir.path}/wals.json').writeAsString('');
+
+        final wals = await WalFileManager.loadWals();
+        expect(wals.single.walOffset, 100);
+      });
+
+      test('still throws when the backup is unreadable too, so callers keep failing closed', () async {
+        await File('${tempDir.path}/wals.json').writeAsString('{ "wals": [ {');
+        await File('${tempDir.path}/wals_backup.json').writeAsString('{ "wals"');
+
+        expect(WalFileManager.loadWals(), throwsA(isA<FormatException>()));
+      });
+    });
   });
 }

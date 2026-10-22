@@ -11,6 +11,7 @@ import 'package:omi/integrations/connector.dart';
 import 'package:omi/integrations/connector_registry.dart';
 import 'package:omi/integrations/integration_upload_manager.dart';
 import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/audio/sync_notification.dart';
 import 'package:omi/utils/logger.dart';
 
@@ -299,11 +300,11 @@ class IntegrationCoordinator extends ChangeNotifier {
           if (flagOffset < bytes.length) {
             final out = Uint8List.fromList(bytes);
             out[flagOffset] |= 0x01;
-            await metaFile.writeAsBytes(out);
+            await AtomicFile.writeBytes(metaFile, out);
           } else {
             final out = Uint8List(flagOffset + 1)..setRange(0, bytes.length, bytes);
             out[flagOffset] = 0x01;
-            await metaFile.writeAsBytes(out);
+            await AtomicFile.writeBytes(metaFile, out);
           }
         }
       }

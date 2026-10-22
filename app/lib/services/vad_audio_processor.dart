@@ -11,6 +11,7 @@ import 'package:omi/services/frame_ref.dart';
 import 'package:omi/services/recording_sidecars.dart';
 import 'package:omi/services/vad_batch_runner_channel.dart';
 import 'package:omi/services/vad/vad_types.dart';
+import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/logger.dart';
 
 // Re-export the VAD value types so existing importers of this file
@@ -576,12 +577,14 @@ class VadAudioProcessor {
       return;
     }
     try {
-      await File(path).writeAsString(jsonEncode({
-        'sessionId': _priorityRecordingSessionId,
-        'openedAtMs': _priorityOpenedAtMs,
-        'capMinutes': _priorityCapAtOpenMinutes,
-        'ts': DateTime.now().millisecondsSinceEpoch,
-      }));
+      await AtomicFile.writeString(
+          File(path),
+          jsonEncode({
+            'sessionId': _priorityRecordingSessionId,
+            'openedAtMs': _priorityOpenedAtMs,
+            'capMinutes': _priorityCapAtOpenMinutes,
+            'ts': DateTime.now().millisecondsSinceEpoch,
+          }));
     } catch (e) {
       Logger.error('VadAudioProcessor: priority latch persist failed ($e)');
     }
@@ -706,13 +709,27 @@ class VadAudioProcessor {
   /// prior (cancelled or backgrounded) run left off.
   Future<void> restoreState(Map<String, dynamic> s) async {
     _currentRefs = [];
+    // A ref into a bin that is gone can never be saved, so restoring it would fail
+    // every later run at the same save. Bins a checkpoint names are protected from
+    // pruning, so this only fires when something outside the pipeline removed one.
+    final binPresent = <String, bool>{};
+    var droppedRefs = 0;
     for (final item in (s['refs'] as List).cast<Map<String, dynamic>>()) {
       if (item['t'] == 'f') {
-        _currentRefs.add(FrameRef(
-            segmentFile: File(item['p'] as String), byteOffset: item['o'] as int, frameLength: item['l'] as int));
+        final path = item['p'] as String;
+        if (!binPresent.putIfAbsent(path, () => File(path).existsSync())) {
+          droppedRefs++;
+          continue;
+        }
+        _currentRefs
+            .add(FrameRef(segmentFile: File(path), byteOffset: item['o'] as int, frameLength: item['l'] as int));
       } else if (item['t'] == 's') {
         _currentRefs.add(Duration(milliseconds: item['ms'] as int));
       }
+    }
+    if (droppedRefs > 0) {
+      Logger.error('VadAudioProcessor: restore dropped $droppedRefs frame ref(s) into '
+          '${binPresent.values.where((present) => !present).length} bin(s) no longer on disk');
     }
     // Register restored refs in _processedFiles so consumeSafeToDeletePaths()
     // can return their segment paths once the conversation ends and refs are cleared.
@@ -1600,11 +1617,7 @@ class VadAudioProcessor {
                   _emitOrphanMarkers();
                   Logger.debug('VadAudioProcessor: Discarding noise conversation before split.');
                 } else {
-                  final filePath = await _saveRecording(_currentRefs, _recordingStartTime!);
-                  // Encoder failure leaves _pendingMarkers populated; surface as
-                  // orphans rather than letting them leak into the next conv.
-                  if (filePath == null) _emitOrphanMarkers();
-                  if (filePath != null) savedFiles.add(filePath);
+                  savedFiles.add(await _saveRecording(_currentRefs, _recordingStartTime!));
                 }
               } else {
                 // Marker queued, no audio buffered yet → still emit orphan so
@@ -1837,7 +1850,11 @@ class VadAudioProcessor {
       // finish it, and a future run must redo it).
       rethrow;
     } catch (e) {
-      Logger.error('VadAudioProcessor: processSegmentFile error: $e');
+      // Not marked processed either. Doing so skipped every frame past the failure
+      // for good, and the bin was deleted once the buffer cleared. The run stops
+      // here instead, and the next one redoes this segment from the checkpoint.
+      Logger.error('VadAudioProcessor: processSegmentFile failed on ${segmentFile.path.split('/').last}: $e');
+      rethrow;
     }
 
     _processedFiles.add(segmentFile.path);
@@ -1862,12 +1879,7 @@ class VadAudioProcessor {
         _emitOrphanMarkers();
         Logger.debug('VadAudioProcessor: Silence split — discarding ${speechMs}ms low-speech chunk.');
       } else {
-        final filePath = await _saveRecording(_currentRefs, _recordingStartTime!);
-        if (filePath == null) {
-          _emitOrphanMarkers();
-        } else {
-          savedFiles.add(filePath);
-        }
+        savedFiles.add(await _saveRecording(_currentRefs, _recordingStartTime!));
         Logger.debug(
             'VadAudioProcessor: Silence split — saved ${_currentChunkDurationMs}ms recording (including trailing silence).');
       }
@@ -1936,11 +1948,6 @@ class VadAudioProcessor {
     }
     discardGuardFiredOnLastFlush = false;
     final path = await _saveRecording(_currentRefs, _recordingStartTime!, isDraft: isDraft);
-    // _saveRecording consumes _pendingMarkers only when it returns a non-null
-    // result. If encoding produced zero frames or failed, any queued taps are
-    // still in _pendingMarkers; emit them as orphans before _resetState wipes
-    // them silently.
-    if (path == null) _emitOrphanMarkers();
     _resetState();
     return path;
   }
@@ -2155,10 +2162,7 @@ class VadAudioProcessor {
         // not because of silence. The pruneConsumedBins guard reads this flag from
         // .meta so it knows NOT to delete bins whose wall-clock extends past rec_end
         // (those bins may contain the post-cap continuation of the conversation).
-        final filePath = await _saveRecording(_currentRefs, _recordingStartTime!, capEnded: true);
-        // Encoder failure path: preserve queued taps as orphans.
-        if (filePath == null) _emitOrphanMarkers();
-        if (filePath != null) savedFiles.add(filePath);
+        savedFiles.add(await _saveRecording(_currentRefs, _recordingStartTime!, capEnded: true));
       } else {
         final rec = _buildDiscardRecord('noise_max_duration');
         if (rec != null) _pendingDiscards.add(rec);
@@ -2350,7 +2354,6 @@ class VadAudioProcessor {
   /// ref — dropping it produced an EMPTY bin list, which silently made the
   /// recording un-mergeable ("lists no source segments"). A best-effort tail at
   /// least keeps the reference and surfaces the real location in the diagnostic.
-  @visibleForTesting
   static String relBinPath(String path) {
     final norm = path.replaceAll('\\', '/');
     // A bin claimed by a discard is relocated to `discarded_segments/`; Recover
@@ -2504,48 +2507,56 @@ class VadAudioProcessor {
   Future<String?> saveRecordingTest(List<Object> refs, DateTime startTime, {bool isDerivedTimestamp = false}) =>
       _saveRecording(refs, startTime, isDerivedTimestamp: isDerivedTimestamp);
 
-  Future<String?> _saveRecording(List<Object> refs, DateTime startTime,
+  /// Throws [RecordingWriteFailed] rather than returning without a file, so a
+  /// recording that could not be written never lets its frames' bins be released.
+  Future<String> _saveRecording(List<Object> refs, DateTime startTime,
       {bool? isDerivedTimestamp, bool isDraft = false, bool capEnded = false}) async {
-    final result = await _saveRecordingCore(refs, startTime,
-        isDerivedTimestamp: isDerivedTimestamp, isDraft: isDraft, capEnded: capEnded);
-    if (result != null) {
-      // The priority audio (if any) is now persisted in this file/draft, so the
-      // marker bin no longer needs pinning — release it for normal deletion.
-      // Only the genuinely audio-less open-priority case (no save happened)
-      // keeps the bin so the next run can re-see the marker. See field doc.
-      _priorityOpenBinPath = null;
-      if (_pendingMarkers.isNotEmpty) {
-        final filename = result.split('/').last;
-        // EDL cropEnd must be playable: cap wall-clock progress at the file's
-        // actual encoded duration. If decode failures dropped frames silently,
-        // _currentChunkDurationMs can exceed what's on disk.
-        var durationMs = _currentChunkDurationMs;
-        try {
-          final base = result.contains('.') ? result.substring(0, result.lastIndexOf('.')) : result;
-          final metaBytes = await File('$base.meta').readAsBytes();
-          if (metaBytes.length >= 8) {
-            final encodedMs = ByteData.sublistView(metaBytes).getUint32(4, Endian.little);
-            if (encodedMs > 0 && encodedMs < durationMs) durationMs = encodedMs;
-          }
-        } catch (_) {}
-        for (final m in _pendingMarkers) {
-          _pendingEdlData.add({
-            'filename': filename,
-            'markerMs': m.markerMs,
-            'offsetMs': m.offsetAtMarkerMs,
-            'durationMs': durationMs,
-            'isHighPriority': m.isHighPriority,
-          });
+    final String result;
+    try {
+      result = await _saveRecordingCore(refs, startTime,
+          isDerivedTimestamp: isDerivedTimestamp, isDraft: isDraft, capEnded: capEnded);
+    } on RecordingWriteFailed {
+      rethrow;
+    } catch (e) {
+      // The date folder could not be made, or similar: just as unwritten.
+      throw RecordingWriteFailed(e, storageFull: RecordingWriteFailed.isStorageFull(e));
+    }
+    // The priority audio (if any) is now persisted in this file/draft, so the
+    // marker bin no longer needs pinning — release it for normal deletion.
+    // Only the genuinely audio-less open-priority case (no save happened)
+    // keeps the bin so the next run can re-see the marker. See field doc.
+    _priorityOpenBinPath = null;
+    if (_pendingMarkers.isNotEmpty) {
+      final filename = result.split('/').last;
+      // EDL cropEnd must be playable: cap wall-clock progress at the file's
+      // actual encoded duration. If decode failures dropped frames silently,
+      // _currentChunkDurationMs can exceed what's on disk.
+      var durationMs = _currentChunkDurationMs;
+      try {
+        final base = result.contains('.') ? result.substring(0, result.lastIndexOf('.')) : result;
+        final metaBytes = await File('$base.meta').readAsBytes();
+        if (metaBytes.length >= 8) {
+          final encodedMs = ByteData.sublistView(metaBytes).getUint32(4, Endian.little);
+          if (encodedMs > 0 && encodedMs < durationMs) durationMs = encodedMs;
         }
-        _pendingMarkers.clear();
+      } catch (_) {}
+      for (final m in _pendingMarkers) {
+        _pendingEdlData.add({
+          'filename': filename,
+          'markerMs': m.markerMs,
+          'offsetMs': m.offsetAtMarkerMs,
+          'durationMs': durationMs,
+          'isHighPriority': m.isHighPriority,
+        });
       }
-      if (_writeOpusFrameSidecar) {
-        try {
-          final dateFolderPath = File(result).parent.path;
-          await _saveOpusFrameSidecar(refs, dateFolderPath, startTime.millisecondsSinceEpoch);
-        } catch (e) {
-          Logger.error('VadAudioProcessor: _saveOpusFrameSidecar failed: $e');
-        }
+      _pendingMarkers.clear();
+    }
+    if (_writeOpusFrameSidecar) {
+      try {
+        final dateFolderPath = File(result).parent.path;
+        await _saveOpusFrameSidecar(refs, dateFolderPath, startTime.millisecondsSinceEpoch);
+      } catch (e) {
+        Logger.error('VadAudioProcessor: _saveOpusFrameSidecar failed: $e');
       }
     }
     return result;
@@ -2584,7 +2595,7 @@ class VadAudioProcessor {
     Logger.debug('VadAudioProcessor: Saved Opus frame sidecar — $binPath');
   }
 
-  Future<String?> _saveRecordingCore(List<Object> refs, DateTime startTime,
+  Future<String> _saveRecordingCore(List<Object> refs, DateTime startTime,
       {bool? isDerivedTimestamp, bool isDraft = false, bool capEnded = false}) async {
     final derived = isDerivedTimestamp ?? _isDerivedTimestamp;
     final prefix = derived ? 'unknown' : 'recording';
@@ -2751,7 +2762,7 @@ class VadAudioProcessor {
     await File(metaPath).writeAsBytes(metaOut);
   }
 
-  Future<String?> _saveWav(List<Object> refs, String dateFolderPath, int timestamp,
+  Future<String> _saveWav(List<Object> refs, String dateFolderPath, int timestamp,
       {String prefix = 'recording', String suffix = '', bool capEnded = false, bool m4aPending = false}) async {
     final wavPath = '$dateFolderPath/${prefix}_$timestamp$suffix.wav';
 
@@ -2900,8 +2911,10 @@ class VadAudioProcessor {
       return wavPath;
     } catch (e) {
       Logger.error('VadAudioProcessor: _saveWav failed: $e');
-      if (await wavFile.exists()) await wavFile.delete();
-      return null;
+      try {
+        if (await wavFile.exists()) await wavFile.delete();
+      } catch (_) {}
+      throw RecordingWriteFailed(e, storageFull: RecordingWriteFailed.isStorageFull(e));
     }
   }
 

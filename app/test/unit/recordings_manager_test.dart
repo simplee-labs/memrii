@@ -6,6 +6,7 @@ import 'package:omi/backend/preferences.dart';
 import 'package:omi/services/device_clock_anchor.dart';
 import 'package:omi/services/recordings_manager.dart';
 import 'package:omi/services/recordings_isolate_worker.dart' show checkpointVersion;
+import 'package:omi/services/set_aside_bins.dart';
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -42,10 +43,12 @@ void main() {
     // retiring the bin-deletion path from these tests. Default to "nothing is
     // mid-transfer"; the tests that care install their own set.
     RecordingsManager.incompleteBinResolverForTest = () async => const {};
+    RecordingsManager.heldBackBinResolverForTest = () async => const {};
   });
 
   tearDown(() {
     RecordingsManager.incompleteBinResolverForTest = null;
+    RecordingsManager.heldBackBinResolverForTest = null;
     if (tempDir.existsSync()) {
       tempDir.deleteSync(recursive: true);
     }
@@ -1944,11 +1947,12 @@ void main() {
       expect(SharedPreferencesUtil().lateMergeNotices, isEmpty);
     });
 
-    // A late merge only adds audio in front of a recording the user already saw
-    // finished, and must not reopen it. With nothing after it, the merged recording used
-    // to drop back to "Conversation in progress" until the next conversation.
-    test('late audio joined onto a recording finished before this run is finished with it', () async {
-      await writeStitchable(startMs: nextStart, durationMs: nextMs);
+    // Late audio — an older file that arrived after the recording following it was
+    // finished — is never folded into that recording, which the user may already have
+    // seen, played, uploaded or exported. The late part is finished as its own recording.
+    test('late audio before a recording finished before this run stays its own', () async {
+      SharedPreferencesUtil().lateMergeNotices = const [];
+      final next = await writeStitchable(startMs: nextStart, durationMs: nextMs);
       late File draft;
 
       // The draft is the late audio: this run wrote it.
@@ -1958,12 +1962,15 @@ void main() {
 
       expect(draft.existsSync(), isFalse, reason: 'not left in progress');
       final finalized = File(draft.path.replaceAll('_draft.wav', '.wav'));
-      expect(finalized.existsSync(), isTrue, reason: 'listed, at the earlier start the message names');
+      expect(finalized.existsSync(), isTrue, reason: 'finished as its own recording');
       final meta = File(finalized.path.replaceAll('.wav', '.meta')).readAsBytesSync();
-      expect(ByteData.sublistView(meta).getUint32(4, Endian.little), draftMs + nextMs);
+      expect(ByteData.sublistView(meta).getUint32(4, Endian.little), draftMs, reason: 'nothing joined onto it');
+      expect(next.existsSync(), isTrue, reason: 'the saved recording is left exactly as it was');
+      expect(next.lengthSync(), 44 + nextMs * 32);
+      expect(SharedPreferencesUtil().lateMergeNotices, isEmpty, reason: 'nothing changed that needs telling');
     });
 
-    test('a recording after the absorbed one stays its own, as the user saw it', () async {
+    test('a recording after a late draft stays its own, as the user saw it', () async {
       await writeStitchable(startMs: nextStart, durationMs: nextMs);
       final after = await writeStitchable(startMs: nextStart + nextMs, durationMs: 2000);
       late File draft;
@@ -1977,16 +1984,18 @@ void main() {
       expect(File(draft.path.replaceAll('_draft.wav', '.wav')).existsSync(), isTrue);
     });
 
-    test('the bolt of a Force-Synced recording carries onto the merged one', () async {
-      await writeStitchable(startMs: nextStart, durationMs: nextMs, forceSynced: true);
+    test('a Force-Synced recording keeps its bolt when late audio lands before it', () async {
+      final next = await writeStitchable(startMs: nextStart, durationMs: nextMs, forceSynced: true);
       late File draft;
 
       await RecordingsManager().stitchDraftRecordingsForTest(
         duringRun: () async => draft = await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true),
       );
 
-      final meta = File(draft.path.replaceAll('_draft.wav', '.meta')).readAsBytesSync();
-      expect(meta[418] & 0x01, 0x01, reason: 'its end is still the one Force Sync chose');
+      final nextMeta = File(next.path.replaceAll('.wav', '.meta')).readAsBytesSync();
+      expect(nextMeta[418] & 0x01, 0x01, reason: 'its end is still the one Force Sync chose');
+      final lateMeta = File(draft.path.replaceAll('_draft.wav', '.meta')).readAsBytesSync();
+      expect(lateMeta[418] & 0x01, 0, reason: 'a recording follows the late part, so it carries no bolt');
     });
 
     // A draft already on disk meets a finished recording only when the previous run
@@ -2904,6 +2913,35 @@ void main() {
       expect(recs.length, 2);
     });
 
+    test('placing a session leaves its raw bins where every reference names them', () async {
+      final unknown = writeRecording(
+        dateFolder: '1970-01-01',
+        basename: 'unknown_7200000',
+        sessionId: anchorSessionId,
+        startUptimeSec: recUptimeSec,
+      );
+      // Bins that outlive the move: a draft's undecoded tail and a half-downloaded file.
+      // Metas, the WAL and the checkpoint all name them by this pre-time-sync path.
+      final sessionDir = Directory(p.join(tempDir.path, 'raw_segments', 'session_$anchorSessionId'))
+        ..createSync(recursive: true);
+      final tail = File(p.join(sessionDir.path, '${recUptimeSec}_$anchorSessionId.bin'))
+        ..writeAsBytesSync(Uint8List(400));
+      final partial = File(p.join(sessionDir.path, '${recUptimeSec + 600}_$anchorSessionId.bin'))
+        ..writeAsBytesSync(Uint8List(100));
+
+      await RecordingsManager.promoteSessionToDate(Conversation.fromFile(unknown), DateTime(2026, 7, 1, 9),
+          include: (c) => c.isUnknown);
+
+      expect(allRecordings().keys.single, startsWith('recording_'), reason: 'the recording itself is placed');
+      expect(tail.existsSync(), isTrue);
+      expect(partial.existsSync(), isTrue);
+      expect(
+        Directory(p.join(tempDir.path, 'raw_segments')).listSync().map((e) => p.basename(e.path)),
+        ['session_$anchorSessionId'],
+        reason: 'no folder renamed onto a seconds-plus-milliseconds timestamp',
+      );
+    });
+
     test('a hand-set date holds recordingsUnsettled while it renames', () async {
       final unknown = writeRecording(
         dateFolder: '1970-01-01',
@@ -3144,6 +3182,268 @@ void main() {
   // The processor reads its segment list as ONE continuous stream, so the resume
   // index decides both what gets decoded and in what order. Skipping a bin no run
   // has touched strands its audio and splits the stream in two.
+  group('raw audio is released only when accounted for', () {
+    tearDown(() {
+      RecordingsManager.freeDiskBytes = () async => null;
+    });
+
+    /// A bin of [frames] frames starting at [ts] (epoch seconds), and the batch carrying it.
+    Future<({File bin, Batch batch})> bin(int ts, {int frames = 50}) async {
+      SharedPreferencesUtil().vadEnabled = false; // manual: AAD, no Silero
+      final builder = BytesBuilder();
+      builder.add((ByteData(36)
+            ..setUint32(0, 0xFFFFFFFB, Endian.little)
+            ..setUint32(4, 28, Endian.little)
+            ..setUint64(8, ts * 1000, Endian.little)
+            ..setUint32(28, 1, Endian.little))
+          .buffer
+          .asUint8List());
+      for (var i = 0; i < frames; i++) {
+        builder.add((ByteData(4)..setUint32(0, 4, Endian.little)).buffer.asUint8List());
+        builder.add(List.filled(4, 0));
+      }
+      final file = File(p.join(tempDir.path, 'raw_segments', '$ts', '${ts}_1.bin'))
+        ..parent.createSync(recursive: true)
+        ..writeAsBytesSync(builder.toBytes())
+        // getBatches dates a bin by its name; where a Windows path defeats that
+        // parse it falls back to mtime, so keep the two in agreement.
+        ..setLastModifiedSync(DateTime.fromMillisecondsSinceEpoch(ts * 1000));
+      return (
+        bin: file,
+        batch: Batch(
+          dateString: coverageDateOf(ts * 1000),
+          date: DateTime.fromMillisecondsSinceEpoch(ts * 1000),
+          rawSegments: [file],
+          draftRecordings: const [],
+          finalizedRecordings: const [],
+          markerTimestamps: const [],
+          discards: const [],
+        ),
+      );
+    }
+
+    List<String> audioOnDisk() {
+      final root = Directory(p.join(tempDir.path, 'recordings'));
+      if (!root.existsSync()) return const [];
+      return root
+          .listSync(recursive: true)
+          .whereType<File>()
+          .map((f) => p.basename(f.path))
+          .where((n) => n.endsWith('.wav') || n.endsWith('.m4a'))
+          .toList();
+    }
+
+    File checkpoint() => File(p.join(tempDir.path, 'vad_checkpoint.json'));
+
+    group('a failed run', () {
+      test('keeps the checkpoint, so the next run resumes the audio it stopped with', () async {
+        checkpoint().writeAsStringSync('{"version": $checkpointVersion}');
+        await RecordingsManager.recordRunFailureForTest(
+            {'phase': 'segment', 'bin': '${tempDir.path}/raw_segments/100/100_1.bin', 'storageFull': false},
+            checkpoint());
+        expect(checkpoint().existsSync(), isTrue);
+      });
+
+      test('discards a checkpoint that could not be restored, which would fail every run alike', () async {
+        checkpoint().writeAsStringSync('{"version": $checkpointVersion}');
+        await RecordingsManager.recordRunFailureForTest({'phase': 'restore', 'storageFull': false}, checkpoint());
+        expect(checkpoint().existsSync(), isFalse);
+      });
+
+      test('counts against the bin it failed inside, until that bin is set aside', () async {
+        const failure = {'phase': 'segment', 'bin': '/docs/raw_segments/100/100_1.bin', 'storageFull': false};
+        for (var i = 0; i < SetAsideBins.strikes; i++) {
+          expect(SetAsideBins.relBins(), isEmpty);
+          await RecordingsManager.recordRunFailureForTest(failure, checkpoint());
+        }
+        expect(SetAsideBins.relBins(), {'100/100_1.bin'});
+      });
+
+      test('on a full phone pauses processing instead of blaming the bin', () async {
+        await RecordingsManager.recordRunFailureForTest(
+            {'phase': 'segment', 'bin': '/docs/raw_segments/100/100_1.bin', 'storageFull': true}, checkpoint(),
+            waitingRawBytes: 4050 * 60 * 5);
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+        expect(SharedPreferencesUtil().processingPausedMinutes, 5);
+        expect(SharedPreferencesUtil().processingFailure, isEmpty);
+      });
+    });
+
+    group('free space', () {
+      Batch batchOf(List<File> bins) => Batch(
+            dateString: '2026-09-01',
+            date: DateTime(2026, 9, 1),
+            rawSegments: bins,
+            draftRecordings: const [],
+            finalizedRecordings: const [],
+            markerTimestamps: const [],
+            discards: const [],
+          );
+      const headroom = 200 * 1024 * 1024;
+
+      test('decodes the oldest bins that fit and leaves the rest waiting, never a later one first', () async {
+        final a = await writeBin(timerStartSec: 1788000000, sessionId: 1, durationSec: 10); // 40 536 B
+        final b = await writeBin(timerStartSec: 1788000600, sessionId: 1, durationSec: 60);
+        final c = await writeBin(timerStartSec: 1788001200, sessionId: 1, durationSec: 1); // small, but after b
+        final fit = RecordingsManager.fitToFreeSpace([
+          batchOf([c, a, b])
+        ], headroom + a.lengthSync() * 8 + 100000);
+
+        expect(fit.batches.single.rawSegments.map((f) => p.basename(f.path)), [p.basename(a.path)]);
+        expect(fit.keptBytes, a.lengthSync());
+        expect(fit.waitingBytes, b.lengthSync() + c.lengthSync());
+      });
+
+      test('keeps everything when it all fits', () async {
+        final a = await writeBin(timerStartSec: 1788000000, sessionId: 1, durationSec: 10);
+        final fit = RecordingsManager.fitToFreeSpace([
+          batchOf([a])
+        ], headroom + 10 * 1024 * 1024);
+        expect(fit.waitingBytes, 0);
+        expect(fit.batches.single.rawSegments, [a]);
+      });
+
+      test('a run short of space decodes what fits, says so, and the next one with room finishes', () async {
+        final older = await bin(1789000000);
+        final newer = await bin(1789000600);
+        RecordingsManager.freeDiskBytes = () async => headroom + older.bin.lengthSync() * 8 + 10;
+
+        await RecordingsManager().processAll([older.batch, newer.batch], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+        expect(newer.bin.existsSync(), isTrue, reason: 'the audio that did not fit waits as raw');
+        final afterFirst = audioOnDisk();
+        expect(afterFirst, isNotEmpty, reason: 'the audio that fit was decoded');
+
+        RecordingsManager.freeDiskBytes = () async => 10 * 1024 * 1024 * 1024;
+        await RecordingsManager().processAll([newer.batch], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedForStorage, isFalse);
+      });
+
+      test('with no room at all, nothing is decoded and nothing is deleted', () async {
+        final only = await bin(1789000000);
+        RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+
+        await RecordingsManager().processAll([only.batch], (_, __) {});
+        expect(audioOnDisk(), isEmpty);
+        expect(only.bin.existsSync(), isTrue);
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+      });
+    });
+
+    group('an automatic run waits for an older file of the boot', () {
+      test('a held bin is left for later, and decoded once the hold lifts', () async {
+        final newer = await bin(1789000600);
+        RecordingsManager.heldBackBinResolverForTest = () async => {'1789000600/1789000600_1.bin'};
+
+        await RecordingsManager().processAll([newer.batch], (_, __) {}, backgroundMode: true);
+        expect(audioOnDisk(), isEmpty, reason: 'its conversation may start in the file still on the Omi');
+        expect(newer.bin.existsSync(), isTrue);
+
+        RecordingsManager.heldBackBinResolverForTest = () async => const {};
+        await RecordingsManager().processAll([newer.batch], (_, __) {}, backgroundMode: true);
+        expect(audioOnDisk(), isNotEmpty);
+      });
+
+      test('Force decodes what has arrived, as it does a still-arriving bin', () async {
+        final newer = await bin(1789000600);
+        RecordingsManager.heldBackBinResolverForTest = () async => {'1789000600/1789000600_1.bin'};
+
+        await RecordingsManager().processAll([newer.batch], (_, __) {}, backgroundMode: false);
+        expect(audioOnDisk(), isNotEmpty);
+      });
+
+      test('an unreadable sync state skips the automatic run', () async {
+        final newer = await bin(1789000600);
+        RecordingsManager.heldBackBinResolverForTest = () async => throw const FormatException('bad wals.json');
+
+        await RecordingsManager().processAll([newer.batch], (_, __) {}, backgroundMode: true);
+        expect(audioOnDisk(), isEmpty);
+        expect(newer.bin.existsSync(), isTrue);
+      });
+    });
+
+    test('a set-aside bin is skipped by every run and stays on disk', () async {
+      final bad = await bin(1789000000);
+      await SetAsideBins.skip('1789000000/1789000000_1.bin');
+
+      await RecordingsManager().processAll([bad.batch], (_, __) {}, finalizeDrafts: true);
+
+      expect(audioOnDisk(), isEmpty);
+      expect(bad.bin.existsSync(), isTrue);
+    });
+
+    group('one deleter', () {
+      const ts = 1788200000;
+      const rel = '$ts/${ts}_5.bin';
+
+      test('a bin the checkpoint still buffers survives the prune of the recording that names it', () async {
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await writeRecordingWithBins(startMs: ts * 1000, durationMs: 30000, relativeBins: [rel]);
+        checkpoint().writeAsStringSync(jsonEncode({
+          'version': checkpointVersion,
+          'state': {
+            'refs': [
+              {'t': 'f', 'p': raw.path, 'o': 36, 'l': 4},
+            ],
+          },
+        }));
+
+        expect(await RecordingsManager.pruneConsumedBins(), 0);
+        expect(raw.existsSync(), isTrue, reason: 'the resume saves the rest of this bin');
+      });
+
+      test('a deleted recording\'s bins count as decoded until they go, then are forgotten', () async {
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await writeRecordingWithBins(startMs: ts * 1000, durationMs: 30000, relativeBins: [rel]);
+        await writeRecordingWithBins(startMs: ts * 1000 + 40000, durationMs: 10000, relativeBins: [rel], isDraft: true);
+        final finished = (await RecordingsManager().getBatches()).expand((b) => b.finalizedRecordings).single;
+
+        await RecordingsManager.deleteConversations([finished]);
+
+        expect(raw.existsSync(), isTrue, reason: 'the draft still names it');
+        expect(await RecordingsManager.deletedRelBins(), {rel});
+        expect(await RecordingsManager.coveredBinPaths([raw]), {raw.path},
+            reason: 'never decoded again while it waits');
+
+        final draft = (await RecordingsManager().getBatches()).expand((b) => b.draftRecordings).single;
+        await RecordingsManager.deleteConversations([draft]);
+        expect(raw.existsSync(), isFalse);
+        expect(await RecordingsManager.deletedRelBins(), isEmpty);
+      });
+
+      test('a half-downloaded bin a deleted recording names waits for its download', () async {
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await writeRecordingWithBins(startMs: ts * 1000, durationMs: 30000, relativeBins: [rel]);
+        final finished = (await RecordingsManager().getBatches()).expand((b) => b.finalizedRecordings).single;
+        RecordingsManager.incompleteBinResolverForTest = () async => {rel};
+
+        await RecordingsManager.deleteConversations([finished]);
+        expect(raw.existsSync(), isTrue, reason: 'the next sync resumes into it');
+
+        RecordingsManager.incompleteBinResolverForTest = () async => const {};
+        await RecordingsManager.pruneConsumedBins();
+        expect(raw.existsSync(), isFalse);
+      });
+
+      test('Delete Day takes the day\'s waiting audio too, but no other day\'s', () async {
+        final today = await bin(1789000000);
+        final waiting = await bin(1789000600);
+        final otherDay = await bin(1789000000 + 3 * 86400);
+
+        final day = (await RecordingsManager().getBatches())
+            .firstWhere((b) => b.rawSegments.any((f) => p.equals(f.path, today.bin.path)));
+        expect(day.rawSegments.map((f) => p.basename(f.path)), contains(p.basename(waiting.bin.path)),
+            reason: 'both bins of the day, one of them not yet processed');
+        await RecordingsManager().deleteDay(day);
+
+        expect(today.bin.existsSync(), isFalse);
+        expect(waiting.bin.existsSync(), isFalse);
+        expect(otherDay.bin.existsSync(), isTrue);
+        expect(await RecordingsManager.coveredBinPaths([otherDay.bin]), isEmpty);
+      });
+    });
+  });
+
   group('shiftedResumeIndex', () {
     String bin(int ts) => '/docs/raw_segments/$ts/${ts}_777.bin';
 

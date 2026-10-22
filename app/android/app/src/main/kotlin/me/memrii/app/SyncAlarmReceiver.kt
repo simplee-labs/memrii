@@ -48,7 +48,8 @@ class SyncAlarmReceiver : BroadcastReceiver() {
         /// Arm (or cancel, at `timestampMs <= 0`) the periodic sync alarm.
         ///
         /// The single funnel for that alarm — DeviceProvider reaches it through
-        /// `setNextSyncTime`, and the receiver's own re-arm below calls it directly — so it
+        /// `setNextSyncTime` (BleHostApiImpl, service or not), the receiver's own re-arm
+        /// below calls it directly, and BootReceiver re-arms through it — so it
         /// is also the right place to mirror the due-time to disk. `idleNotificationContent`
         /// reads it back to render "Next sync at H:MM" on a headless start, where nothing
         /// Dart-side has pushed a status yet. Persisting here rather than at the call sites

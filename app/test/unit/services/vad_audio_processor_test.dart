@@ -2492,4 +2492,59 @@ void main() {
       }
     });
   });
+
+  group('a recording that cannot be written', () {
+    ProcessingSettings cappedSettings() => const ProcessingSettings(
+          vadEnabled: true,
+          speechThreshold: 0.5,
+          silenceDurationToSplitMs: 120000,
+          minDurationMs: 0,
+          minSpeechMs: 0,
+          maxChunkMs: 200, // 10 frames, so the cap saves a recording mid-segment
+          deviceId: 'test-device',
+          audioSaveFormat: 'wav',
+          writeOpusFrameSidecar: false,
+          priorityRecordCapMinutes: 0,
+        );
+
+    test('stops the segment, which is not marked processed, so its bin is never released', () async {
+      // A file where the output folder should be: the recording cannot be written.
+      final blocked = File('${tempDir.path}/out')..writeAsStringSync('not a folder');
+      final processor = VadAudioProcessor.fromSettings(settings: cappedSettings(), outputDir: blocked.path);
+      final bin = _makeBinFile(tempDir, 50, name: 'cap.bin');
+
+      await expectLater(
+        processor.processSegmentFile(bin, DateTime(2026, 1, 1, 10)),
+        throwsA(isA<RecordingWriteFailed>().having((e) => e.storageFull, 'storageFull', isFalse)),
+      );
+      expect(processor.consumeSafeToDeletePaths(), isNot(contains(bin.path)),
+          reason: 'its frames were never written, so the bin is the only copy');
+      await processor.destroy();
+    });
+
+    test('is told apart as storage-full when the platform says so', () {
+      expect(RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('No space', 28))), isTrue);
+      expect(RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('Denied', 13))), isFalse);
+      expect(RecordingWriteFailed.isStorageFull(StateError('x')), isFalse);
+    });
+  });
+
+  test('a restored checkpoint drops refs into a bin that is gone, and keeps the rest', () async {
+    final processor = VadAudioProcessor.fromSettings(settings: _settings(), outputDir: tempDir.path);
+    final kept = _makeBinFile(tempDir, 5, name: 'kept.bin');
+    final gone = _makeBinFile(tempDir, 5, name: 'gone.bin');
+    await processor.processSegmentFile(kept, DateTime(2026, 1, 1, 10));
+    await processor.processSegmentFile(gone, DateTime(2026, 1, 1, 10, 0, 0, 100));
+    final state = (await processor.serializeState())!;
+    Set<Object?> refPaths(Map<String, dynamic> st) =>
+        (st['refs'] as List).cast<Map<String, dynamic>>().where((r) => r['t'] == 'f').map((r) => r['p']).toSet();
+    expect(refPaths(state), {kept.path, gone.path}, reason: 'both bins are buffered before one goes');
+    await processor.destroy();
+    gone.deleteSync();
+
+    final resumed = VadAudioProcessor.fromSettings(settings: _settings(), outputDir: tempDir.path);
+    await resumed.restoreState(state);
+    expect(refPaths((await resumed.serializeState())!), {kept.path});
+    await resumed.destroy();
+  });
 }

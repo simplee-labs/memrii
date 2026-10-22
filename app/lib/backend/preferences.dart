@@ -308,6 +308,28 @@ class SharedPreferencesUtil {
   bool get lastVadFallbackActive => getBool('lastVadFallbackActive', defaultValue: false);
   set lastVadFallbackActive(bool v) => saveBool('lastVadFallbackActive', v);
 
+  // True while processing is held back because the phone is short of space: a run
+  // either decoded only the oldest audio that fit or did not start. Raw bins are kept,
+  // so nothing is lost; the recordings page and the idle notification say why audio is
+  // waiting. Cleared by the next run that fits everything.
+  // processingPausedMinutes is the audio left waiting (the native notification reads
+  // both as flutter.* keys).
+  bool get processingPausedForStorage => getBool('processingPausedForStorage', defaultValue: false);
+  set processingPausedForStorage(bool v) => saveBool('processingPausedForStorage', v);
+
+  int get processingPausedMinutes => getInt('processingPausedMinutes', defaultValue: 0);
+  set processingPausedMinutes(int v) => saveInt('processingPausedMinutes', v);
+
+  // The raw bin the last failed processing runs stopped inside, as JSON
+  // {"bin": <raw_segments-relative path>, "count": <runs in a row>}. See SetAsideBins.
+  String get processingFailure => getString('processingFailure');
+  set processingFailure(String v) => saveString('processingFailure', v);
+
+  // Raw bins processing could not get past and that automatic runs now skip, as a
+  // JSON list of {"bin", "build", "auto", "atMs"}. See SetAsideBins.
+  String get setAsideBins => getString('setAsideBins');
+  set setAsideBins(String v) => saveString('setAsideBins', v);
+
   // Local audio is deleted after delivery to all available configured destinations.
   // This does not authorize any upload; explicit manual delivery is sufficient.
   // Only the metadata
@@ -681,7 +703,7 @@ class SharedPreferencesUtil {
   set pendingRefiles(String v) => saveString('pendingRefiles', v);
 
   /// Recordings the stitcher folded into an earlier draft after they had already been
-  /// finished — out-of-order audio, or an interrupted run — each as
+  /// finished — a run completing an interrupted run's join — each as
   /// "<absorbedStartMs>:<mergedStartMs>". The recordings page shows them once, as a
   /// single message, and clears them. A pref rather than controller state because the
   /// stitch usually runs in a background sync with no page to show anything on.

@@ -458,6 +458,88 @@ void main() {
     }
   });
 
+  group('processing waits for an older file of the same boot', () {
+    const device = 'omi-1';
+    const t0 = 1789000000;
+
+    Wal waiting({
+      int timerStart = t0,
+      int sessionId = 7,
+      String dev = device,
+      int strikes = 0,
+      int? failingSinceMs,
+      WalStatus? status,
+    }) =>
+        Wal(
+          device: dev,
+          fileNum: 0,
+          walOffset: 0,
+          storageTotalBytes: 100,
+          timerStart: timerStart,
+          sessionId: sessionId,
+          storage: WalStorage.sdcard,
+          status: status ?? WalStatus.miss,
+          syncFailCount: strikes,
+          failingSinceMs: failingSinceMs,
+        );
+
+    /// A bin already on the phone, as the download path names it.
+    String onPhone(int timerStart, int sessionId) {
+      final folder = timerStart < 946684800 ? 'session_$sessionId' : '$timerStart';
+      final rel = '$folder/${timerStart}_$sessionId.bin';
+      File('${tempDir.path}/raw_segments/$rel')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(List<int>.filled(40, 0));
+      return rel;
+    }
+
+    Future<Set<String>> held(List<Wal> persisted) async {
+      SharedPreferencesUtil().btDevice = BtDevice(id: device, name: 'Omi', type: DeviceType.omi, rssi: 0);
+      await WalFileManager.saveWals(persisted);
+      return SDCardWalSyncImpl(MockWalSyncListener()).heldBackBinRelPaths();
+    }
+
+    test('newer audio of the boot waits; another boot and older audio do not', () async {
+      final newer = onPhone(t0 + 600, 7);
+      onPhone(t0 - 600, 7); // recorded before the file still on the Omi
+      onPhone(t0 + 600, 8); // another boot: a conversation never spans a reboot
+      expect(await held([waiting()]), {newer});
+    });
+
+    test('pre-time-sync files of the boot are ordered by their uptime keys, before its UTC ones', () async {
+      final laterUptime = onPhone(1200, 7);
+      final utc = onPhone(t0, 7);
+      onPhone(300, 7);
+      expect(await held([waiting(timerStart: 600)]), {laterUptime, utc});
+    });
+
+    test('the wait ends when the file arrives, after the give-up time, or after three failed syncs', () async {
+      onPhone(t0 + 600, 7);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final limit = SDCardWalSyncImpl.heldBackGiveUpAfter.inMilliseconds;
+      const strikes = SDCardWalSyncImpl.heldBackGiveUpFailures;
+      expect(await held([waiting(status: WalStatus.synced)]), isEmpty, reason: 'it is on the phone');
+      expect(await held([waiting()]), isNotEmpty, reason: 'not failing, only waiting for its turn');
+      expect(await held([waiting(strikes: strikes - 1, failingSinceMs: now - limit + 60000)]), isNotEmpty,
+          reason: 'neither limit reached yet');
+      expect(await held([waiting(strikes: 0, failingSinceMs: now - limit - 1000)]), isEmpty,
+          reason: 'the time limit, even for a file that inched forward on every sync');
+      expect(await held([waiting(strikes: strikes, failingSinceMs: now)]), isEmpty,
+          reason: 'three failed syncs in quick succession need not wait out the clock');
+    });
+
+    test('only the current Omi counts — a replaced one never delivers its files', () async {
+      onPhone(t0 + 600, 7);
+      expect(await held([waiting(dev: 'old-omi')]), isEmpty);
+    });
+
+    test('an unreadable wals.json throws, so automatic processing fails closed', () async {
+      SharedPreferencesUtil().btDevice = BtDevice(id: device, name: 'Omi', type: DeviceType.omi, rssi: 0);
+      await File('${tempDir.path}/wals.json').writeAsString('{ "wals": [ {');
+      await expectLater(SDCardWalSyncImpl(MockWalSyncListener()).heldBackBinRelPaths(), throwsA(anything));
+    });
+  });
+
   group('Wal incomplete-transfer identity', () {
     Wal walOf({required int offset, required int total, int timerStart = 1784260394, int? sessionId}) => Wal(
           device: 'test-device',
@@ -638,30 +720,34 @@ void main() {
         expect(globalDeletedTimestamps, [ts]);
       });
 
-      test('${batch ? 'syncAll' : 'syncWal'} repeated gaps never spend poison budget, including reconnect', () async {
+      test('${batch ? 'syncAll' : 'syncWal'} repeated gaps never delete a file, including reconnect', () async {
         await seed(wal(offset: 4, version: 1, strikes: 4), original.sublist(0, 4));
-        // A second queued file must not cause an index-0 read under another identity.
+        // A second queued file is read too, in the batch — at its own index, under its
+        // own identity, never at index 0 under another's.
         connection.files.add(StorageFile(index: 1, timestamp: ts + 60, size: 12));
+        final readsPerCycle = batch ? 2 : 1;
         int stops = 0;
         connection.onStop = () async {
           stops++;
           return true;
         };
         receiver = (args) async {
-          expect(args[3], ts);
+          expect(args[1], args[3] == ts ? 0 : 1, reason: 'each file is read at its own index');
           // A repeat realigns earlier (covered below); it never reads past the prefix.
           expect(args[2]! as int, lessThanOrEqualTo(4), reason: 'no seek-ahead retry');
           return gap(args[2]! as int, (args[2]! as int) + 4);
         };
         for (int attempt = 0; attempt < 7; attempt++) {
           await run(batch);
-          expect(requests.length, attempt + 1, reason: 'one failed read per cycle; no skip retry');
-          expect(stops, attempt + 1);
+          expect(requests.length, (attempt + 1) * readsPerCycle, reason: 'one failed read per file per cycle');
+          expect(stops, (attempt + 1) * readsPerCycle);
           expect(globalDeletedTimestamps, isEmpty);
           final saved = (await WalFileManager.loadWals()).firstWhere((w) => w.timerStart == ts);
           expect(saved.walOffset, lessThanOrEqualTo(4));
           expect(saved.status, WalStatus.miss);
-          expect(saved.syncFailCount, 4);
+          // The batch counts a gap that moved nothing forward — it is what lets newer audio
+          // stop waiting for this file — but the count deletes nothing.
+          expect(saved.syncFailCount, batch ? 5 + attempt : 4);
           expect(saved.nativeIntegrityVersion, 1);
           final bytes = await bin().readAsBytes();
           expect(bytes.length, greaterThanOrEqualTo(saved.walOffset));
@@ -761,8 +847,10 @@ void main() {
           expect(saved.walOffset, lostAt - SDCardWalSyncImpl.integrityRealignBytes,
               reason: 'the same gap again resumes earlier, on different packet boundaries');
           expect(saved.lastIntegrityGapOffset, lostAt);
-          expect(saved.syncFailCount, 2, reason: 'a gap never spends the deletion budget');
-          expect(globalDeletedTimestamps, isEmpty);
+          // syncWal leaves the count alone; the batch counts a gap hit again as no progress
+          // (from 880 the first attempt did progress to the gap, and reset it).
+          expect(saved.syncFailCount, batch ? (start == lostAt ? 4 : 1) : 2);
+          expect(globalDeletedTimestamps, isEmpty, reason: 'a gap never deletes the file');
           expect(captureLog().map((e) => e['event']), ['gap', 'realign']);
           expect(captureLog().last['resumeOffset'], lostAt - SDCardWalSyncImpl.integrityRealignBytes);
           expect(File('${capture.path}/capture.json').existsSync(), isTrue, reason: 'the realign arms a capture');
@@ -857,39 +945,46 @@ void main() {
       ];
       await WalFileManager.saveWals([first, second], deviceId: 'test');
       await reconnect();
-      receiver = (args) async {
-        expect(args[3], 1000);
-        expect(args[2], 0);
-        await File(args[4]! as String).writeAsBytes(original.sublist(0, 4));
-        return gap(4, 8);
-      };
-      await run(true);
-      expect((await WalFileManager.loadWals()).map((w) => w.nativeIntegrityVersion), [1, 0]);
-      expect(globalDeletedTimestamps, isEmpty);
-
-      await reconnect();
+      // The first segment migrates and then fails on a gap; the second is still read in
+      // the same cycle, and its own legacy prefix is discarded rather than certified by
+      // the first one's migration.
       final identities = <int>[];
       receiver = (args) async {
         final timestamp = args[3]! as int;
         final offset = args[2]! as int;
         identities.add(timestamp);
         if (timestamp == 1000) {
-          expect(offset, 4);
-          expect(await fileFor(first).readAsBytes(), original.sublist(0, 4));
-        } else {
-          expect(timestamp, 1060);
-          expect(offset, 0, reason: 'the first segment cannot certify the second segment prefix');
-          expect(await fileFor(second).length(), 0, reason: 'discard legacy padding before the read');
+          expect(offset, 0);
+          await File(args[4]! as String).writeAsBytes(original.sublist(0, 4));
+          return gap(4, 8);
         }
-        await File(args[4]! as String).writeAsBytes(original.sublist(offset), mode: FileMode.append);
+        expect(timestamp, 1060);
+        expect(args[1], 1, reason: 'the first file is still on the device, ahead of it');
+        expect(offset, 0, reason: 'the first segment cannot certify the second segment prefix');
+        expect(await fileFor(second).length(), 0, reason: 'discard legacy padding before the read');
+        await File(args[4]! as String).writeAsBytes(original);
+        return [null];
+      };
+      await run(true);
+      expect(identities, [1000, 1060]);
+      expect((await WalFileManager.loadWals()).single.nativeIntegrityVersion, 1);
+      expect(await fileFor(second).readAsBytes(), original);
+      expect(globalDeletedTimestamps, [1060]);
+
+      // The device now lists only the first one, which resumes from its own prefix.
+      connection.files = [StorageFile(index: 0, timestamp: 1000, size: 12, sessionId: 42)];
+      await reconnect();
+      receiver = (args) async {
+        expect(args[3], 1000);
+        expect(args[2], 4);
+        expect(await fileFor(first).readAsBytes(), original.sublist(0, 4));
+        await File(args[4]! as String).writeAsBytes(original.sublist(4), mode: FileMode.append);
         return [null];
       };
       expect((await native.syncAll())!.isPartial, isFalse);
-      expect(requests, [0, 4, 0]);
-      expect(identities, [1000, 1060]);
+      expect(requests, [0, 0, 4]);
       expect(await fileFor(first).readAsBytes(), original);
-      expect(await fileFor(second).readAsBytes(), original);
-      expect(globalDeletedTimestamps, [1000, 1060]);
+      expect(globalDeletedTimestamps, [1060, 1000]);
     });
 
     for (final identity in [
@@ -909,7 +1004,8 @@ void main() {
               storage: WalStorage.sdcard,
               status: status,
               nativeIntegrityVersion: 1,
-              syncFailCount: 3);
+              syncFailCount: 3,
+              failingSinceMs: 1789000000000);
           await WalFileManager.saveWals([saved], deviceId: 'test');
           connection.files = [
             StorageFile(index: 0, timestamp: identity.nextTs, size: 12, sessionId: identity.nextSid),
@@ -920,11 +1016,13 @@ void main() {
           expect(rebuilt.first.walOffset, 0);
           expect(rebuilt.first.status, WalStatus.miss);
           expect(rebuilt.first.syncFailCount, 0);
+          expect(rebuilt.first.failingSinceMs, isNull);
           expect(rebuilt.first.nativeIntegrityVersion, 0);
           expect(rebuilt.last.fileNum, 1, reason: 'a shifted index must not lose the correct bookmark');
           expect(rebuilt.last.walOffset, 12);
           expect(rebuilt.last.status, status);
           expect(rebuilt.last.syncFailCount, 3);
+          expect(rebuilt.last.failingSinceMs, 1789000000000);
           expect(rebuilt.last.nativeIntegrityVersion, 1);
         });
       }
@@ -974,12 +1072,31 @@ void main() {
       });
     }
 
-    test('failed STOP cannot mask integrity error at poison threshold', () async {
+    test('three files failing in a row end the cycle; the rest wait for the next sync', () async {
+      connection.files = [
+        for (int i = 0; i < 5; i++) StorageFile(index: i, timestamp: ts + i * 600, size: 12),
+      ];
+      await reconnect();
+      receiver = (args) async => gap(args[2]! as int, (args[2]! as int) + 4);
+
+      expect((await native.syncAll())!.isPartial, isTrue);
+      expect(requests, hasLength(3), reason: 'one bad file is skipped; three in a row say the device is unwell');
+      expect(globalDeletedTimestamps, isEmpty);
+    });
+
+    test('a failed STOP after an integrity gap ends the cycle, and still deletes nothing', () async {
       await seed(wal(offset: 4, version: 1, strikes: 4), original.sublist(0, 4));
+      connection.files.add(StorageFile(index: 1, timestamp: ts + 60, size: 12));
       receiver = (_) async => gap(4, 8);
       connection.onStop = () async => throw StateError('STOP failed');
       await run(true);
-      expect((await WalFileManager.loadWals()).single.syncFailCount, 4);
+      // The file without earlier failures goes first, and is the only one read: the device
+      // may still be sending it when its STOP did not take.
+      expect(requests, hasLength(1));
+      final saved = await WalFileManager.loadWals();
+      expect(saved.firstWhere((w) => w.timerStart == ts + 60).syncFailCount, 1,
+          reason: 'the gap, not the STOP, is what the attempt is judged by');
+      expect(saved.firstWhere((w) => w.timerStart == ts).syncFailCount, 4, reason: 'not tried this cycle');
       expect(globalDeletedTimestamps, isEmpty);
     });
 
@@ -1254,9 +1371,10 @@ void main() {
     test('syncAll continues to next file on protocol gap', () async {
       globalCurrentFileNum = -1;
       globalWriteCount = 0;
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       mockConn.files = [
-        StorageFile(index: 1, timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000, size: 3000000),
-        StorageFile(index: 2, timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000, size: 1000000)
+        StorageFile(index: 0, timestamp: now, size: 3000000),
+        StorageFile(index: 1, timestamp: now + 600, size: 1000000)
       ];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
@@ -1294,9 +1412,10 @@ void main() {
     test('syncAll retries then skips file on stall, batch continues', () async {
       globalCurrentFileNum = -1;
       globalWriteCount = 0;
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       mockConn.files = [
-        StorageFile(index: 1, timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000, size: 3000000),
-        StorageFile(index: 2, timestamp: DateTime.now().millisecondsSinceEpoch ~/ 1000, size: 1000000)
+        StorageFile(index: 0, timestamp: now, size: 3000000),
+        StorageFile(index: 1, timestamp: now + 600, size: 1000000)
       ];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
@@ -1494,44 +1613,56 @@ void main() {
       expect(globalDeletedTimestamps, equals([ts]), reason: 'only the delete is retried');
     }, timeout: const Timeout(Duration(seconds: 30)));
 
-    test('a file whose delete was refused blocks the head instead of mis-attributing the next', () async {
-      // The fast path can only read and delete index 0, and relies on each finished file
-      // being removed so the next one becomes index 0. A file that would not delete still
-      // holds that slot, so carrying on would re-read IT and store the bytes under the
-      // NEXT file's timestamp and bin path.
+    test('a file whose delete was refused keeps its place, and the next file is read at its own', () async {
+      // A file that would not delete still holds its index. The next file is read at the
+      // index after it, with its own timestamp, and its bytes land under its own name —
+      // never under the stuck file's, which is what reading index 0 again would do.
       final tsA = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 2000;
       final tsB = tsA + 300;
       globalRejectDeleteTimestamps = {tsA};
       globalDeletedTimestamps = [];
       globalWriteCount = 0;
-      mockConn.files = [
-        StorageFile(index: 1, timestamp: tsA, size: 10),
-        StorageFile(index: 2, timestamp: tsB, size: 10),
-      ];
+      final fileA = StorageFile(index: 0, timestamp: tsA, size: 10);
+      mockConn.files = [fileA, StorageFile(index: 1, timestamp: tsB, size: 10)];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
 
       final first = sync.syncAll();
       await mockConn.waitForWrite(1);
       await pump(10);
+      expect(globalCurrentFileNum, 0);
       mockConn.add(ackPacket(0x00));
       await pump();
       mockConn.add(dataPacket(0, List<int>.filled(10, 0xAB)));
       await pump();
       mockConn.add(eotPacket());
       await pump(10);
-      final firstResp = await first;
-      expect(globalWriteCount, equals(1), reason: 'B must not be read while A still holds index 0');
-      expect(firstResp!.isPartial, isTrue);
 
-      // Next cycle: the sweep retries A's delete, fails again, and must still refuse to
-      // download B rather than read whatever is at index 0.
+      await mockConn.waitForWrite(2);
+      await pump(10);
+      expect(globalCurrentFileNum, 1, reason: 'A was not deleted, so B is still at index 1');
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(dataPacket(0, List<int>.filled(10, 0xCD)));
+      await pump();
+      mockConn.add(eotPacket());
+      await pump(10);
+      final firstResp = await first;
+
+      expect(firstResp!.isPartial, isTrue, reason: 'A is still on the card');
+      expect(globalDeletedTimestamps, [tsA, tsB]);
+      expect(File('${tempDir.path}/raw_segments/$tsA/${tsA}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xAB));
+      expect(File('${tempDir.path}/raw_segments/$tsB/${tsB}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xCD),
+          reason: 'B landed under its own name');
+
+      // Next cycle the device lists only A. The sweep retries its delete and nothing is read.
+      mockConn.files = [fileA];
       globalDeletedTimestamps = [];
       final second = sync.syncAll();
       await pump(20);
       final secondResp = await second;
-      expect(globalWriteCount, equals(1));
-      expect(globalDeletedTimestamps, equals([tsA]));
+      expect(globalWriteCount, 2, reason: 'A is already on the phone, so only its delete is retried');
+      expect(globalDeletedTimestamps, [tsA]);
       expect(secondResp!.isPartial, isTrue);
     }, timeout: const Timeout(Duration(seconds: 30)));
 
@@ -1712,22 +1843,19 @@ void main() {
       expect(await sync.incompleteBinRelPaths(), isEmpty);
     }, timeout: const Timeout(Duration(seconds: 30)));
 
-    test('syncAll eventually drops a persistently-unreadable (zero-progress) file to unblock', () async {
+    test('syncAll never deletes a file that will not read, and counts every failed attempt', () async {
       globalDeletedTimestamps = [];
       final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      mockConn.files = [StorageFile(index: 1, timestamp: ts, size: 1000000)];
+      mockConn.files = [StorageFile(index: 0, timestamp: ts, size: 1000000)];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
 
-      // Every attempt "completes" (clean EOT) having delivered ZERO bytes — the file
-      // the firmware genuinely can't read (rotated-under-read / stale cached size /
-      // an empty read error). No attempt makes forward progress, so the guard counts
-      // each as a strike and, after _maxSyncFailBeforeDrop (5), deletes the file to
-      // unblock the index-0-only fast path (accepting the loss of that one file).
-      // Contrast the progressing-file test below: the drop keys on *no progress*, not
-      // on "short read" — a file that keeps advancing is never dropped because it will
-      // eventually complete.
-      for (int attempt = 1; attempt <= 5; attempt++) {
+      // Every attempt "completes" (clean EOT) having delivered ZERO bytes — the file the
+      // firmware genuinely can't read (rotated-under-read / stale cached size / an empty
+      // read error). It used to be deleted after five such syncs to unblock the queue;
+      // nothing waits behind it now, so it stays on the device and every sync retries it.
+      int? failingSince;
+      for (int attempt = 1; attempt <= 7; attempt++) {
         final f = sync.syncAll();
         await mockConn.waitForWrite(attempt);
         await pump(10);
@@ -1735,23 +1863,55 @@ void main() {
         await pump();
         mockConn.add(eotPacket()); // EOT with no data packet → zero bytes, no progress
         await pump(10);
-        await f;
-        if (attempt < 5) {
-          expect(globalDeletedTimestamps, isEmpty,
-              reason: 'must not delete before the poison threshold (attempt $attempt)');
-        }
+        expect((await f)!.isPartial, isTrue);
+        expect(globalDeletedTimestamps, isEmpty, reason: 'a file that never fully arrived stays on the device');
+        final saved = (await WalFileManager.loadWals()).single;
+        failingSince ??= saved.failingSinceMs;
+        expect(saved.failingSinceMs, allOf(isNotNull, equals(failingSince)),
+            reason: 'the clock starts at the first failure and later ones leave it (attempt $attempt)');
       }
-      expect(globalDeletedTimestamps, contains(ts));
+      expect((await WalFileManager.loadWals()).single.syncFailCount, 7);
     }, timeout: const Timeout(Duration(seconds: 60)));
 
+    test('a file that will not read does not keep the next one on the device', () async {
+      globalDeletedTimestamps = [];
+      globalWriteCount = 0;
+      final tsA = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final tsB = tsA + 600;
+      mockConn.files = [
+        StorageFile(index: 0, timestamp: tsA, size: 1000000),
+        StorageFile(index: 1, timestamp: tsB, size: 10),
+      ];
+      await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
+      await pump(10);
+
+      final f = sync.syncAll();
+      await mockConn.waitForWrite(1);
+      await pump(10);
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(eotPacket()); // A: nothing arrives
+      await pump(10);
+      await mockConn.waitForWrite(2);
+      await pump(10);
+      expect(globalCurrentFileNum, 1);
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(dataPacket(0, List<int>.filled(10, 0xCD)));
+      await pump();
+      mockConn.add(eotPacket());
+      await pump(10);
+
+      expect((await f)!.isPartial, isTrue);
+      expect(globalDeletedTimestamps, [tsB], reason: 'only the file that fully arrived leaves the device');
+      expect(File('${tempDir.path}/raw_segments/$tsB/${tsB}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xCD));
+    }, timeout: const Timeout(Duration(seconds: 30)));
+
     test('syncAll never drops a file that keeps making forward progress', () async {
-      // Forward-progress guard (#2b): a large recording that only comes down in
-      // pieces — background BLE throttling, or the link dropping mid-transfer
-      // ("Stream closed without EOT") — must NOT be dropped as poison. Each attempt
-      // advances the byte offset, so the file will finish on a later sync (typically
-      // once the app is foregrounded). Prove it survives well past
-      // _maxSyncFailBeforeDrop (5) attempts as long as it keeps progressing —
-      // deleting it would lose the recording for good just short of completion.
+      // A large recording that only comes down in pieces — background BLE throttling,
+      // or the link dropping mid-transfer ("Stream closed without EOT") — is never
+      // deleted, and never counts as failing: each attempt advances the byte offset, so
+      // it will finish on a later sync. Nothing waits behind it either way.
       globalDeletedTimestamps = [];
       final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       mockConn.files = [StorageFile(index: 1, timestamp: ts, size: 1000000)];
@@ -1764,6 +1924,7 @@ void main() {
       // (globalRequestedOffset); a packet before that is treated as already-have and
       // makes no progress (see the read handler's incomingOffset < expectedOffset
       // branch), which is why a fixed dataPacket(0, …) would plateau after attempt 1.
+      int? failingSince;
       for (int attempt = 1; attempt <= 8; attempt++) {
         final f = sync.syncAll();
         await mockConn.waitForWrite(attempt);
@@ -1777,33 +1938,34 @@ void main() {
         await pump(10);
         await f;
         expect(globalDeletedTimestamps, isEmpty, reason: 'a progressing file must never be dropped (attempt $attempt)');
+        final saved = (await WalFileManager.loadWals()).single;
+        expect(saved.syncFailCount, 0, reason: 'progress is not a failed sync');
+        failingSince ??= saved.failingSinceMs;
+        expect(saved.failingSinceMs, allOf(isNotNull, equals(failingSince)),
+            reason: 'progress does not restart the clock, so the time limit still bounds the wait');
       }
     }, timeout: const Timeout(Duration(seconds: 60)));
 
-    test('syncAll drops a file that always THROWS a terminal error (thrown poison)', () async {
+    test('syncAll never deletes a file that always THROWS, and retries it every sync', () async {
       globalDeletedTimestamps = [];
       final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      mockConn.files = [StorageFile(index: 1, timestamp: ts, size: 1000000)];
+      mockConn.files = [StorageFile(index: 0, timestamp: ts, size: 1000000)];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
 
-      // Every attempt throws an error-ACK with no data — the *thrown* failure mode,
-      // not the clean-but-short one. A thrown poison file must also count toward the
-      // retry budget and be dropped; otherwise (fast path can't get past a bad index-0
-      // head) it blocks every newer recording forever.
-      for (int attempt = 1; attempt <= 5; attempt++) {
+      // Every attempt throws an error-ACK with no data — the *thrown* failure mode, not
+      // the clean-but-short one. It counts as a failed attempt like a short read, and
+      // like one it is never deleted from the device for it.
+      for (int attempt = 1; attempt <= 6; attempt++) {
         final f = sync.syncAll();
         await mockConn.waitForWrite(attempt);
         await pump(10);
         mockConn.add(ackPacket(0x01)); // firmware error ACK (non-fatal, non-7)
         await pump(10);
         await f;
-        if (attempt < 5) {
-          expect(globalDeletedTimestamps, isEmpty,
-              reason: 'must not delete before the poison threshold (attempt $attempt)');
-        }
+        expect(globalDeletedTimestamps, isEmpty, reason: 'attempt $attempt');
       }
-      expect(globalDeletedTimestamps, contains(ts));
+      expect((await WalFileManager.loadWals()).single.syncFailCount, 6);
     }, timeout: const Timeout(Duration(seconds: 60)));
 
     test('Crash Recovery (Syncing): resumes from last segment boundary after interruption', () async {

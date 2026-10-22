@@ -32,11 +32,11 @@ power-loss durability.
 The companion Flutter file runs the real WAL policies and Dart native-download
 wrapper. A test-only platform override selects the native wrapper on the host;
 mocked Pigeon replies pass through the actual generated Dart error decoder.
-Coverage includes seven failed cycles across reload/reconnect beyond the poison
-threshold, no head skipping, final failure progress before polling, STOP ordering
-and failure, cancellation, legacy-prefix migration, and byte-correct resume
-before deletion. Shared desktop-receiver controls cover legitimate zeros and
-short-file retention.
+Coverage includes seven failed cycles across reload/reconnect beyond the give-up
+threshold with no deletion, the next file read at its own index under its own
+identity, final failure progress before polling, STOP ordering and failure,
+cancellation, legacy-prefix migration, and byte-correct resume before deletion.
+Shared desktop-receiver controls cover legitimate zeros and short-file retention.
 
 ```text
 cd app

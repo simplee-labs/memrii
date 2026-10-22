@@ -339,4 +339,49 @@ void main() {
       expect(passes.every((p) => p.batches.single.markerTimestamps.length == 1), isTrue);
     });
   });
+
+  group('retirement watermark', () {
+    File bin(int ts) => File('/docs/raw_segments/$ts/${ts}_7.bin');
+    final now = DateTime.utc(2026, 9, 10);
+    const none = (unknownTime: false, utcSeconds: null);
+
+    test('the oldest bin on the phone, while nothing older waits on the Omi', () {
+      expect(
+        RecordingsController.retirementWatermark(
+            bins: [bin(1789000600), bin(1789000000)], waitingOnDevice: none, keepRecordingsDays: 0, now: now),
+        1789000000,
+      );
+    });
+
+    test('a file still on the Omi holds it down: the sync can fetch newer audio before it', () {
+      expect(
+        RecordingsController.retirementWatermark(
+            bins: [bin(1789000600)],
+            waitingOnDevice: (unknownTime: false, utcSeconds: 1788990000),
+            keepRecordingsDays: 0,
+            now: now),
+        1788990000,
+      );
+    });
+
+    test('a waiting file with no wall-clock time leaves no evidence', () {
+      expect(
+        RecordingsController.retirementWatermark(
+            bins: [bin(1789000600)],
+            waitingOnDevice: (unknownTime: true, utcSeconds: null),
+            keepRecordingsDays: 0,
+            now: now),
+        isNull,
+      );
+    });
+
+    test('the retention cutoff still wins when it is later', () {
+      final cutoff = now.subtract(const Duration(days: 3)).millisecondsSinceEpoch ~/ 1000;
+      expect(
+        RecordingsController.retirementWatermark(
+            bins: const [], waitingOnDevice: (unknownTime: true, utcSeconds: null), keepRecordingsDays: 3, now: now),
+        cutoff,
+      );
+    });
+  });
 }

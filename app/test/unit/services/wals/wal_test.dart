@@ -98,6 +98,7 @@ void main() {
         'storage': 'sdcard',
         'status': 'synced',
         'syncFailCount': 0,
+        'failingSinceMs': null,
         'nativeIntegrityVersion': 0,
         'lastIntegrityGapOffset': null,
       });
@@ -114,6 +115,7 @@ void main() {
         'storage': 'sdcard',
         'status': 'synced',
         'syncFailCount': 3,
+        'failingSinceMs': 1789000000000,
         'nativeIntegrityVersion': 1,
         'lastIntegrityGapOffset': 1125960,
       };
@@ -129,6 +131,8 @@ void main() {
       expect(wal.storage, WalStorage.sdcard);
       expect(wal.status, WalStatus.synced);
       expect(wal.syncFailCount, 3);
+      expect(wal.failingSinceMs, 1789000000000);
+      expect(Wal.fromJson(wal.toJson()).failingSinceMs, 1789000000000);
       expect(wal.nativeIntegrityVersion, 1);
       expect(Wal.fromJson(wal.toJson()).nativeIntegrityVersion, 1);
       expect(wal.lastIntegrityGapOffset, 1125960);
@@ -149,6 +153,7 @@ void main() {
       expect(wal.storage, WalStorage.local);
       expect(wal.status, WalStatus.miss);
       expect(wal.syncFailCount, 0);
+      expect(wal.failingSinceMs, isNull);
       expect(wal.nativeIntegrityVersion, 0);
       expect(wal.lastIntegrityGapOffset, isNull);
     });

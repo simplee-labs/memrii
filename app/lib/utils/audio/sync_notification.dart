@@ -136,6 +136,8 @@ class SyncNotification {
         partial: prefs.lastSyncPartial,
         batteryLevel: prefs.lastBatteryLevel,
         isConnected: isConnected,
+        storagePaused: prefs.processingPausedForStorage,
+        storageWaitingMinutes: prefs.processingPausedMinutes,
       ),
     );
   }
@@ -153,7 +155,16 @@ class SyncNotification {
     required bool partial,
     required int batteryLevel,
     bool? isConnected,
+    bool storagePaused = false,
+    int storageWaitingMinutes = 0,
   }) {
+    // Audio waiting on phone storage outranks the last sync: nothing else will move
+    // it, and only the user can make room. Mirrored by native's idleNotificationContent.
+    if (storagePaused) {
+      return storageWaitingMinutes > 0
+          ? 'Phone storage full • $storageWaitingMinutes min of audio waiting'
+          : 'Phone storage full • audio waiting to process';
+    }
     if (lastStatusMs > 0) {
       final time = DateFormat('h:mm a').format(DateTime.fromMillisecondsSinceEpoch(lastStatusMs));
       final status = skipped ? 'Skipped' : (partial ? 'Partial' : 'Complete');

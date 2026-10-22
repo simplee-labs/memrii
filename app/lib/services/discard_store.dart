@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 import 'package:omi/models/recordings/recordings_models.dart';
+import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/logger.dart';
 
 /// All persistence and querying of VAD-dropped stretches recorded in
@@ -364,7 +365,7 @@ class DiscardStore {
         await d.sourceJsonl.delete();
       } catch (_) {}
     } else {
-      await d.sourceJsonl.writeAsString('${keep.join('\n')}\n', flush: true);
+      await AtomicFile.writeString(d.sourceJsonl, '${keep.join('\n')}\n');
     }
   }
 
@@ -433,7 +434,7 @@ class DiscardStore {
           await group.jsonl.delete();
         } catch (_) {}
       } else if (activeRecords.length != group.records.length) {
-        await group.jsonl.writeAsString('${activeRecords.map(jsonEncode).join('\n')}\n', flush: true);
+        await AtomicFile.writeString(group.jsonl, '${activeRecords.map(jsonEncode).join('\n')}\n');
       }
     }
 

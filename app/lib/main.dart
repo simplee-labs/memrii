@@ -9,6 +9,7 @@ import 'package:omi/backend/preferences.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/services/ui_lifecycle.dart';
 import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/bridges/ble_bridge.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'package:omi/providers/device_provider.dart';
@@ -157,6 +158,8 @@ Future<void> _launchHousekeeping() async {
   try {
     await RecordingsManager.cleanUpIncompleteExtraction();
     await RecordingsManager.cleanupOrphanedTempFiles();
+    await RecordingsManager.logMisdatedArchive();
+    await SetAsideBins.releaseAfterUpdate();
   } catch (e) {
     Logger.error('main: startup cleanup failed: $e');
   }

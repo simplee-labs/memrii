@@ -195,6 +195,25 @@ abstract class SDCardWalSync implements IWalSync {
   /// are prefixes awaiting a resumed read, so the processing pass must skip
   /// them: it prunes every bin it consumes, and pruning one strands its resume.
   Future<Set<String>> incompleteBinRelPaths();
+
+  /// Bins (paths relative to `raw_segments/`) automatic processing should not decode
+  /// yet: a file recorded EARLIER in the same boot is still waiting on the Omi.
+  /// Decoding the newer audio first would build its conversation without the start,
+  /// and the older file could then only arrive as a separate recording. Scoped to the
+  /// boot session, since a conversation never spans a reboot.
+  ///
+  /// A bin is released when the older file arrives; when that file has been failing for
+  /// [SDCardWalSyncImpl.heldBackGiveUpAfter] or has failed
+  /// [SDCardWalSyncImpl.heldBackGiveUpFailures] syncs in a row without progress,
+  /// whichever comes first — it stays on the Omi and keeps being retried, but newer
+  /// recordings stop waiting for it; or when the Omi no longer lists it. Only the current Omi's files count. Throws, like
+  /// [incompleteBinRelPaths], when the persisted WAL state cannot be read.
+  Future<Set<String>> heldBackBinRelPaths();
+
+  /// The oldest file the current Omi still holds that has not been downloaded, as its
+  /// UTC start in epoch seconds; [unknownTime] when one of them was recorded before the
+  /// clock was set, and so could be from any time. Both empty when nothing waits.
+  ({bool unknownTime, int? utcSeconds}) get oldestFileWaitingOnDevice;
 }
 
 extension SDCardWalSyncCancel on SDCardWalSync {

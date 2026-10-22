@@ -319,7 +319,7 @@ class OmiBleForegroundService : Service() {
     private val bleManager get() = OmiBleManager.instance
     private var currentNotificationTitle = DEFAULT_NOTIF_TITLE
     private var currentNotificationText = DEFAULT_NOTIF_TEXT
-    // True while auto-sync is scheduled. Read (as `wasActive`) by setNextSyncTime to spot
+    // True while auto-sync is scheduled. Read (as `wasActive`) by onSyncScheduleChanged to spot
     // the inactive→active transition that re-arms the recovery probe — it is NOT a
     // notification concern, whatever its name suggests. An older comment here claimed it
     // suppressed transient "Connecting…"/"Connected" text; it never did, and there is no
@@ -1730,14 +1730,12 @@ class OmiBleForegroundService : Service() {
 
     // ── Notification ──
 
-    fun setNextSyncTime(timestampMs: Long) {
+    /// Dart moved the sync schedule. The alarm itself is armed by BleHostApiImpl through
+    /// SyncAlarmReceiver.schedule() — the one funnel that arms, cancels and persists it —
+    /// whether or not this service is running; this keeps only the recovery probe in step.
+    fun onSyncScheduleChanged(timestampMs: Long) {
         val wasActive = syncTimerActive
         syncTimerActive = timestampMs > 0
-        // schedule() persists the armed time as a side effect, and is the ONLY funnel that
-        // arms or cancels the sync alarm (the receiver's own re-arm goes through it too).
-        // So the persisted value and the armed alarm cannot drift, and idleNotificationContent
-        // reads it back rather than a field that a headless start would find at 0.
-        SyncAlarmReceiver.schedule(this, timestampMs)
         // timestampMs <= 0 is Dart turning the sync schedule off — i.e. Manual Only
         // (device_provider setNextSyncTime(0)). The recovery alarm exists only to bridge a
         // confirmed outage back onto that schedule, so cancel it now rather than leaving an
@@ -1801,14 +1799,12 @@ class OmiBleForegroundService : Service() {
         // nextSyncTime: an overdue alarm is a true statement about the schedule.
         //
         // Gated on the LIVE interval rather than trusted on its own. The persisted time is
-        // written by SyncAlarmReceiver.schedule(), which every arm and cancel goes through
-        // — but Dart reaches it via `OmiBleForegroundService.instance?.setNextSyncTime`,
-        // which is null-safe: with the service down, switching to Manual Only never lands,
-        // and the stale future time would then render "Next sync at 4:15 PM" on a schedule
-        // that no longer exists. `flutter.backgroundSyncIntervalMinutes` is written by Dart
-        // directly and is always current, so it is the honest gate. (The same null-safety
-        // also leaves the ALARM armed in that case — pre-existing, and not something this
-        // renderer can fix.)
+        // written by SyncAlarmReceiver.schedule(), which every arm and cancel goes through,
+        // now straight from BleHostApiImpl whether or not this service is up. The gate
+        // still matters for anything that ends the schedule without a cancel reaching
+        // schedule() — a native start ahead of Dart — and
+        // `flutter.backgroundSyncIntervalMinutes`, written by Dart directly, is always
+        // current.
         val autoSyncOn = autoSyncIntervalMinutes() > 0
         val nextMs = if (autoSyncOn) getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getLong(PREFS_NEXT_SYNC_MS, 0L) else 0L
         val title = if (nextMs > 0) "Next sync at ${fmt.format(Date(nextMs))}" else DEFAULT_NOTIF_TITLE
@@ -1821,7 +1817,16 @@ class OmiBleForegroundService : Service() {
             prefs.getLong("flutter.lastSyncCompletedMs", 0L)
         }
         val text: String
-        if (lastMs > 0) {
+        if (prefs.getBoolean("flutter.processingPausedForStorage", false)) {
+            // Same precedence as Dart's idleBodyText: audio waiting on phone storage
+            // outranks the last sync, since only the user can make room for it.
+            val waiting = prefs.getLong("flutter.processingPausedMinutes", 0L)
+            text = if (waiting > 0) {
+                "Phone storage full • $waiting min of audio waiting"
+            } else {
+                "Phone storage full • audio waiting to process"
+            }
+        } else if (lastMs > 0) {
             val skipped = prefs.getBoolean("flutter.lastSyncSkipped", false)
             val status = when {
                 skipped -> "Skipped"

@@ -136,6 +136,86 @@ class VadFallbackBanner extends StatelessWidget {
   }
 }
 
+/// Shown while processing is held back because the phone is short of space. The
+/// waiting audio is kept as raw segments — about an eighth of the room it takes
+/// once processed — so nothing is lost, and the next run with room carries on.
+class PhoneStorageBanner extends StatelessWidget {
+  final bool active;
+  final int waitingMinutes;
+  const PhoneStorageBanner({super.key, required this.active, this.waitingMinutes = 0});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!active) return const SizedBox.shrink();
+    final waiting = waitingMinutes > 0 ? ' — $waitingMinutes min of audio waiting' : '';
+    return Container(
+      width: double.infinity,
+      color: Colors.red.shade900,
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      child: Row(
+        children: [
+          const FaIcon(FontAwesomeIcons.circleExclamation, color: Colors.white, size: 20),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              'Phone storage is full$waiting. Free up space and processing continues automatically.',
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Raw audio processing could not get past: files it set aside, or one it has
+/// stopped at. They stay on the phone; tapping offers Try again, Share and Delete.
+class SetAsideBanner extends StatelessWidget {
+  /// Files set aside, processing having moved past them.
+  final int setAsideCount;
+
+  /// Processing is stopped at a file and waits for the user's choice.
+  final bool stuck;
+
+  /// Start of the audio in question when there is just one and it has a time.
+  final DateTime? start;
+  final VoidCallback? onTap;
+
+  const SetAsideBanner({super.key, required this.setAsideCount, required this.stuck, this.start, this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    if (setAsideCount == 0 && !stuck) return const SizedBox.shrink();
+    final at = start == null
+        ? ''
+        : ' from ${DateFormat(SharedPreferencesUtil().use24HourTime ? 'd MMM HH:mm' : 'd MMM h:mm a').format(start!)}';
+    final message = stuck
+        ? "Processing stopped at an audio file$at it can't read."
+        : "$setAsideCount audio ${setAsideCount == 1 ? 'file' : 'files'}$at couldn't be processed.";
+    return Material(
+      color: Colors.orange.shade900,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+          child: Row(
+            children: [
+              const FaIcon(FontAwesomeIcons.triangleExclamation, color: Colors.white, size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  '$message Kept on your phone — tap for options.',
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class AccumulatingBanner extends StatelessWidget {
   final SyncProcessState spState;
   final double toProcessMinutes;

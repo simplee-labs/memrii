@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 import 'package:omi/services/wals.dart';
+import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/logger.dart';
 import 'package:omi/utils/mutex.dart';
 
@@ -44,16 +45,36 @@ class WalFileManager {
       return [];
     }
 
-    final content = await _walFile!.readAsString();
-    if (content.isEmpty) {
-      Logger.debug('WAL file is empty, returning empty list');
-      return [];
+    try {
+      return await _readWalFile(_walFile!);
+    } catch (e) {
+      // saveWals never writes an empty or malformed file, so this one was torn by an
+      // older build's in-place write or damaged on disk. The backup is the copy taken
+      // before the last save: one sync behind at worst, and its offsets still stop a
+      // half-downloaded bin from restarting at 0.
+      final backup = _walBackupFile;
+      if (backup != null && backup.existsSync()) {
+        try {
+          final wals = await _readWalFile(backup);
+          Logger.warning('WalFileManager: wals.json unreadable ($e) — restored ${wals.length} WALs from the backup');
+          return wals;
+        } catch (_) {}
+      }
+      if (e is _EmptyOrMalformedWalFile) {
+        Logger.debug('WalFileManager: ${e.message}, returning empty list');
+        return [];
+      }
+      rethrow;
     }
+  }
+
+  static Future<List<Wal>> _readWalFile(File file) async {
+    final content = await file.readAsString();
+    if (content.isEmpty) throw const _EmptyOrMalformedWalFile('WAL file is empty');
 
     final jsonData = jsonDecode(content);
     if (jsonData is! Map<String, dynamic> || jsonData['wals'] is! List) {
-      Logger.debug('Invalid WAL file format, returning empty list');
-      return [];
+      throw const _EmptyOrMalformedWalFile('Invalid WAL file format');
     }
 
     final walsList = jsonData['wals'] as List;
@@ -94,7 +115,7 @@ class WalFileManager {
       };
 
       final jsonString = jsonEncode(jsonData);
-      await _walFile!.writeAsString(jsonString);
+      await AtomicFile.writeString(_walFile!, jsonString);
 
       return true;
     } finally {
@@ -139,4 +160,14 @@ class WalFileManager {
       'backupFileSize': backupFileSize,
     };
   }
+}
+
+/// A WAL file with no parseable content — the shapes the loader has always answered
+/// with an empty list when no backup can stand in.
+class _EmptyOrMalformedWalFile implements Exception {
+  final String message;
+  const _EmptyOrMalformedWalFile(this.message);
+
+  @override
+  String toString() => message;
 }

@@ -327,7 +327,16 @@ class BleHostApiImpl(
     }
 
     override fun setNextSyncTime(timestampMs: Long) {
-        OmiBleForegroundService.instance?.setNextSyncTime(timestampMs)
+        // Armed here, not through the service: on a cold start or after the process was
+        // reclaimed the service is often not running yet, and the alarm was then never
+        // armed, leaving background sync to WorkManager alone. The service, when up, only
+        // keeps its recovery-probe bookkeeping in step.
+        try {
+            SyncAlarmReceiver.schedule(appContext, timestampMs)
+        } catch (e: Exception) {
+            Log.w(TAG, "setNextSyncTime: could not arm the sync alarm: ${e.message}")
+        }
+        OmiBleForegroundService.instance?.onSyncScheduleChanged(timestampMs)
     }
 
     override fun setDeviceBattery(level: Long, timestampMs: Long) {

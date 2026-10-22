@@ -83,4 +83,28 @@ void main() {
       expect(body(lastStatusMs: 0, isConnected: true, batteryLevel: 87), 'Ready to sync');
     });
   });
+
+  group('idle body text — phone storage', () {
+    test('audio waiting on phone storage takes the line, with how much is waiting', () {
+      expect(
+        SyncNotification.idleBodyText(
+          lastStatusMs: at,
+          skipped: false,
+          partial: false,
+          batteryLevel: 87,
+          storagePaused: true,
+          storageWaitingMinutes: 42,
+        ),
+        'Phone storage full • 42 min of audio waiting',
+      );
+    });
+
+    test('says so even before any sync outcome, or without a count', () {
+      expect(
+        SyncNotification.idleBodyText(
+            lastStatusMs: 0, skipped: false, partial: false, batteryLevel: -1, storagePaused: true),
+        'Phone storage full • audio waiting to process',
+      );
+    });
+  });
 }

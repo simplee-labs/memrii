@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart' show SharePlus, ShareParams, XFile;
 import 'package:omi/providers/device_provider.dart';
 import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/pages/settings/settings_drawer.dart';
 import 'package:omi/pages/settings/find_devices_page.dart';
@@ -572,6 +573,11 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
       ),
     );
     if (confirm != true) return;
+    if (RecordingsManager.isProcessingAny) {
+      // The delete waits for the run, which could otherwise turn the day's waiting
+      // audio back into recordings as it goes.
+      messenger.showSnackBar(const SnackBar(content: Text('Deleting after processing finishes')));
+    }
     try {
       await _controller.deleteDay(batch);
     } catch (e) {
@@ -581,6 +587,118 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
         );
       }
     }
+  }
+
+  Widget _buildSetAsideBanner() {
+    final setAside = SetAsideBins.list();
+    final stuck = SetAsideBins.stuckBin();
+    DateTime? start;
+    if (stuck != null && setAside.isEmpty) {
+      start = SetAsideBin(relBin: stuck, build: '', automatic: false, atMs: 0).startTime;
+    } else if (stuck == null && setAside.length == 1) {
+      start = setAside.single.startTime;
+    }
+    return SetAsideBanner(
+      setAsideCount: setAside.length,
+      stuck: stuck != null,
+      start: start,
+      onTap: () => unawaited(_showSetAsideSheet()),
+    );
+  }
+
+  /// Try again, Skip (for the file processing stopped at), Share or Delete for each
+  /// raw file processing could not get past. Nothing is removed without Delete.
+  Future<void> _showSetAsideSheet() async {
+    final stuck = SetAsideBins.stuckBin();
+    final files = [
+      if (stuck != null) (relBin: stuck, stuck: true),
+      ...SetAsideBins.list().map((e) => (relBin: e.relBin, stuck: false)),
+    ];
+    if (files.isEmpty) return;
+    final timeFormat = DateFormat(_prefs.use24HourTime ? 'd MMM HH:mm' : 'd MMM h:mm a');
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'These audio files are kept on your phone. Try again processes them now; Share sends the raw '
+                'file, for a bug report; Delete removes it for good.',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ),
+            for (final file in files)
+              ListTile(
+                title: Text(
+                  () {
+                    final start = SetAsideBin(relBin: file.relBin, build: '', automatic: false, atMs: 0).startTime;
+                    return start != null
+                        ? 'Audio from ${timeFormat.format(start)}'
+                        : 'Audio from before the clock was set';
+                  }(),
+                  style: const TextStyle(color: Colors.white),
+                ),
+                subtitle: Text(
+                  file.stuck ? 'Processing is stopped here' : 'Skipped by processing',
+                  style: const TextStyle(color: Colors.white54),
+                ),
+                trailing: PopupMenuButton<String>(
+                  icon: const Icon(Icons.more_vert, color: Colors.white70),
+                  onSelected: (action) {
+                    Navigator.of(sheetContext).pop();
+                    unawaited(_onSetAsideAction(file.relBin, action));
+                  },
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(value: 'retry', child: Text('Try again')),
+                    if (file.stuck) const PopupMenuItem(value: 'skip', child: Text('Skip this file')),
+                    const PopupMenuItem(value: 'share', child: Text('Share file')),
+                    const PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _onSetAsideAction(String relBin, String action) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      switch (action) {
+        case 'retry':
+          SetAsideBins.release(relBin);
+          unawaited(_controller.startProcessingWithoutSync());
+        case 'skip':
+          await SetAsideBins.skip(relBin);
+          unawaited(_controller.startProcessingWithoutSync());
+        case 'share':
+          final file = await SetAsideBins.fileFor(relBin);
+          await SharePlus.instance.share(ShareParams(files: [XFile(file.path)], subject: file.uri.pathSegments.last));
+        case 'delete':
+          if (!mounted) return;
+          final confirm = await showDialog<bool>(
+            context: context,
+            builder: (c) => getDialog(
+              c,
+              () => Navigator.of(c).pop(false),
+              () => Navigator.of(c).pop(true),
+              'Delete audio file',
+              'This permanently deletes this audio file from your phone. It cannot be recovered.',
+              confirmText: 'Delete',
+            ),
+          );
+          if (confirm != true) return;
+          await SetAsideBins.delete(relBin);
+      }
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not complete that: $e')));
+    }
+    if (mounted) setState(() {});
   }
 
   Future<void> _deleteAllDiscards(Batch batch, List<DiscardRecord> discards) async {
@@ -1117,6 +1235,11 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
                   percentage: deviceProvider.storageFullPercentage,
                 ),
                 VadFallbackBanner(active: _prefs.lastVadFallbackActive),
+                PhoneStorageBanner(
+                  active: _prefs.processingPausedForStorage,
+                  waitingMinutes: _prefs.processingPausedMinutes,
+                ),
+                _buildSetAsideBanner(),
                 // Only ever raised for an Omi this app has not configured — a
                 // replacement, or one whose settings were reset. Review opens
                 // Recording Settings, the same page the manual-mode tag opens.
