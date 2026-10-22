@@ -4,6 +4,17 @@ Recent app and firmware releases are listed by patch version. Older releases rem
 
 ## App
 
+### memrii 0.2.6 (build 17)
+
+- **No background service without a paired Omi.** The sync alarm is now set only while an Omi is paired. Before, a phone with no Omi (never set up, or after Forget Device) could have memrii's background service and its notification started every sync interval for a sync that could not happen.
+- **"Phone storage full" goes away once no audio is waiting.** The banner and the notification line now clear as soon as nothing is left waiting for space. Before, if the waiting audio was deleted (for example with Delete Day) or set aside, they could stay up indefinitely.
+- **Deleting, cropping or editing a recording no longer waits for M4A conversion.** After processing in M4A mode, these actions now go ahead while recordings are converted. Before, after a long backlog they could wait minutes with no sign of progress.
+- **A deleted recording stays deleted.** Deleting a recording just as processing finished could lose the record of that deletion, so audio kept for another reason could later be processed again and bring the recording back. A failure while tidying up after processing also no longer leaves processing looking unfinished.
+- **Delete Day while processing is starting.** Processing that was just starting when a day was deleted could bring the day's recordings back, or fail. It now waits for the delete and leaves the deleted audio out.
+- **A file that makes the end of processing fail is set aside too.** A failure while saving the last conversation of a run now counts against the run's last audio file, which after three failures in a row is set aside with Try again, Share file and Delete. Before, it could fail the same way on every run with nothing to tap.
+- **Only a full phone shows "Phone storage full".** Errors that mean something else on Android are no longer taken for a full phone, and a used-up storage quota is recognized as one.
+- **Firmware unchanged:** memrii-fw-3.2.1. This app also works with memrii-fw-3.2.0.
+
 ### memrii 0.2.5 (build 16)
 
 - **A recording that won't download no longer holds up the rest.** Sync now moves on to the next recording on the Omi and tries the stuck one again on every sync, so newer recordings reach the phone right away. Before, newer recordings waited on the Omi behind it, and for some kinds of failure the stuck recording was deleted from the Omi after five tries without ever arriving. Now nothing is removed from the Omi until all of it has arrived.

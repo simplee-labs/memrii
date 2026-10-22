@@ -8,7 +8,7 @@ recording under the user's control.
 Recordings remain local by default. Users decide what is retained, processed, exported,
 or shared with connected services.
 
-[memrii.me](https://memrii.me) · **App source:** `0.2.5+16` · **Firmware source:** `memrii-fw-3.2.1`
+[memrii.me](https://memrii.me) · **App source:** `0.2.6+17` · **Firmware source:** `memrii-fw-3.2.1`
 
 Download the signed Android APK from [Releases](https://github.com/simplee-labs/memrii/releases/latest). Firmware updates
 are published separately. To build it yourself, see [Building](#building).
