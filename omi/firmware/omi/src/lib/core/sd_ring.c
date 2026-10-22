@@ -954,6 +954,22 @@ uint64_t sd_ring_free_bytes(void)
     return (ring_bytes > used) ? (ring_bytes - used) : 0;
 }
 
+uint64_t sd_ring_unsynced_bytes(void)
+{
+    if (!ring_mounted) {
+        return 0;
+    }
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < segtab.count; i++) {
+        const ring_segment_t *e = &segtab.entries[i];
+        if (e->flags & RING_SEG_FLAG_ACKED) {
+            continue; /* synced, lingering behind an older un-acked segment */
+        }
+        n += (e->flags & RING_SEG_FLAG_OPEN) ? (head_abs - e->start_abs) : e->length;
+    }
+    return n;
+}
+
 uint64_t sd_ring_capacity_bytes(void)
 {
     return ring_mounted ? ring_bytes : 0;

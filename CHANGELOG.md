@@ -537,6 +537,10 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## Firmware
 
+### memrii-fw-3.2.1
+
+- **Fix: the Omi's free space read too low while an older recording was waiting to sync.** The Omi reuses its card starting from the oldest recording. While that recording hadn't been downloaded yet, everything recorded after it counted as used, including recordings the app had already synced and removed. Storage Free Space in Device Settings therefore showed less than the Omi really had, and its "% full" figure read high. Free space now means the card's capacity minus the audio the app hasn't synced yet. Space already synced counts as free, which matches what the Omi does: when it needs room, it reuses that space, dropping the oldest waiting recording first. When recordings sync in order, as they normally do, the number is unchanged. Nothing changes over Bluetooth, so any app version shows the corrected number.
+
 ### memrii-fw-3.2
 
 - **The firmware is now memrii-fw-3.2.0.** Device Settings shows the new name; it behaves exactly like oo-3.1.5. The Omi still advertises itself as "Omi", so the app finds it as before, and flashing it re-pairs automatically, as every update does. The version numbers continue from the oo- series, so notes that say "oo-3.1.4 and later" include it.

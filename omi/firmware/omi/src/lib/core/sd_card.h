@@ -342,6 +342,8 @@ bool sd_is_current_recording_file(const char *filename);
 /**
  * @brief Return the most recently cached free space on the SD card (bytes).
  *
+ * Free means not holding audio the phone has yet to sync: ring capacity minus
+ * sd_ring_unsynced_bytes(), so synced space not yet reused counts as free.
  * Updated each time the file-list cache is rebuilt on the SD worker thread.
  * Returns 0 if the cache has not been populated yet.
  */

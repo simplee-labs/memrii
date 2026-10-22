@@ -934,7 +934,12 @@ static int refresh_file_cache(void)
     cached_stats_file_count = (uint32_t) n;
     cached_stats_total_size = total_size;
     {
-        uint64_t freeb = sd_ring_free_bytes();
+        /* Capacity minus audio not yet synced, not sd_ring_free_bytes(): space synced
+         * and deleted behind an older file still waiting is reused as soon as the ring
+         * needs room, so counting it as used made the card look fuller than it is. */
+        uint64_t cap = sd_ring_capacity_bytes();
+        uint64_t unsynced = sd_ring_unsynced_bytes();
+        uint64_t freeb = (cap > unsynced) ? (cap - unsynced) : 0;
         cached_free_bytes = (freeb > UINT32_MAX) ? UINT32_MAX : (uint32_t) freeb;
     }
     cached_stats_valid_until_ms = k_uptime_get() + FILE_CACHE_TTL_MS;

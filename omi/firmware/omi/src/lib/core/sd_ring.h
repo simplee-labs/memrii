@@ -339,6 +339,17 @@ uint64_t sd_ring_used_bytes(void);
 uint64_t sd_ring_free_bytes(void);
 
 /**
+ * @brief Bytes the phone has not synced yet: every closed, un-acked segment plus
+ *        the open segment's bytes so far.
+ *
+ * Unlike sd_ring_used_bytes(), this leaves out acked segments lingering behind an
+ * older un-acked one. That space is already synced, and keep-newest reuses it as
+ * soon as the ring needs room (dropping the older segment first), so capacity
+ * minus this is the free space the phone is told about.
+ */
+uint64_t sd_ring_unsynced_bytes(void);
+
+/**
  * @brief Free bytes in the append stage.
  *
  * An append of at most this many bytes never takes sd_ring_append()'s
