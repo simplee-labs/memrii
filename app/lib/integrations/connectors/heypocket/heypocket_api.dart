@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:omi/integrations/integration_recording.dart';
 import 'package:omi/utils/logger.dart';
@@ -9,6 +10,16 @@ import 'package:path/path.dart' as p;
 
 class HeyPocketService {
   static const _base = 'https://public.heypocketai.com/api/v1';
+
+  /// How long the file PUT may go without handing the connection another chunk before
+  /// it counts as stalled. A slow link keeps taking chunks; a stalled one stops.
+  @visibleForTesting
+  static Duration uploadIdleLimit = const Duration(seconds: 60);
+
+  /// How long the PUT may then wait for the server's answer. Generous because the last
+  /// chunks can still be draining from the socket's own buffer on a slow link.
+  @visibleForTesting
+  static Duration uploadResponseLimit = const Duration(minutes: 5);
 
   /// Returns false only when the service rejects the key. An unavailable check
   /// throws, so callers can preserve a saved connection during an outage.
@@ -87,20 +98,55 @@ class HeyPocketService {
       final uri = Uri.tryParse(url);
       if (uri == null) throw const HeyPocketException(500, 'Invalid upload URL');
 
-      // Step 2: stream PUT file to presigned URL
+      // Step 2: stream PUT file to presigned URL. Bounded by progress rather than by a
+      // total, since a long recording on a slow link can rightly take many minutes; but
+      // a connection that stops moving used to hold this destination's upload lane until
+      // the OS gave up on the socket. A watchdog closes the client instead, which aborts
+      // the request.
       final fileLength = await rec.audioFile.length();
+      final client = http.Client();
       final request = http.StreamedRequest('PUT', uri)
         ..headers['Content-Type'] = contentType
         ..contentLength = fileLength;
 
-      Object? streamError;
-      final pipeFuture = rec.audioFile.openRead().pipe(request.sink).catchError((e) {
-        streamError = e;
-        request.sink.close();
-      });
+      Timer? watchdog;
+      var stalled = false;
+      void armWatchdog(Duration limit) {
+        watchdog?.cancel();
+        watchdog = Timer(limit, () {
+          stalled = true;
+          client.close();
+        });
+      }
 
-      final streamedRes = await request.send();
-      await pipeFuture.timeout(const Duration(seconds: 60));
+      Object? streamError;
+      armWatchdog(uploadIdleLimit);
+      final pipeFuture = rec.audioFile
+          .openRead()
+          .map((chunk) {
+            armWatchdog(uploadIdleLimit);
+            return chunk;
+          })
+          .pipe(request.sink)
+          .then((_) => armWatchdog(uploadResponseLimit), onError: (Object e) {
+            streamError = e;
+            request.sink.close();
+          });
+
+      final http.StreamedResponse streamedRes;
+      try {
+        streamedRes = await client.send(request);
+        await streamedRes.stream.drain<void>();
+        await pipeFuture;
+      } catch (e) {
+        if (stalled) {
+          throw TimeoutException('HeyPocket upload made no progress', uploadIdleLimit);
+        }
+        rethrow;
+      } finally {
+        watchdog?.cancel();
+        client.close();
+      }
 
       if (streamError != null) throw const HeyPocketException(0, 'File read failed during upload');
       if (streamedRes.statusCode != 200 && streamedRes.statusCode != 204) {
