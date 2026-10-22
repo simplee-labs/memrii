@@ -29,12 +29,15 @@ class RecordingWriteFailed implements Exception {
 
   const RecordingWriteFailed(this.cause, {required this.storageFull});
 
-  /// ENOSPC on Android; ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL on Windows.
+  /// ENOSPC, or EDQUOT where a storage quota applies — the Linux codes Android reports.
+  /// Android is the only platform this runs on, and there Windows' disk-full codes, 39
+  /// and 112, mean "directory not empty" and "host is down"; counting them misread those
+  /// failures as a full phone, pausing processing behind the wrong banner.
   static bool isStorageFull(Object error) {
     if (error is RecordingWriteFailed) return error.storageFull;
     if (error is! FileSystemException) return false;
     final code = error.osError?.errorCode;
-    return code == 28 || code == 112 || code == 39;
+    return code == 28 || code == 122;
   }
 
   @override

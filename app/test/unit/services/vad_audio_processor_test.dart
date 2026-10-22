@@ -2524,8 +2524,18 @@ void main() {
 
     test('is told apart as storage-full when the platform says so', () {
       expect(RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('No space', 28))), isTrue);
+      expect(RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('Quota exceeded', 122))),
+          isTrue);
       expect(RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('Denied', 13))), isFalse);
       expect(RecordingWriteFailed.isStorageFull(StateError('x')), isFalse);
+    });
+
+    // Windows' disk-full codes mean something else on Android, the platform this runs on.
+    test('is not misled by codes that mean something else on Android', () {
+      expect(
+          RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('Not empty', 39))), isFalse);
+      expect(
+          RecordingWriteFailed.isStorageFull(const FileSystemException('w', 'p', OSError('Host down', 112))), isFalse);
     });
   });
 
