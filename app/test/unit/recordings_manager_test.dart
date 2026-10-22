@@ -3506,6 +3506,27 @@ void main() {
         expect(raw.existsSync(), isFalse);
       });
 
+      // A prune runs outside the archive edit queue (after every run, before a background
+      // run). It used to write back the deleted set it read when it started, dropping what a
+      // delete added meanwhile — and the two shared one staging file, so one rename threw.
+      test('a prune running alongside a delete keeps what the delete adds, and neither throws', () async {
+        // An entry whose bin is gone, so the prune has something to forget and rewrites the file.
+        File(p.join(tempDir.path, 'deleted_bins.json')).writeAsStringSync(jsonEncode(['1788100000/1788100000_5.bin']));
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await writeRecordingWithBins(startMs: ts * 1000, durationMs: 30000, relativeBins: [rel]);
+        await writeRecordingWithBins(startMs: ts * 1000 + 40000, durationMs: 10000, relativeBins: [rel], isDraft: true);
+        final finished = (await RecordingsManager().getBatches()).expand((b) => b.finalizedRecordings).single;
+
+        await Future.wait([
+          RecordingsManager.pruneConsumedBins(),
+          RecordingsManager.deleteConversations([finished]),
+        ]);
+
+        expect(raw.existsSync(), isTrue, reason: 'the draft still names it');
+        expect(await RecordingsManager.deletedRelBins(), {rel},
+            reason: 'the deleted recording stays deleted; only the entry whose bin is gone was forgotten');
+      });
+
       test('Delete Day takes the day\'s waiting audio too, but no other day\'s', () async {
         final today = await bin(1789000000);
         final waiting = await bin(1789000600);

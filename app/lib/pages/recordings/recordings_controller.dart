@@ -1588,7 +1588,13 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       // _incompleteBins already logged the cause.
     }
     if (incompleteForPrune != null) {
-      await RecordingsManager.pruneConsumedBins(protectedRelBins: incompleteForPrune);
+      try {
+        await RecordingsManager.pruneConsumedBins(protectedRelBins: incompleteForPrune);
+      } catch (e) {
+        // Reclaiming bins can wait for the next run; settling this one cannot. A throw
+        // here used to skip _finishPipelineRun and leave the pipeline in processing.
+        Logger.error('RecordingsController: post-run prune failed, retried next run: $e');
+      }
     }
     await reloadBatchesSilently();
     await _finishPipelineRun();

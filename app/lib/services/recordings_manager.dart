@@ -28,6 +28,7 @@ import 'package:omi/services/vad_audio_processor.dart';
 import 'package:omi/services/vad_batch_runner_channel.dart';
 import 'package:omi/utils/atomic_file.dart';
 import 'package:omi/utils/logger.dart';
+import 'package:omi/utils/mutex.dart';
 
 // Re-export the recording domain models so existing importers of this file keep
 // working without touching their import lists. The model definitions now live in
@@ -3456,7 +3457,7 @@ class RecordingsManager {
     // On disk before any file goes: a kill mid-delete must not leave bins that
     // nothing names, or the next run decodes the recording straight back.
     final released = conversations.where((c) => shouldDelete == null || shouldDelete(c)).expand(_ownBinsOnDisk).toSet();
-    if (released.isNotEmpty) await _writeDeletedRelBins({...await deletedRelBins(), ...released});
+    await _addDeletedRelBins(released);
 
     // Group conversations by directory to minimize directory listings for EDL cleanup
     final Map<String, List<Conversation>> byDir = {};
@@ -3747,7 +3748,7 @@ class RecordingsManager {
       ...batch.rawSegments.map((f) => VadAudioProcessor.relBinPath(f.path)),
       ...[...batch.finalizedRecordings, ...batch.draftRecordings].expand(_ownBinsOnDisk),
     };
-    if (released.isNotEmpty) await _writeDeletedRelBins({...await deletedRelBins(), ...released});
+    await _addDeletedRelBins(released);
 
     // Drop discard records for this day, with the bins they hold for recovery.
     for (final d in batch.discards) {
@@ -4772,7 +4773,7 @@ class RecordingsManager {
     }
     final deletable = consumed.difference(protectedBins);
     if (deletable.isEmpty) {
-      await _forgetDeletedRelBinsGone(rawDir, userDeleted);
+      await _forgetDeletedRelBinsGone(rawDir);
       return 0;
     }
 
@@ -4806,7 +4807,7 @@ class RecordingsManager {
       } catch (_) {}
     }
 
-    await _forgetDeletedRelBinsGone(rawDir, userDeleted);
+    await _forgetDeletedRelBinsGone(rawDir);
     return deletedCount;
   }
 
@@ -4828,6 +4829,14 @@ class RecordingsManager {
     }
   }
 
+  /// Held for every read-modify-write of the deleted set. A delete adds to it inside the
+  /// archive edit queue while a prune — after every run, ahead of a background run —
+  /// removes from it outside the queue. Unserialized, the prune wrote back the set it had
+  /// read when it started, losing what the delete added, and the two writers shared one
+  /// staging file, so one rename threw.
+  static final Mutex _deletedBinsLock = Mutex();
+
+  /// Only under [_deletedBinsLock].
   static Future<void> _writeDeletedRelBins(Set<String> relBins) async {
     final file = File('${(await getApplicationDocumentsDirectory()).path}/$_deletedBinsFileName');
     if (relBins.isEmpty) {
@@ -4839,15 +4848,31 @@ class RecordingsManager {
     await AtomicFile.writeString(file, jsonEncode(relBins.toList()..sort()));
   }
 
-  /// Drops deleted-set entries whose bin is gone — pruned here, or consumed and
-  /// deleted by a run.
-  static Future<void> _forgetDeletedRelBinsGone(Directory rawDir, Set<String> userDeleted) async {
-    if (userDeleted.isEmpty) return;
-    final present = <String>{};
-    for (final rel in userDeleted) {
-      if (await File('${rawDir.path}/$rel').exists()) present.add(rel);
+  static Future<void> _addDeletedRelBins(Set<String> relBins) async {
+    if (relBins.isEmpty) return;
+    await _deletedBinsLock.acquire();
+    try {
+      await _writeDeletedRelBins({...await deletedRelBins(), ...relBins});
+    } finally {
+      _deletedBinsLock.release();
     }
-    if (present.length != userDeleted.length) await _writeDeletedRelBins(present);
+  }
+
+  /// Drops deleted-set entries whose bin is gone — pruned here, or consumed and
+  /// deleted by a run. Reads the set afresh under the lock rather than reusing the
+  /// prune's copy, so an entry a delete added meanwhile is kept.
+  static Future<void> _forgetDeletedRelBinsGone(Directory rawDir) async {
+    await _deletedBinsLock.acquire();
+    try {
+      final current = await deletedRelBins();
+      final present = <String>{};
+      for (final rel in current) {
+        if (await File('${rawDir.path}/$rel').exists()) present.add(rel);
+      }
+      if (present.length != current.length) await _writeDeletedRelBins(present);
+    } finally {
+      _deletedBinsLock.release();
+    }
   }
 
   /// Bins the processing checkpoint still buffers frames from, as
