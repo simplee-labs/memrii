@@ -1,8 +1,22 @@
 # Changelog
 
-Recent app releases are listed by patch version. Older app and firmware releases remain grouped by minor version; those sections reflect the **net** behavior at the end of each series.
+Recent app and firmware releases are listed by patch version. Older releases remain grouped by minor version; those sections reflect the **net** behavior at the end of each series.
 
 ## App
+
+### memrii 0.2.5 (build 16)
+
+- **A recording that won't download no longer holds up the rest.** Sync now moves on to the next recording on the Omi and tries the stuck one again on every sync, so newer recordings reach the phone right away. Before, newer recordings waited on the Omi behind it, and for some kinds of failure the stuck recording was deleted from the Omi after five tries without ever arriving. Now nothing is removed from the Omi until all of it has arrived.
+- **Conversations are still put together in order.** While an older recording from the same Omi session is still on the Omi, processing waits for it, so each conversation is built from its start. The wait ends when that recording arrives, or once it has been failing for 75 minutes or has failed three syncs in a row, whichever comes first. Audio that arrives late becomes its own recording instead of being merged into one already saved, so a saved recording is never renamed or uploaded a second time.
+- **A full phone no longer costs audio.** Before processing, the app checks free space (processing needs about eight times the space of the audio downloaded from the Omi) and processes the oldest audio that fits. The rest waits on the phone, a banner and the notification show how much, and processing continues once space is freed. Before, a recording that couldn't be saved for lack of space could have its audio deleted anyway.
+- **A failure during processing no longer loses audio.** If processing fails partway through, it stops and picks up from the same point next time, just as it does when the app is closed mid-run. Before, the audio it was working on could be dropped.
+- **An audio file that keeps failing is set aside instead of stopping everything.** If one file makes processing fail three times in a row, it is set aside so the rest of the audio keeps processing. The recordings page lists it with Try again, Share file (for a bug report) and Delete, and it gets one more try after each app update. If a second file fails the same way, processing stops and offers to skip that file, since that points to a problem with processing rather than with one file.
+- **Deleting a recording deletes only that recording.** Before, deleting the last remaining recording from an Omi session (everything the Omi records between restarts) also deleted the rest of that session's downloaded audio, including audio not yet processed or still downloading. Delete Day still deletes everything for its date, including audio waiting to be processed, once any processing in progress finishes.
+- **Placing Unorganized recordings on their date no longer creates duplicates.** Moving them used to rename their downloaded audio in a way that could later produce duplicate recordings dated far in the future, or download the same audio again.
+- **Syncing resumes after a phone restart or an app update without opening memrii.** The sync alarm is now set whether or not memrii's background service is running, and set again when the phone restarts or the app updates.
+- **Sync progress and recording details survive a crash.** The app now saves its files so that a crash or forced close partway through a save can't leave one half-written. Before, that could cause repeat downloads, duplicate recordings or lost recording details, or hold up automatic processing.
+- **HeyPocket uploads no longer hang.** An upload that makes no progress for 60 seconds, or gets no reply within five minutes of finishing, now fails and is retried later. Before, a dropped connection could leave an upload waiting forever and hold up the HeyPocket uploads behind it. Uploads that are slow but still moving are not cut off.
+- **Firmware:** memrii-fw-3.2.1, which corrects the free space the Omi reports while an older recording is waiting to sync (see Firmware). This app also works with memrii-fw-3.2.0.
 
 ### memrii 0.2.4 (build 15)
 
