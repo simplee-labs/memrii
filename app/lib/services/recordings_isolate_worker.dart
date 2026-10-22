@@ -204,8 +204,9 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
       'RecordingsManager isolate: processing run started — ${params.segmentPaths.length} segment(s), backgroundMode=${params.backgroundMode}');
 
   // Where a failure happened, reported with it. A failed restore means the checkpoint
-  // itself is unusable; a failure inside a segment is attributed to that bin, so a
-  // file that fails every run can be set aside instead of blocking every later one.
+  // itself is unusable; a failure inside a segment is attributed to that bin, and one in
+  // the final flush to the run's last bin, so a file that fails every run can be set
+  // aside instead of blocking every later one.
   var phase = 'restore';
   String? currentBin;
   try {
@@ -360,7 +361,10 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
       }
     }
 
-    currentBin = null;
+    // A failure saving what the run ends with is charged to its last bin, so one that
+    // fails every run alike is set aside like a failure inside a segment, rather than
+    // stopping every run with nothing offering Try again or Skip.
+    currentBin = params.segmentPaths.isEmpty ? null : params.segmentPaths.last;
     phase = 'flush';
 
     // Skip the draft flush on cancel — flushRemaining triggers another save

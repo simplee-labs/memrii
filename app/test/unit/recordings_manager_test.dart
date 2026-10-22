@@ -3303,6 +3303,17 @@ void main() {
         expect(SetAsideBins.relBins(), {'100/100_1.bin'});
       });
 
+      // The flush saves what the run ends with. Uncharged, one failing alike every run kept
+      // stopping processing with nothing on the recordings page to try again or skip.
+      test('a failure saving what the run ends with counts against its last bin', () async {
+        const failure = {'phase': 'flush', 'bin': '/docs/raw_segments/100/100_1.bin', 'storageFull': false};
+        for (var i = 0; i < SetAsideBins.strikes; i++) {
+          expect(SetAsideBins.relBins(), isEmpty);
+          await RecordingsManager.recordRunFailureForTest(failure, checkpoint());
+        }
+        expect(SetAsideBins.relBins(), {'100/100_1.bin'});
+      });
+
       test('on a full phone pauses processing instead of blaming the bin', () async {
         await RecordingsManager.recordRunFailureForTest(
             {'phase': 'segment', 'bin': '/docs/raw_segments/100/100_1.bin', 'storageFull': true}, checkpoint(),

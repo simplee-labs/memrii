@@ -654,7 +654,9 @@ class RecordingsManager {
   /// leaves, in which no bin was released before a checkpoint naming it was on disk.
   /// A failed restore is the exception, since that checkpoint would fail every run at
   /// the same spot. A full phone pauses processing; any other failure inside a
-  /// segment counts against that bin (see [SetAsideBins]).
+  /// segment counts against that bin, and one in the final flush against the run's last
+  /// bin (see [SetAsideBins]) — uncharged, a flush that failed alike every run stopped
+  /// processing with nothing offering Try again or Skip.
   static Future<void> _recordRunFailure(Map<dynamic, dynamic> msg, File checkpointFile,
       {required int waitingRawBytes}) async {
     if (msg['phase'] == 'restore') {
@@ -664,7 +666,7 @@ class RecordingsManager {
     }
     if (msg['storageFull'] == true) {
       _pauseForStorage(waitingRawBytes);
-    } else if (msg['phase'] == 'segment' && msg['bin'] is String) {
+    } else if ((msg['phase'] == 'segment' || msg['phase'] == 'flush') && msg['bin'] is String) {
       await SetAsideBins.recordFailure(VadAudioProcessor.relBinPath(msg['bin'] as String));
     }
   }
