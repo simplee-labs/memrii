@@ -13,6 +13,7 @@ Recent app and firmware releases are listed by patch version. Older releases rem
 - **Delete Day while processing is starting.** Processing that was just starting when a day was deleted could bring the day's recordings back, or fail. It now waits for the delete and leaves the deleted audio out.
 - **A file that makes the end of processing fail is set aside too.** A failure while saving the last conversation of a run now counts against the run's last audio file, which after three failures in a row is set aside with Try again, Share file and Delete. Before, it could fail the same way on every run with nothing to tap.
 - **Only a full phone shows "Phone storage full".** Errors that mean something else on Android are no longer taken for a full phone, and a used-up storage quota is recognized as one.
+- **No more false "no reply" timeouts from the Omi.** Two requests sent back to back to the same part of the Omi now each get their own reply. Before, the first reply could be taken as the second request's, and the first request was reported as unanswered after 10 seconds even though it had gone through. That could make a working connection look stuck, skip a sync, or leave a Device Settings value unread.
 - **Firmware unchanged:** memrii-fw-3.2.1. This app also works with memrii-fw-3.2.0.
 
 ### memrii 0.2.5 (build 16)

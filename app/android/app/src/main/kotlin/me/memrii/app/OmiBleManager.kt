@@ -91,8 +91,46 @@ class OmiBleManager private constructor(private val application: Application) {
 
     val connectedGatts = ConcurrentHashMap<String, BluetoothGatt>()
     private val discoveryTimeouts = ConcurrentHashMap<String, Runnable>()
+
+    // Reads and with-response writes waiting on their callback, from enqueue until answered,
+    // each under its own key: "address:service:characteristic#sequence". The sequence is the
+    // point. Keyed by characteristic alone, a second operation on the same characteristic,
+    // queued behind the first, replaced the first's completion: the first callback then
+    // answered the second caller, and the first caller timed out at 10 s although its
+    // operation had gone through. A firmware update's STOP, queued just ahead of the sync's
+    // own LIST, timed out that way. The address stays the prefix, which is what
+    // [cleanupPeripheral] fails them by.
     private val readCompletions = ConcurrentHashMap<String, (Result<ByteArray>) -> Unit>()
     private val writeCompletions = ConcurrentHashMap<String, (Result<Unit>) -> Unit>()
+    private val operationSequence = java.util.concurrent.atomic.AtomicLong()
+
+    // The key of the read or with-response write the queue has in flight. The queue is
+    // single-in-flight, so the next onCharacteristicRead/Write is that operation's, and
+    // answering it by this key rather than by characteristic is what keeps a callback with
+    // its own caller. Null while anything else is in flight (a keep-alive, a descriptor
+    // write, discovery), whose callbacks then answer nobody. Set on main as the command
+    // runs, before the operation is issued, since its callback can arrive on a binder
+    // thread before the issuing call returns; cleared by that callback or a rejection,
+    // and by [resetCommandPipeline].
+    @Volatile private var inFlightOperationKey: String? = null
+
+    private fun newOperationKey(address: String, serviceUuid: String, charUuid: String) =
+        "$address:$serviceUuid:$charUuid".lowercase() + "#" + operationSequence.incrementAndGet()
+
+    /**
+     * Answers the operation in flight with [result], provided it was issued on [charKey]
+     * ("address:service:characteristic", lowercased) and is waiting in [completions].
+     * Anything else (no operation in flight, a callback for another characteristic, a
+     * read's callback while a write is in flight) answers nobody, and the operation in
+     * flight, if any, stays waiting for its own.
+     */
+    private fun <T> answerInFlight(completions: ConcurrentHashMap<String, (Result<T>) -> Unit>, charKey: String, result: Result<T>) {
+        val key = inFlightOperationKey ?: return
+        if (!key.startsWith("$charKey#")) return
+        val completion = completions.remove(key) ?: return
+        inFlightOperationKey = null
+        completion(result)
+    }
 
     private val servicesDiscoveredFor = ConcurrentHashMap.newKeySet<String>()
 
@@ -522,12 +560,14 @@ class OmiBleManager private constructor(private val application: Application) {
             completion(Result.failure(Exception("Not found")))
             return
         }
-        val key = "$addr:$serviceUuid:$charUuid".lowercase()
+        val key = newOperationKey(addr, serviceUuid, charUuid)
         readCompletions[key] = completion
         // Label mirrors NativeBleTransport's own timeout line (`read <service>:<char>`) so a
         // Dart give-up and the native truth about the same operation grep together.
         enqueueCommand("read $serviceUuid:$charUuid") {
+            inFlightOperationKey = key
             if (gatt.readCharacteristic(characteristic) == false) {
+                inFlightOperationKey = null
                 readCompletions.remove(key)?.invoke(Result.failure(Exception("Rejected")))
                 completeCommand()
             }
@@ -546,10 +586,11 @@ class OmiBleManager private constructor(private val application: Application) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
-        val key = "$addr:$serviceUuid:$charUuid".lowercase()
+        val key = newOperationKey(addr, serviceUuid, charUuid)
         if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) writeCompletions[key] = completion
 
         enqueueCommand("write $serviceUuid:$charUuid") {
+            if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) inFlightOperationKey = key
             val result = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
                 val r = gatt.writeCharacteristic(characteristic, data, writeType)
                 if (r != BluetoothStatusCodes.SUCCESS) Log.e(TAG, "writeCharacteristic returned $r for $key")
@@ -561,6 +602,7 @@ class OmiBleManager private constructor(private val application: Application) {
                 if (gatt.writeCharacteristic(characteristic)) BluetoothStatusCodes.SUCCESS else BluetoothStatusCodes.ERROR_UNKNOWN
             }
             if (result != BluetoothStatusCodes.SUCCESS) {
+                inFlightOperationKey = null
                 writeCompletions.remove(key)?.invoke(Result.failure(Exception("Rejected: $result")))
                 completeCommand()
             } else if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
@@ -771,10 +813,6 @@ class OmiBleManager private constructor(private val application: Application) {
     // both run there); cleared by [resetCommandPipeline], which discards the command.
     private var keepAliveQueued = false
 
-    // The beat is the operation in flight, so the next onCharacteristicWrite is its own.
-    // Written on main, read on the binder thread that delivers the callback.
-    @Volatile private var keepAliveInFlight = false
-
     private fun sendStorageKeepAliveNoResponse(address: String) {
         val addr = address.uppercase()
         val gatt = connectedGatts[addr] ?: return
@@ -791,7 +829,6 @@ class OmiBleManager private constructor(private val application: Application) {
                 return@enqueueCommand
             }
             val data = ByteArray(1) { 0x32 }
-            keepAliveInFlight = true
             val accepted = try {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeCharacteristic(characteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
@@ -810,11 +847,9 @@ class OmiBleManager private constructor(private val application: Application) {
             }
             // Accepted, it completes on its own onCharacteristicWrite, like every write:
             // Android reports a write-without-response there too, and holds the next
-            // operation off as busy until it has.
-            if (!accepted) {
-                keepAliveInFlight = false
-                completeCommand()
-            }
+            // operation off as busy until it has. It registers no completion and sets no
+            // in-flight operation key, so that callback answers nobody.
+            if (!accepted) completeCommand()
         }
     }
 
@@ -937,10 +972,11 @@ class OmiBleManager private constructor(private val application: Application) {
         gattQueue.peek()?.let { mainHandler.removeCallbacks(it.run) }
         gattQueue.clear()
         isProcessingCommand = false
+        // The operation in flight went with the queue; a late callback must not answer it.
+        inFlightOperationKey = null
         // A beat discarded with the queue must not leave the ticker believing one is still
         // waiting, or no keep-alive is ever sent on the next link.
         keepAliveQueued = false
-        keepAliveInFlight = false
     }
 
     @Synchronized fun enqueueCommand(label: String, command: Runnable) {
@@ -1116,9 +1152,9 @@ class OmiBleManager private constructor(private val application: Application) {
         }
         override fun onCharacteristicRead(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
             if (connectedGatts[gatt.device.address.uppercase()] !== gatt) return
-            val key = "${gatt.device.address.uppercase()}:${char.service.uuid}:${char.uuid}".lowercase()
+            val charKey = "${gatt.device.address.uppercase()}:${char.service.uuid}:${char.uuid}".lowercase()
             val res = if (status == BluetoothGatt.GATT_SUCCESS) Result.success(value) else Result.failure(Exception("Error $status"))
-            readCompletions.remove(key)?.invoke(res)
+            answerInFlight(readCompletions, charKey, res)
             completeCommand()
         }
         @Suppress("DEPRECATION") override fun onCharacteristicRead(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, status: Int) {
@@ -1126,19 +1162,12 @@ class OmiBleManager private constructor(private val application: Application) {
         }
         override fun onCharacteristicWrite(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, status: Int) {
             if (connectedGatts[gatt.device.address.uppercase()] !== gatt) return
-            // The queue has one operation in flight, so while that is the keep-alive this
-            // callback is the keep-alive's. It has no completion of its own, and a Dart write
-            // to the same characteristic queued behind it has already registered one under
-            // this key — the generic path below would report that write done before it was
-            // even sent.
-            if (keepAliveInFlight) {
-                keepAliveInFlight = false
-                completeCommand()
-                return
-            }
-            val key = "${gatt.device.address.uppercase()}:${char.service.uuid}:${char.uuid}".lowercase()
+            // Answers only the with-response write in flight. While the keep-alive is in
+            // flight no operation key is, so its callback cannot report a Dart write to the
+            // same characteristic, queued behind it, as done before that write was sent.
+            val charKey = "${gatt.device.address.uppercase()}:${char.service.uuid}:${char.uuid}".lowercase()
             val res = if (status == BluetoothGatt.GATT_SUCCESS) Result.success(Unit) else Result.failure(Exception("Error $status"))
-            writeCompletions.remove(key)?.invoke(res)
+            answerInFlight(writeCompletions, charKey, res)
             completeCommand()
         }
         override fun onDescriptorWrite(gatt: BluetoothGatt, desc: BluetoothGattDescriptor, status: Int) {
