@@ -2629,7 +2629,7 @@ class VadAudioProcessor {
     // the stitch can only join WAV to WAV, and a recording encoded straight to .m4a here
     // could never be joined onto the draft its conversation started in, so a conversation
     // that ran across a sync came back as two recordings. A draft is not stamped:
-    // _finalizeDraft converts it when it is closed.
+    // _finalizeDraft stamps it when it is closed, and the same pass converts it.
     return await _saveWav(refs, dateFolderPath, timestamp,
         prefix: prefix, suffix: suffix, capEnded: capEnded, m4aPending: _audioSaveFormat == 'm4a' && !isDraft);
   }

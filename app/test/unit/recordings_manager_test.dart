@@ -1,3 +1,4 @@
+import 'dart:async';
 import "dart:convert";
 import "dart:typed_data";
 import 'dart:io';
@@ -2474,9 +2475,52 @@ void main() {
 
         expect(audioOnDisk(), [p.basename(m4aOf(draft).path)], reason: 'one recording, not split at the sync');
       });
+
+      // Encoding a long backlog takes minutes. It used to hold the archive edit queue the
+      // whole time, so a delete, crop or priority change waited for all of it.
+      test('a delete while the run is encoding is not held up by it, and nothing of the recording is left', () async {
+        final wav = writeRecording(binTs * 1000 - 86400000, 2000, pending: true); // finished by an earlier run
+        final encoding = Completer<void>();
+        final release = Completer<void>();
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+          const MethodChannel('me.memrii.app/aacEncoder'),
+          (call) async {
+            final args = call.arguments as Map;
+            switch (call.method) {
+              case 'startEncoder':
+                outputs['held'] = args['outputPath'] as String;
+                fed['held'] = BytesBuilder();
+                return 'held';
+              case 'encodeBuffer':
+                fed['held']!.add(args['pcmBytes'] as Uint8List);
+                return null;
+              case 'finishEncoder':
+                if (!encoding.isCompleted) encoding.complete();
+                await release.future; // still encoding a long recording
+                File(outputs['held']!).writeAsBytesSync([...'M4A'.codeUnits, ...fed['held']!.toBytes()]);
+                return null;
+            }
+            return null;
+          },
+        );
+
+        final run = RecordingsManager().processAll([await stoppedBin()], (_, __) {});
+        try {
+          await encoding.future;
+          await RecordingsManager.deleteConversations([Conversation.fromFile(wav)])
+              .timeout(const Duration(seconds: 10), onTimeout: () => fail('the delete waited for the encoding'));
+        } finally {
+          release.complete();
+          await run;
+        }
+
+        expect(wav.existsSync(), isFalse);
+        expect(m4aOf(wav).existsSync(), isFalse, reason: 'the encoded copy of a deleted recording is dropped');
+        expect(File(wav.path.replaceAll('.wav', '.tmp.m4a')).existsSync(), isFalse);
+      });
     });
 
-    test('a draft whose conversion fails at close is marked, so a later run converts it', () async {
+    test('a closed draft whose conversion fails stays marked, so a later run converts it', () async {
       final draft = writeRecording(t0, 2000, isDraft: true);
       writeRecording(t0 + 2000 + 600000, 1000); // closes the draft by the gap
       failAfterBytes = 0;
