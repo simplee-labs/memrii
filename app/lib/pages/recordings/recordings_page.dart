@@ -1236,7 +1236,9 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
                 ),
                 VadFallbackBanner(active: _prefs.lastVadFallbackActive),
                 PhoneStorageBanner(
-                  active: _prefs.processingPausedForStorage,
+                  // Only while audio is still waiting: once it is deleted or set aside the
+                  // banner goes now, not when the next run clears the pause.
+                  active: _prefs.processingPausedForStorage && controller.unprocessedBinCount > 0,
                   waitingMinutes: _prefs.processingPausedMinutes,
                 ),
                 _buildSetAsideBanner(),

@@ -682,7 +682,11 @@ class RecordingsManager {
     notifyRecordingsChanged();
   }
 
-  static void _resumeAfterStorage() {
+  /// No audio is waiting for space: the latest run fit it all, or there was nothing
+  /// left to process. The pause describes the most recent attempt, so every path that
+  /// finds nothing to decode clears it too — otherwise audio deleted or set aside while
+  /// it waited left the banner and the notification line up for good.
+  static void clearStoragePause() {
     final prefs = SharedPreferencesUtil();
     if (!prefs.processingPausedForStorage) return;
     prefs.processingPausedForStorage = false;
@@ -965,7 +969,10 @@ class RecordingsManager {
     var activeBatches = batches.where((b) => b.rawSegments.isNotEmpty).toList();
     final hasDrafts = batches.any((b) => b.draftRecordings.isNotEmpty);
 
-    if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) return;
+    if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) {
+      clearStoragePause();
+      return;
+    }
     if (_isProcessingAny && !processingReserved) throw Exception("Another processing task is already in progress.");
 
     _isProcessingAny = true;
@@ -984,10 +991,12 @@ class RecordingsManager {
       // waiting loses nothing. Unknown free space (no platform answer) decodes it all
       // and leaves a full disk to the save path, which now stops the run cleanly.
       final freeBytes = await freeDiskBytes();
-      if (freeBytes != null) {
+      if (freeBytes == null) {
+        clearStoragePause(); // decoding it all, so nothing is held back for space
+      } else {
         final fit = fitToFreeSpace(activeBatches, freeBytes);
         if (fit.waitingBytes == 0) {
-          _resumeAfterStorage();
+          clearStoragePause();
         } else {
           _pauseForStorage(fit.waitingBytes);
           if (fit.keptBytes == 0) {
@@ -2967,6 +2976,7 @@ class RecordingsManager {
           }).toList();
     final activeBatches = processableBatches.where((b) => b.rawSegments.isNotEmpty).toList();
     if (activeBatches.isEmpty) {
+      clearStoragePause();
       // Nothing new to decode, but this connect may have brought the anchor that places
       // recordings an earlier run filed before any anchor existed — the case where the
       // first connect's diagnostics read lost the race to its own sync. processAll runs
@@ -3037,6 +3047,7 @@ class RecordingsManager {
     final activeBatches =
         candidateBatches.where((b) => b.rawSegments.isNotEmpty || b.draftRecordings.isNotEmpty).toList();
     if (activeBatches.isEmpty) {
+      clearStoragePause();
       Logger.debug('RecordingsManager: forceProcessAll — nothing to process '
           '(reprocessCovered=$reprocessCovered; covered bins skipped)');
       return;

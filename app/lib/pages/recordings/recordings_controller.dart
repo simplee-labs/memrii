@@ -1481,6 +1481,10 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       }
     }
 
+    // Taken before the drain below, which removes the backlog's bins from this run
+    // whether or not its own runs found room for them.
+    final nothingToDecode = processableBatches.every((b) => b.rawSegments.isEmpty);
+
     // Drain any pre-mode-switch backlogs with the settings that were live when
     // they were recorded, and take those bins out of this run so only
     // current-mode audio is processed below. Returns the batches unchanged when
@@ -1493,6 +1497,9 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     final hasMarkers = processableBatches.any((b) => b.markerTimestamps.isNotEmpty);
 
     if (activeBatches.isEmpty && !(_isForcePipeline && hasDrafts) && !hasMarkers) {
+      // Nothing waits for space when nothing waits at all — e.g. the waiting audio was
+      // deleted. The runs that do decode settle the pause themselves.
+      if (nothingToDecode) RecordingsManager.clearStoragePause();
       await _finishPipelineRun();
       return;
     }

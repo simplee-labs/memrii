@@ -3328,6 +3328,43 @@ void main() {
         expect(only.bin.existsSync(), isTrue);
         expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
       });
+
+      // The pause describes the latest attempt. Audio deleted while it waited left the
+      // banner and the notification line up for good, since no later run had anything to
+      // fit and none cleared it.
+      for (final background in [false, true]) {
+        test('once the waiting audio is deleted, the next ${background ? 'background ' : ''}run clears the pause',
+            () async {
+          final only = await bin(1789000000);
+          RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+          await RecordingsManager().processAll([only.batch], (_, __) {});
+          expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+
+          final day = (await RecordingsManager().getBatches())
+              .firstWhere((b) => b.rawSegments.any((f) => p.equals(f.path, only.bin.path)));
+          await RecordingsManager().deleteDay(day);
+          if (background) {
+            await RecordingsManager.processAllCompletedSessions();
+          } else {
+            await RecordingsManager().processAll(await RecordingsManager().getBatches(), (_, __) {});
+          }
+
+          expect(SharedPreferencesUtil().processingPausedForStorage, isFalse);
+          expect(SharedPreferencesUtil().processingPausedMinutes, 0);
+        });
+      }
+
+      test('a run that cannot tell free space decodes it all and clears the pause', () async {
+        final only = await bin(1789000000);
+        RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+        await RecordingsManager().processAll([only.batch], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+
+        RecordingsManager.freeDiskBytes = () async => null;
+        await RecordingsManager().processAll([only.batch], (_, __) {});
+        expect(audioOnDisk(), isNotEmpty);
+        expect(SharedPreferencesUtil().processingPausedForStorage, isFalse);
+      });
     });
 
     group('an automatic run waits for an older file of the boot', () {
