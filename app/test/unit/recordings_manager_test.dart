@@ -3543,6 +3543,32 @@ void main() {
         expect(otherDay.bin.existsSync(), isTrue);
         expect(await RecordingsManager.coveredBinPaths([otherDay.bin]), isEmpty);
       });
+
+      // A run took its bin list, then spent a while on checks before claiming processing.
+      // A Delete Day in that window did not wait for it, and the run went on with the list
+      // it already had: it rebuilt the deleted day, or failed on a bin the delete removed.
+      test('Delete Day landing while a run is starting keeps that run from bringing the day back', () async {
+        final today = await bin(1789000000);
+        final reached = Completer<void>();
+        final gate = Completer<void>();
+        RecordingsManager.heldBackBinResolverForTest = () async {
+          reached.complete();
+          await gate.future; // past its first checks, not yet claiming processing
+          return const {};
+        };
+
+        final run = RecordingsManager().processAll([today.batch], (_, __) {}, backgroundMode: true);
+        await reached.future;
+        expect(RecordingsManager.isProcessingAny, isFalse, reason: 'so the delete does not wait for it');
+        final day = (await RecordingsManager().getBatches())
+            .firstWhere((b) => b.rawSegments.any((f) => p.equals(f.path, today.bin.path)));
+        await RecordingsManager().deleteDay(day);
+        gate.complete();
+        await run;
+
+        expect(audioOnDisk(), isEmpty, reason: 'the deleted day did not come back');
+        expect(today.bin.existsSync(), isFalse);
+      });
     });
   });
 

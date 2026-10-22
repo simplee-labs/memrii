@@ -721,6 +721,22 @@ class RecordingsManager {
     }).toList();
   }
 
+  /// [batches] without the raw segments no longer on disk — deleted since the caller
+  /// listed them.
+  static List<Batch> _withoutMissingBins(List<Batch> batches) => batches.map((b) {
+        final present = b.rawSegments.where((f) => f.existsSync()).toList();
+        if (present.length == b.rawSegments.length) return b;
+        return Batch(
+          dateString: b.dateString,
+          date: b.date,
+          rawSegments: present,
+          draftRecordings: b.draftRecordings,
+          finalizedRecordings: b.finalizedRecordings,
+          markerTimestamps: b.markerTimestamps,
+          discards: b.discards,
+        );
+      }).toList();
+
   /// Deletes 0-byte raw bins and strips them from [batches].
   ///
   /// The local file is created before the first byte arrives (see
@@ -981,6 +997,20 @@ class RecordingsManager {
     SharedPreferencesUtil().extractionInProgress = true;
 
     try {
+      // Everything above ran before this run claimed processing, so a Delete Day could
+      // have started meanwhile without waiting for it. Let any edit already in the queue
+      // finish, then take out what it deleted, and any bin gone from disk since the caller
+      // listed it. A Delete Day that starts from here on sees the claim and waits for the
+      // run instead (see deleteDay).
+      await _archiveEditQueue;
+      activeBatches = _withoutMissingBins(stripBinsByRelPath(activeBatches, await deletedRelBins()))
+          .where((b) => b.rawSegments.isNotEmpty)
+          .toList();
+      if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) {
+        clearStoragePause();
+        return;
+      }
+
       await _waitForRetention();
       final directory = await getApplicationDocumentsDirectory();
       await _snapshotBeforeRun(directory.path);
@@ -1102,8 +1132,10 @@ class RecordingsManager {
         }
       }
 
-      // Combine segments from all batches, sorted chronologically by timestamp.
-      final allSegments = activeBatches.expand((b) => b.rawSegments).toList();
+      // Combine segments from all batches, sorted chronologically by timestamp. Only those
+      // still on disk: a bin deleted since the check after the claim would otherwise throw
+      // in the size and time lookups below and fail the run before it starts.
+      final allSegments = activeBatches.expand((b) => b.rawSegments).where((f) => f.existsSync()).toList();
 
       if (allSegments.isNotEmpty) {
         // Chronological, and NUMERICALLY so — the processor reads this list as one
@@ -3719,8 +3751,20 @@ class RecordingsManager {
   Future<void> deleteDay(Batch batch) async {
     // A run decodes from a list it took at its start, so the day's audio could come
     // back as recordings while it runs. Wait for it, then work from a fresh listing.
-    await _waitForProcessingIdle();
-    await _editArchive(() => _deleteDayHeld(batch));
+    // Checked again inside the queue slot, since a run can claim processing after the
+    // wait and before the slot starts; the slot is then given back rather than held
+    // while waiting, because a run that has claimed processing waits for the queue.
+    // A run that starts while the delete holds the slot waits for it, and drops what it
+    // deleted (see _processAll).
+    while (true) {
+      await _waitForProcessingIdle();
+      final deleted = await _editArchive(() async {
+        if (_isProcessingAny) return false;
+        await _deleteDayHeld(batch);
+        return true;
+      });
+      if (deleted) return;
+    }
   }
 
   static Future<void> _waitForProcessingIdle() async {
