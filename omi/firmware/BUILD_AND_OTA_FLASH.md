@@ -362,14 +362,14 @@ CONFIG_BOOTLOADER_MCUBOOT=y               # Use MCUboot
 **Last Updated**: October 2026
 **SDK Version**: nRF Connect SDK 2.9.0  
 **Target Hardware**: Omi Consumer (nRF5340)  
-**Firmware Version**: `memrii-fw-3.2.1` — the current value is `CONFIG_BT_DIS_FW_REV_STR` in
+**Firmware Version**: `memrii-fw-3.2.0` — the current value is `CONFIG_BT_DIS_FW_REV_STR` in
 [`omi/omi.conf`](omi/omi.conf), which is the string the app reads over DIS. Check there
 rather than trusting this line.
 
 ## Signing, image version and factory recovery
 
 The advertised revision (`CONFIG_BT_DIS_FW_REV_STR`, currently
-`memrii-fw-3.2.1`) is a DIS/product version, not MCUboot's anti-downgrade
+`memrii-fw-3.2.0`) is a DIS/product version, not MCUboot's anti-downgrade
 image version. Current signing leaves the image version unset (`0.0.0+0`);
 the build enables `CONFIG_MCUBOOT_DOWNGRADE_PREVENTION=y`.
 Introducing a nonzero image version can be a one-way compatibility change:

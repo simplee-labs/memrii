@@ -1,6 +1,6 @@
 # Changelog
 
-Recent app and firmware releases are listed by patch version. Older releases remain grouped by minor version; those sections reflect the **net** behavior at the end of each series.
+Recent app releases are listed by patch version. Older app and firmware releases remain grouped by minor version; those sections reflect the **net** behavior at the end of each series.
 
 ## App
 
@@ -15,7 +15,7 @@ Recent app and firmware releases are listed by patch version. Older releases rem
 - **Only a full phone shows "Phone storage full".** Errors that mean something else on Android are no longer taken for a full phone, and a used-up storage quota is recognized as one.
 - **No more false "no reply" timeouts from the Omi.** Two requests sent back to back to the same part of the Omi now each get their own reply. Before, the first reply could be taken as the second request's, and the first request was reported as unanswered after 10 seconds even though it had gone through. That could make a working connection look stuck, skip a sync, or leave a Device Settings value unread.
 - **Firmware updates are less likely to fail as they start.** During an update the app now stops sending its own requests to the Omi, and before the update begins it waits for any already sent to be answered. An update that fails before any firmware has been sent is retried once automatically. Before, an update started while Device Settings was still loading could fail within seconds, with nothing installed.
-- **Firmware unchanged:** memrii-fw-3.2.1. This app also works with memrii-fw-3.2.0.
+- **Firmware unchanged:** memrii-fw-3.2.0.
 
 ### memrii 0.2.5 (build 16)
 
@@ -29,7 +29,7 @@ Recent app and firmware releases are listed by patch version. Older releases rem
 - **Syncing resumes after a phone restart or an app update without opening memrii.** The sync alarm is now set whether or not memrii's background service is running, and set again when the phone restarts or the app updates.
 - **Sync progress and recording details survive a crash.** The app now saves its files so that a crash or forced close partway through a save can't leave one half-written. Before, that could cause repeat downloads, duplicate recordings or lost recording details, or hold up automatic processing.
 - **HeyPocket uploads no longer hang.** An upload that makes no progress for 60 seconds, or gets no reply within five minutes of finishing, now fails and is retried later. Before, a dropped connection could leave an upload waiting forever and hold up the HeyPocket uploads behind it. Uploads that are slow but still moving are not cut off.
-- **Firmware:** memrii-fw-3.2.1, which corrects the free space the Omi reports while an older recording is waiting to sync (see Firmware). This app also works with memrii-fw-3.2.0.
+- **Firmware unchanged:** memrii-fw-3.2.0.
 
 ### memrii 0.2.4 (build 15)
 
@@ -563,10 +563,6 @@ Recent app and firmware releases are listed by patch version. Older releases rem
 ---
 
 ## Firmware
-
-### memrii-fw-3.2.1
-
-- **Fix: the Omi's free space read too low while an older recording was waiting to sync.** The Omi reuses its card starting from the oldest recording. While that recording hadn't been downloaded yet, everything recorded after it counted as used, including recordings the app had already synced and removed. Storage Free Space in Device Settings therefore showed less than the Omi really had, and its "% full" figure read high. Free space now means the card's capacity minus the audio the app hasn't synced yet. Space already synced counts as free, which matches what the Omi does: when it needs room, it reuses that space, dropping the oldest waiting recording first. When recordings sync in order, as they normally do, the number is unchanged. Nothing changes over Bluetooth, so any app version shows the corrected number.
 
 ### memrii-fw-3.2
 
