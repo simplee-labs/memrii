@@ -111,7 +111,13 @@ class HeyPocketService {
 
       Timer? watchdog;
       var stalled = false;
+      // Set once the request has ended either way. The file pipe outlives a send that
+      // throws, and its last chunk or its completion would otherwise arm a new watchdog
+      // after the finally below cancelled the old one: a timer holding the client and
+      // the file for up to uploadResponseLimit, only to close a client already closed.
+      var ended = false;
       void armWatchdog(Duration limit) {
+        if (ended) return;
         watchdog?.cancel();
         watchdog = Timer(limit, () {
           stalled = true;
@@ -144,6 +150,7 @@ class HeyPocketService {
         }
         rethrow;
       } finally {
+        ended = true;
         watchdog?.cancel();
         client.close();
       }

@@ -21,7 +21,27 @@ class SetAsideBin {
 
   final int atMs;
 
-  const SetAsideBin({required this.relBin, required this.build, required this.automatic, required this.atMs});
+  /// Byte offset in the bin where the audio no recording holds begins, from the last
+  /// failure inside it; null when that failure could not say. A retry decodes the bin
+  /// from here and saves what it finds as recordings of their own.
+  final int? startByte;
+
+  /// When the audio at [startByte] was recorded (epoch ms), for the retried recording's
+  /// start time; null when [startByte] is the bin's head, which the bin's name dates.
+  final int? startMs;
+
+  /// A newer build than [build] is to retry it once, on the next processing run.
+  final bool retryPending;
+
+  const SetAsideBin({
+    required this.relBin,
+    required this.build,
+    required this.automatic,
+    required this.atMs,
+    this.startByte,
+    this.startMs,
+    this.retryPending = false,
+  });
 
   /// When the bin's audio starts, from its `<timerStart>_<sessionId>.bin` name. Null
   /// for a pre-time-sync bin, whose key is device uptime rather than a time of day.
@@ -31,7 +51,25 @@ class SetAsideBin {
     return DateTime.fromMillisecondsSinceEpoch(timerStart * 1000);
   }
 
-  Map<String, dynamic> toJson() => {'bin': relBin, 'build': build, 'auto': automatic, 'atMs': atMs};
+  SetAsideBin copyWith({String? build, bool? retryPending}) => SetAsideBin(
+        relBin: relBin,
+        build: build ?? this.build,
+        automatic: automatic,
+        atMs: atMs,
+        startByte: startByte,
+        startMs: startMs,
+        retryPending: retryPending ?? this.retryPending,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'bin': relBin,
+        'build': build,
+        'auto': automatic,
+        'atMs': atMs,
+        if (startByte != null) 'startByte': startByte,
+        if (startMs != null) 'startMs': startMs,
+        if (retryPending) 'retry': true,
+      };
 
   static SetAsideBin? fromJson(Object? json) {
     if (json is! Map) return null;
@@ -42,6 +80,9 @@ class SetAsideBin {
       build: json['build'] is String ? json['build'] as String : '',
       automatic: json['auto'] == true,
       atMs: json['atMs'] is int ? json['atMs'] as int : 0,
+      startByte: json['startByte'] is int ? json['startByte'] as int : null,
+      startMs: json['startMs'] is int ? json['startMs'] as int : null,
+      retryPending: json['retry'] == true,
     );
   }
 }
@@ -50,12 +91,19 @@ class SetAsideBin {
 /// and out of every processing run, so one bad file cannot hold back every recording
 /// after it.
 ///
-/// Nothing here moves, renames or deletes a bin unless the user asks. The bin stays at
-/// the path every reference names; prune never touches it, because no recording names
-/// it. A new app build retries it once, since a file that fails every time most likely
-/// needs a code fix. At most one bin is set aside automatically per build: a second
-/// failing file means processing itself is broken, not the file, so processing stops
-/// there and the recordings page asks instead.
+/// Nothing here moves, renames or deletes a bin; the user's Delete goes through
+/// `RecordingsManager.deleteSetAsideBin`. The bin stays at the path every reference
+/// names, and the prune keeps it while it is set aside: a recording saved earlier in the
+/// run that failed can name it, although the rest of it was never saved.
+///
+/// Try again, and the one retry each newer build gives it, run
+/// `RecordingsManager.retrySetAsideBin`: the bin is decoded from where its unsaved audio
+/// begins ([SetAsideBin.startByte]) and saved as recordings of their own, never joined
+/// onto one already saved. It stays set aside until that succeeds.
+///
+/// At most one bin is set aside automatically per build: a second failing file means
+/// processing itself is broken, not the file, so processing stops there and the
+/// recordings page asks instead.
 ///
 /// Storage failures never count — they are the phone's state, not the file's (see
 /// [SharedPreferencesUtil.processingPausedForStorage]).
@@ -84,12 +132,19 @@ class SetAsideBins {
     }
   }
 
+  static SetAsideBin? entryFor(String relBin) {
+    for (final e in list()) {
+      if (e.relBin == relBin) return e;
+    }
+    return null;
+  }
+
   static Set<String> relBins() => list().map((e) => e.relBin).toSet();
 
   static void _save(List<SetAsideBin> entries) =>
       SharedPreferencesUtil().setAsideBins = entries.isEmpty ? '' : jsonEncode(entries.map((e) => e.toJson()).toList());
 
-  static ({String relBin, int count})? _failure() {
+  static ({String relBin, int count, int? startByte, int? startMs})? _failure() {
     final raw = SharedPreferencesUtil().processingFailure;
     if (raw.isEmpty) return null;
     try {
@@ -97,11 +152,26 @@ class SetAsideBins {
       final bin = json['bin'];
       final count = json['count'];
       if (bin is! String || count is! int) return null;
-      return (relBin: bin, count: count);
+      final startByte = json['startByte'];
+      final startMs = json['startMs'];
+      return (
+        relBin: bin,
+        count: count,
+        startByte: startByte is int ? startByte : null,
+        startMs: startMs is int ? startMs : null,
+      );
     } catch (_) {
       return null;
     }
   }
+
+  static void _saveFailure(String relBin, int count, int? startByte, int? startMs) =>
+      SharedPreferencesUtil().processingFailure = jsonEncode({
+        'bin': relBin,
+        'count': count,
+        if (startByte != null) 'startByte': startByte,
+        if (startMs != null) 'startMs': startMs,
+      });
 
   static void _clearFailureFor(String relBin) {
     if (_failure()?.relBin == relBin) SharedPreferencesUtil().processingFailure = '';
@@ -116,12 +186,14 @@ class SetAsideBins {
     return relBins().contains(failure.relBin) ? null : failure.relBin;
   }
 
-  /// A processing run failed inside [relBin] for a reason other than storage.
-  static Future<void> recordFailure(String relBin) async {
+  /// A processing run failed inside [relBin] for a reason other than storage. [startByte]
+  /// and [startMs] say where in it the audio no recording holds begins (see
+  /// [SetAsideBin.startByte]); the latest failure's are kept.
+  static Future<void> recordFailure(String relBin, {int? startByte, int? startMs}) async {
     final previous = _failure();
     final count = previous?.relBin == relBin ? previous!.count + 1 : 1;
     if (count < strikes) {
-      SharedPreferencesUtil().processingFailure = jsonEncode({'bin': relBin, 'count': count});
+      _saveFailure(relBin, count, startByte, startMs);
       Logger.error('SetAsideBins: processing failed inside $relBin ($count/$strikes runs in a row)');
       return;
     }
@@ -129,14 +201,21 @@ class SetAsideBins {
     final entries = list();
     if (entries.any((e) => e.relBin == relBin)) return;
     if (entries.any((e) => e.automatic && e.build == build)) {
-      SharedPreferencesUtil().processingFailure = jsonEncode({'bin': relBin, 'count': count});
+      _saveFailure(relBin, count, startByte, startMs);
       Logger.error('SetAsideBins: $relBin failed $count runs in a row, and this build already set a file '
           'aside — processing stays stopped here until Try again or Skip');
       return;
     }
     _save([
       ...entries,
-      SetAsideBin(relBin: relBin, build: build, automatic: true, atMs: DateTime.now().millisecondsSinceEpoch),
+      SetAsideBin(
+        relBin: relBin,
+        build: build,
+        automatic: true,
+        atMs: DateTime.now().millisecondsSinceEpoch,
+        startByte: startByte,
+        startMs: startMs,
+      ),
     ]);
     SharedPreferencesUtil().processingFailure = '';
     Logger.error('SetAsideBins: set $relBin aside after $count failed runs — kept on disk, skipped by processing');
@@ -150,21 +229,31 @@ class SetAsideBins {
   }
 
   /// Skip, from the recordings page: set [relBin] aside without spending the
-  /// automatic cap.
+  /// automatic cap. Where its unsaved audio begins comes from its last failure.
   static Future<void> skip(String relBin) async {
     final entries = list();
     if (!entries.any((e) => e.relBin == relBin)) {
+      final failure = _failure();
+      final own = failure?.relBin == relBin ? failure : null;
       _save([
         ...entries,
         SetAsideBin(
-            relBin: relBin, build: await currentBuild(), automatic: false, atMs: DateTime.now().millisecondsSinceEpoch),
+          relBin: relBin,
+          build: await currentBuild(),
+          automatic: false,
+          atMs: DateTime.now().millisecondsSinceEpoch,
+          startByte: own?.startByte,
+          startMs: own?.startMs,
+        ),
       ]);
     }
     _clearFailureFor(relBin);
   }
 
-  /// Try again: the next processing run decodes [relBin], with a fresh count of
-  /// [strikes] failures before it is set aside again.
+  /// Takes [relBin] out of the set-aside list, with its failure count. For a bin still
+  /// stuck (never set aside), the next run decodes it again, with a fresh count of
+  /// [strikes] failures; a set-aside bin is released only once
+  /// `RecordingsManager.retrySetAsideBin` has saved its audio, or when it is deleted.
   static void release(String relBin) {
     final entries = list();
     final kept = entries.where((e) => e.relBin != relBin).toList();
@@ -172,30 +261,28 @@ class SetAsideBins {
     _clearFailureFor(relBin);
   }
 
-  /// Delete, from the recordings page: the raw file goes, and with it the entry.
-  static Future<void> delete(String relBin) async {
-    final file = await fileFor(relBin);
-    try {
-      if (await file.exists()) await file.delete();
-    } on FileSystemException catch (e) {
-      Logger.error('SetAsideBins: could not delete $relBin: $e');
-      rethrow;
-    }
-    release(relBin);
+  /// A retry of [relBin] failed: it stays set aside, now on this build's account, so
+  /// it is not retried again until a newer one.
+  static Future<void> retryFailed(String relBin) async {
+    final build = await currentBuild();
+    _save([for (final e in list()) e.relBin == relBin ? e.copyWith(build: build, retryPending: false) : e]);
+    _clearFailureFor(relBin);
   }
 
-  /// Startup: a build other than the one that set a bin aside gets one more try at it.
+  /// Startup: a build other than the one that set a bin aside gets one more try at it,
+  /// on the next processing run (see `RecordingsManager.retryPendingSetAsideBins`). The
+  /// bin stays set aside, and protected, until that try saves its audio.
   static Future<void> releaseAfterUpdate() async {
     final entries = list();
     if (entries.isEmpty) return;
     final build = await currentBuild();
-    final kept = entries.where((e) => e.build == build).toList();
-    if (kept.length == entries.length) return;
-    for (final e in entries.where((e) => e.build != build)) {
+    final due = entries.where((e) => e.build != build && !e.retryPending).toList();
+    if (due.isEmpty) return;
+    for (final e in due) {
       _clearFailureFor(e.relBin);
     }
-    _save(kept);
-    Logger.info('SetAsideBins: build $build retries ${entries.length - kept.length} set-aside bin(s)');
+    _save([for (final e in entries) due.contains(e) ? e.copyWith(retryPending: true) : e]);
+    Logger.info('SetAsideBins: build $build retries ${due.length} set-aside bin(s) on the next processing run');
   }
 
   static Future<File> fileFor(String relBin) async {

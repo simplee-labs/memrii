@@ -278,8 +278,13 @@ class IntegrationCoordinator extends ChangeNotifier {
     super.dispose();
   }
 
-  // Moved from RecordingsController; delivery/retention guards are unchanged.
-  Future<void> _convertToPassthrough(Conversation conversation) async {
+  // Moved from RecordingsController; delivery/retention guards are unchanged. Runs in the
+  // archive edit queue, as every other writer of a recording's .meta does: written beside
+  // one of them (a priority change, a clock correction, M4A conversion) the meta could tear.
+  Future<void> _convertToPassthrough(Conversation conversation) =>
+      RecordingsManager.editArchive(() => _convertToPassthroughQueued(conversation));
+
+  Future<void> _convertToPassthroughQueued(Conversation conversation) async {
     try {
       final filePath = conversation.file.path;
       final fileDir = conversation.file.parent.path;

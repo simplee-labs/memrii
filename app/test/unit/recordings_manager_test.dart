@@ -1920,17 +1920,22 @@ void main() {
       expect(next.lengthSync(), 44 + nextMs * 32, reason: 'and nothing was prepended to it');
     });
 
-    // Out-of-order audio: the draft is older audio that arrived late, and the recording
-    // after it was finished by an earlier run — the user may already have seen it.
-    test('joining onto a recording that was already finished leaves a one-time notice', () async {
+    // A draft an interrupted run left on disk, then the recording that run went on to
+    // finish. That recording may already have been seen, played or uploaded, so it is left
+    // as it is and the draft is finished on its own: the conversation stays split where
+    // the run was cut short. It used to be folded in, with a one-time notice.
+    test('a recording finished before this run is never joined onto a draft, even an interrupted run\'s', () async {
       SharedPreferencesUtil().lateMergeNotices = const [];
-      await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true);
+      final draft = await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true);
       final next = await writeStitchable(startMs: nextStart, durationMs: nextMs);
 
       await RecordingsManager().stitchDraftRecordingsForTest();
 
-      expect(next.existsSync(), isFalse, reason: 'folded into the draft');
-      expect(SharedPreferencesUtil().lateMergeNotices, ['$nextStart:$draftStart']);
+      expect(draft.existsSync(), isFalse, reason: 'not left in progress');
+      expect(File(draft.path.replaceAll('_draft.wav', '.wav')).existsSync(), isTrue, reason: 'finished on its own');
+      expect(next.existsSync(), isTrue);
+      expect(next.lengthSync(), 44 + nextMs * 32, reason: 'the saved recording is left exactly as it was');
+      expect(SharedPreferencesUtil().lateMergeNotices, isEmpty, reason: 'nothing changed that needs telling');
     });
 
     // The everyday cross-sync join: the recording after the draft was created by this
@@ -1999,19 +2004,6 @@ void main() {
       expect(lateMeta[418] & 0x01, 0, reason: 'a recording follows the late part, so it carries no bolt');
     });
 
-    // A draft already on disk meets a finished recording only when the previous run
-    // died between moving its recordings and stitching them. That run would have kept
-    // joining, so the resumed one must too.
-    test('a draft that was already on disk keeps joining, as the interrupted run would have', () async {
-      final draft = await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true);
-      final next = await writeStitchable(startMs: nextStart, durationMs: nextMs);
-
-      await RecordingsManager().stitchDraftRecordingsForTest();
-
-      expect(next.existsSync(), isFalse, reason: 'joined');
-      expect(draft.existsSync(), isTrue, reason: 'and left open, exactly as before the late-merge close existed');
-    });
-
     // The mode stamp is written ONCE, by VadAudioProcessor._saveMetadata, and then
     // has to survive every later rewrite of the .meta it shares a byte with. Both
     // rewrites are read-modify-write and both were checked by inspection; these pin
@@ -2035,9 +2027,11 @@ void main() {
       // is labelled with the mode it started in), and the OR must not clobber it.
       final draft =
           await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true, recordedManual: true);
-      await writeStitchable(startMs: nextStart, durationMs: nextMs, hardEnd: true, recordedManual: false);
 
-      await RecordingsManager().stitchDraftRecordingsForTest();
+      // Created by this run, as the only recording a draft takes in.
+      await RecordingsManager().stitchDraftRecordingsForTest(
+        duringRun: () => writeStitchable(startMs: nextStart, durationMs: nextMs, hardEnd: true, recordedManual: false),
+      );
 
       // The carried hardEnd then closes the draft in the same pass, so the meta to
       // inspect is the promoted one — which means this covers BOTH rewrites: the
@@ -2097,11 +2091,14 @@ void main() {
       // not START at a boundary), and must inherit its hardEnd, or the next pass would
       // append straight across the boundary it just swallowed.
       final draft = await writeStitchable(startMs: draftStart, durationMs: draftMs, isDraft: true);
-      await writeStitchable(startMs: nextStart, durationMs: nextMs, hardEnd: true);
-      // What arrives after the boundary, in a later run, unstamped.
+      // What arrives after the boundary, unstamped.
       final after = await writeStitchable(startMs: nextStart + nextMs, durationMs: 2000);
 
-      await RecordingsManager().stitchDraftRecordingsForTest();
+      // The recording the boundary closed, created by this run, as the only recording a
+      // draft takes in.
+      await RecordingsManager().stitchDraftRecordingsForTest(
+        duringRun: () => writeStitchable(startMs: nextStart, durationMs: nextMs, hardEnd: true),
+      );
 
       expect(after.existsSync(), isTrue, reason: 'never folded in — the draft now ends at the boundary');
       final finalized = File(draft.path.replaceAll('_draft.wav', '.wav'));
@@ -2319,6 +2316,35 @@ void main() {
 
       expect(m4aOf(late).existsSync(), isTrue, reason: 'finished on its own, as M4A');
       expect(earlier.readAsBytesSync(), earlierBytes, reason: 'an .m4a cannot be joined; it is untouched');
+    });
+
+    // Closing a draft only renames it and marks it; the mark lives in the fourth flag byte.
+    // A draft whose meta had three, or no meta at all, used to stay WAV for good.
+    test('a draft whose meta has only three flag bytes is still converted', () async {
+      final draft = writeRecording(t0, 2000, isDraft: true);
+      final metaFile = File(draft.path.replaceAll('_draft.wav', '_draft.meta'));
+      final bytes = metaFile.readAsBytesSync();
+      metaFile.writeAsBytesSync(bytes.sublist(0, bytes.length - 1)); // an older build's three
+
+      await RecordingsManager().stitchDraftRecordingsForTest(finalizeAll: true);
+
+      final m4a = m4aOf(draft);
+      expect(m4a.existsSync(), isTrue);
+      expect(File(draft.path.replaceAll('_draft.wav', '.wav')).existsSync(), isFalse);
+      final meta = metaOf(m4a);
+      expect(meta.length, 417 + meta[416] + 4, reason: 'one byte added, and no more');
+      expect(RecordingsManager.metaM4aPending(meta), isFalse, reason: 'cleared once converted');
+      expect(ByteData.sublistView(meta).getUint32(4, Endian.little), 2000);
+    });
+
+    test('a draft with no meta is encoded as it is closed', () async {
+      final draft = writeRecording(t0, 2000, isDraft: true);
+      File(draft.path.replaceAll('_draft.wav', '_draft.meta')).deleteSync();
+
+      await RecordingsManager().stitchDraftRecordingsForTest(finalizeAll: true);
+
+      expect(m4aOf(draft).existsSync(), isTrue);
+      expect(File(draft.path.replaceAll('_draft.wav', '.wav')).existsSync(), isFalse);
     });
 
     test('conversion moves the markers, keeps the upload key and clears the bit', () async {
@@ -3315,11 +3341,15 @@ void main() {
       });
 
       test('on a full phone pauses processing instead of blaming the bin', () async {
+        final decoded = await writeBin(timerStartSec: 1789000000, sessionId: 1, durationSec: 60);
+        final failedIn = await writeBin(timerStartSec: 1789000600, sessionId: 1, durationSec: 4 * 60 - 1);
+        final after = await writeBin(timerStartSec: 1789001200, sessionId: 1, durationSec: 60);
         await RecordingsManager.recordRunFailureForTest(
-            {'phase': 'segment', 'bin': '/docs/raw_segments/100/100_1.bin', 'storageFull': true}, checkpoint(),
-            waitingRawBytes: 4050 * 60 * 5);
+            {'phase': 'segment', 'bin': failedIn.path, 'storageFull': true}, checkpoint(),
+            runBins: [decoded, failedIn, after]);
         expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
-        expect(SharedPreferencesUtil().processingPausedMinutes, 5);
+        expect(SharedPreferencesUtil().processingPausedMinutes, 5,
+            reason: 'the bin it failed inside and the one after it; not the one already decoded');
         expect(SharedPreferencesUtil().processingFailure, isEmpty);
       });
     });
@@ -3409,6 +3439,55 @@ void main() {
         });
       }
 
+      // The pause was one flag every run set or cleared for its own bins, so a run over a
+      // few of them (Recover Discard, a mode-switch backlog pass) spoke for all of them.
+      test('a run over other bins that fit leaves the waiting backlog\'s pause as it was', () async {
+        final backlog = await bin(1789000000);
+        RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+        await RecordingsManager().processAll([backlog.batch], (_, __) {});
+        final minutes = SharedPreferencesUtil().processingPausedMinutes;
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+
+        final small = await bin(1789003600);
+        RecordingsManager.freeDiskBytes = () async => 10 * 1024 * 1024 * 1024;
+        await RecordingsManager().processAll([small.batch], (_, __) {});
+
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue, reason: 'the backlog still waits');
+        expect(SharedPreferencesUtil().processingPausedMinutes, minutes);
+      });
+
+      test('a run short of space adds its waiting audio to what already waits', () async {
+        final first = await writeBin(timerStartSec: 1789000000, sessionId: 1, durationSec: 5 * 60 - 1);
+        final second = await writeBin(timerStartSec: 1789003600, sessionId: 1, durationSec: 3 * 60 - 1);
+        Batch batchOf(File f) => Batch(
+              dateString: coverageDateOf(1789000000 * 1000),
+              date: DateTime.fromMillisecondsSinceEpoch(1789000000 * 1000),
+              rawSegments: [f],
+              draftRecordings: const [],
+              finalizedRecordings: const [],
+              markerTimestamps: const [],
+              discards: const [],
+            );
+        RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+        await RecordingsManager().processAll([batchOf(first)], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedMinutes, 5);
+
+        await RecordingsManager().processAll([batchOf(second)], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedMinutes, 8, reason: 'not just the last run\'s three');
+      });
+
+      test('a waiting bin set aside or gone takes the pause with it, with no run needed', () async {
+        final only = await bin(1789000000);
+        RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
+        await RecordingsManager().processAll([only.batch], (_, __) {});
+        expect(SharedPreferencesUtil().processingPausedForStorage, isTrue);
+
+        only.bin.deleteSync();
+        await RecordingsManager.refreshStoragePause();
+        expect(SharedPreferencesUtil().processingPausedForStorage, isFalse);
+        expect(SharedPreferencesUtil().processingPausedMinutes, 0);
+      });
+
       test('a run that cannot tell free space decodes it all and clears the pause', () async {
         final only = await bin(1789000000);
         RecordingsManager.freeDiskBytes = () async => headroom ~/ 2;
@@ -3451,6 +3530,94 @@ void main() {
         await RecordingsManager().processAll([newer.batch], (_, __) {}, backgroundMode: true);
         expect(audioOnDisk(), isEmpty);
         expect(newer.bin.existsSync(), isTrue);
+      });
+    });
+
+    // Try again on a set-aside bin. A run saved a recording reaching into the bin, then
+    // failed saving the rest; set aside, the bin reads as decoded, since that recording
+    // names it. The retry decodes it from where the unsaved audio begins and saves that
+    // as a recording of its own.
+    group('Try again on a set-aside bin', () {
+      const ts = 1789000000;
+      const rel = '$ts/${ts}_1.bin';
+      const frameBytes = 8; // the bin() helper's frames: a 4-byte length and 4 bytes
+      const savedMs = ts * 1000;
+
+      List<String> recordingsOnDisk() {
+        final root = Directory(p.join(tempDir.path, 'recordings'));
+        if (!root.existsSync()) return const [];
+        return root
+            .listSync(recursive: true)
+            .whereType<File>()
+            .map((f) => p.basename(f.path))
+            .where((n) => n.endsWith('.wav') || n.endsWith('.m4a'))
+            .toList()
+          ..sort();
+      }
+
+      Future<void> setAside({int? startByte, int? startMs}) async {
+        for (var i = 0; i < SetAsideBins.strikes; i++) {
+          await SetAsideBins.recordFailure(rel, startByte: startByte, startMs: startMs);
+        }
+        expect(SetAsideBins.relBins(), {rel});
+      }
+
+      test('saves the unsaved rest as a recording of its own, and leaves the checkpoint alone', () async {
+        final raw = (await bin(ts, frames: 100)).bin;
+        await writeRecordingWithBins(startMs: savedMs, durationMs: 1000, relativeBins: [rel]);
+        const startByte = 36 + 60 * frameBytes;
+        const unsavedMs = savedMs + 1200;
+        await setAside(startByte: startByte, startMs: unsavedMs);
+        // A regular run's, which a retry must neither resume, nor overwrite, nor delete.
+        checkpoint().writeAsStringSync('{"version": $checkpointVersion, "mark": "regular"}');
+
+        expect(await RecordingsManager.retrySetAsideBin(rel), SetAsideRetry.recovered);
+
+        final recordings = recordingsOnDisk();
+        expect(recordings, hasLength(2), reason: 'the saved one, and the rest as its own');
+        expect(recordings.where((n) => n.contains('_draft')), isEmpty, reason: 'never left to be joined');
+        expect(recordings, contains('recording_$savedMs.wav'), reason: 'the saved one is left as it was');
+        expect(recordings, contains('recording_$unsavedMs.wav'), reason: 'dated where the unsaved audio began');
+        expect(SetAsideBins.relBins(), isEmpty);
+        expect(checkpoint().readAsStringSync(), contains('"mark": "regular"'));
+        expect(raw.existsSync(), isFalse, reason: 'all of it is saved now, so it goes like any other bin');
+      });
+
+      test('with no known start, a bin a saved recording names stays set aside', () async {
+        final raw = (await bin(ts)).bin;
+        await writeRecordingWithBins(startMs: savedMs, durationMs: 1000, relativeBins: [rel]);
+        await setAside();
+
+        expect(await RecordingsManager.retrySetAsideBin(rel), SetAsideRetry.cannotRetry,
+            reason: 'decoding all of it would duplicate the saved recording');
+        expect(SetAsideBins.relBins(), {rel});
+        expect(raw.existsSync(), isTrue);
+        expect(recordingsOnDisk(), ['recording_$savedMs.wav']);
+      });
+
+      test('with no known start, a bin no recording names is decoded whole', () async {
+        await bin(ts);
+        await setAside();
+
+        expect(await RecordingsManager.retrySetAsideBin(rel), SetAsideRetry.recovered);
+        expect(recordingsOnDisk(), hasLength(1));
+        expect(SetAsideBins.relBins(), isEmpty);
+      });
+
+      test('a newer build\'s retry runs before the next background run', () async {
+        await bin(ts);
+        await writeRecordingWithBins(startMs: savedMs, durationMs: 1000, relativeBins: [rel]);
+        await setAside(startByte: 36 + 30 * frameBytes, startMs: savedMs + 600);
+        final build = SetAsideBins.currentBuild;
+        addTearDown(() => SetAsideBins.currentBuild = build);
+        SetAsideBins.currentBuild = () async => 'newer';
+        await SetAsideBins.releaseAfterUpdate();
+        expect(SetAsideBins.list().single.retryPending, isTrue);
+
+        await RecordingsManager.processAllCompletedSessions();
+
+        expect(SetAsideBins.relBins(), isEmpty);
+        expect(recordingsOnDisk(), hasLength(2));
       });
     });
 
@@ -3536,6 +3703,76 @@ void main() {
         expect(raw.existsSync(), isTrue, reason: 'the draft still names it');
         expect(await RecordingsManager.deletedRelBins(), {rel},
             reason: 'the deleted recording stays deleted; only the entry whose bin is gone was forgotten');
+      });
+
+      // A recording from before metas listed their bins keeps the bins its window covers out
+      // of processing. Deleted, it named no bins, its window went with it, and the next run
+      // decoded them again: the recording came back.
+      test('deleting a recording with no bin list keeps the bins its window covered from coming back', () async {
+        final recStartMs = DateTime.utc(2026, 5, 27, 10).millisecondsSinceEpoch;
+        await writeRecording(startMs: recStartMs, durationMs: 4 * 60 * 1000, capEnded: false);
+        final covered = await writeBin(timerStartSec: recStartMs ~/ 1000, sessionId: 42, durationSec: 200);
+        final elsewhere = await writeBin(timerStartSec: recStartMs ~/ 1000 + 3600, sessionId: 42, durationSec: 60);
+        expect(await RecordingsManager.coveredBinPaths([covered]), {covered.path});
+
+        final legacy = (await RecordingsManager().getBatches()).expand((b) => b.finalizedRecordings).single;
+        await RecordingsManager.deleteConversations([legacy]);
+
+        expect(covered.existsSync(), isFalse, reason: 'its audio is the deleted recording');
+        expect(elsewhere.existsSync(), isTrue, reason: 'outside its window, so not its audio');
+        expect(await RecordingsManager.coveredBinPaths([elsewhere]), isEmpty);
+      });
+
+      // A run that saved a recording reaching into its last bin, then failed saving the rest,
+      // charges that bin; set aside, it is named by a finished recording and so read as
+      // consumed. Once the kept checkpoint was gone the prune deleted it — the unsaved rest
+      // with it — while the set-aside list still offered to share it.
+      test('a set-aside bin a finished recording names is kept by the prune', () async {
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await writeRecordingWithBins(startMs: ts * 1000, durationMs: 30000, relativeBins: [rel]);
+        await SetAsideBins.skip(rel);
+
+        expect(await RecordingsManager.pruneConsumedBins(), 0);
+        expect(raw.existsSync(), isTrue);
+
+        await RecordingsManager.deleteSetAsideBin(rel);
+        expect(raw.existsSync(), isFalse, reason: 'until the user deletes it');
+      });
+
+      // Delete on a set-aside bin used to remove the file on the spot, outside the prune and
+      // its protections, with a run possibly decoding it.
+      test('Delete on a set-aside bin goes through the prune, and nothing decodes it again', () async {
+        final setAside = await bin(1789000000);
+        const setAsideRel = '1789000000/1789000000_1.bin';
+        await SetAsideBins.skip(setAsideRel);
+
+        await RecordingsManager.deleteSetAsideBin(setAsideRel);
+
+        expect(setAside.bin.existsSync(), isFalse);
+        expect(SetAsideBins.relBins(), isEmpty);
+        expect(await RecordingsManager.deletedRelBins(), isEmpty, reason: 'gone, so forgotten');
+      });
+
+      test('a set-aside bin the checkpoint still names is deleted only once it no longer does', () async {
+        final raw = await writeBin(timerStartSec: ts, sessionId: 5, durationSec: 60);
+        await SetAsideBins.skip(rel);
+        checkpoint().writeAsStringSync(jsonEncode({
+          'version': checkpointVersion,
+          'state': {
+            'refs': [
+              {'t': 'f', 'p': raw.path, 'o': 36, 'l': 4},
+            ],
+          },
+        }));
+
+        await RecordingsManager.deleteSetAsideBin(rel);
+        expect(raw.existsSync(), isTrue, reason: 'the kept checkpoint still buffers part of it');
+        expect(SetAsideBins.relBins(), isEmpty);
+        expect(await RecordingsManager.deletedRelBins(), {rel}, reason: 'so no run decodes it meanwhile');
+
+        checkpoint().deleteSync();
+        await RecordingsManager.pruneConsumedBins();
+        expect(raw.existsSync(), isFalse);
       });
 
       test('Delete Day takes the day\'s waiting audio too, but no other day\'s', () async {

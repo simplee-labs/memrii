@@ -58,6 +58,10 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   // integrity gap. The firmware may still be streaming the old file, so no new read may
   // start this cycle. Set and cleared by _readStorageBytesToFileLockedNative.
   bool _stopFailedAfterIntegrityGap = false;
+  // The last native read ended on an integrity gap at the same offset as the one before
+  // it. Only such a gap counts against the file: one lost packet is the link's doing.
+  // Set and cleared by _readStorageBytesToFileLockedNative.
+  bool _integrityGapRepeated = false;
   // Absolute path of the .bin the native downloader is currently writing, or null
   // between transfers. Exposed (statted fresh) via [activeTransferBytesOnDisk] so
   // the stall watchdog sees real intra-file progress under background throttling.
@@ -130,6 +134,17 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   // since only a complete download may delete it there.
   static const Duration heldBackGiveUpAfter = Duration(minutes: 75);
   static const int heldBackGiveUpFailures = 3;
+
+  /// Whether processing has stopped waiting for [w] (see [heldBackGiveUpAfter]). Such a
+  /// file is still retried every sync, but it no longer makes a sync partial: its audio is
+  /// no longer held for, so nothing a sync could finish depends on it, and counting it kept
+  /// every sync "Partial" and Force Sync out of force mode for as long as it stayed stuck.
+  /// It is reported on its own instead ([SharedPreferencesUtil.lastSyncStuckFiles]).
+  static bool givenUpOn(Wal w, int nowMs) {
+    final failingSince = w.failingSinceMs;
+    return w.syncFailCount >= heldBackGiveUpFailures ||
+        (failingSince != null && nowMs - failingSince >= heldBackGiveUpAfter.inMilliseconds);
+  }
 
   // Files failing back to back in one cycle before the cycle stops. One bad file is
   // skipped; several in a row say the device or link is unwell, and the next cycle is
@@ -420,11 +435,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     final oldestWaiting = <int, int>{};
     for (final w in byPath.values) {
       if (w.storage != WalStorage.sdcard || w.status == WalStatus.synced) continue;
-      final failingSince = w.failingSinceMs;
-      if (w.syncFailCount >= heldBackGiveUpFailures ||
-          (failingSince != null && nowMs - failingSince >= heldBackGiveUpAfter.inMilliseconds)) {
-        continue;
-      }
+      if (givenUpOn(w, nowMs)) continue;
       final session = w.sessionId ?? 0;
       final current = oldestWaiting[session];
       if (current == null || w.timerStart < current) oldestWaiting[session] = w.timerStart;
@@ -513,22 +524,23 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   ///
   /// Each delete is addressed at the file's current index ([_currentIndex]) and recorded
   /// in [deletedListIndices], so the downloads that follow address theirs correctly too.
-  /// A delete that keeps failing costs nothing else: the file holds its own place, and
-  /// every other file is read at its own index.
   ///
-  /// Returns false while any of them is still on the device: the card is not drained,
-  /// so the cycle is partial.
-  Future<bool> _retryPendingDeletesLocked(
+  /// `allDeleted` is false while any of them is still on the device: the card is not
+  /// drained, so the cycle is partial. `uncertain` is true when a delete failed: one whose
+  /// reply was lost may still have taken, which moves every later file down a place, so
+  /// the indices no longer say where the files are. The caller lists again.
+  Future<({bool allDeleted, bool uncertain})> _retryPendingDeletesLocked(
       DeviceConnection connection, String deviceId, List<int> deletedListIndices) async {
     final pending = _wals.where((w) => w.storage == WalStorage.sdcard && w.status == WalStatus.synced).toList()
       ..sort((a, b) => a.fileNum.compareTo(b.fileNum));
-    if (pending.isEmpty) return true;
+    if (pending.isEmpty) return (allDeleted: true, uncertain: false);
 
     Logger.warning('SDCardWalSync: ${pending.length} file(s) already received in full are still on the device '
         '(a previous delete did not take) — retrying their deletion before syncing');
 
     bool allDeleted = true;
     bool anyDeleted = false;
+    bool uncertain = false;
     for (final wal in pending) {
       if (_isCancelled || !await connection.isConnected()) {
         allDeleted = false;
@@ -545,12 +557,13 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       } catch (e) {
         Logger.error('SDCardWalSync: delete retry still failing for ts=${wal.timerStart}: $e');
         allDeleted = false;
+        uncertain = true;
       }
     }
     if (anyDeleted) {
       await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
     }
-    return allDeleted;
+    return (allDeleted: allDeleted, uncertain: uncertain);
   }
 
   /// Where [wal] sits in the device's file list now: its index in this session's
@@ -571,10 +584,24 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     wal.failingSinceMs ??= DateTime.now().millisecondsSinceEpoch;
   }
 
+  /// The storage reading the current sync took, if any. See [_syncAllLocked].
+  StorageFileStats? _lastStorageStats;
+
+  /// How much more the Omi can record, in minutes, before it overwrites audio not yet
+  /// synced; -1 when [stats] cannot say. Only the ring backend (1) overwrites — keep-
+  /// newest, from the oldest end — and its free space is exactly the room before it
+  /// does: synced audio behind an older unsynced file is not reusable until that file
+  /// goes. Opus on the card averages about 4 050 B/s while recording.
+  static int overwriteMinutesLeft(StorageFileStats? stats) {
+    if (stats == null || stats.storageBackend != 1) return -1;
+    return stats.freeBytes ~/ (4050 * 60);
+  }
+
   Future<void> _updateStorageStatsLocked(DeviceConnection connection) async {
     try {
       final stats = await connection.getStorageFileStats();
       if (stats != null) {
+        _lastStorageStats = stats;
         listener.onStorageStatsUpdated(stats);
       }
     } catch (e) {
@@ -1214,6 +1241,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
 
     _activeDownloadPath = outputPath;
     _stopFailedAfterIntegrityGap = false;
+    _integrityGapRepeated = false;
     try {
       await hostApi.downloadStorageFile(
         _device!.id,
@@ -1237,6 +1265,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         } catch (_) {}
         final gapOffset = safeOffset;
         final realign = _realignRepeatedIntegrityGap(wal, gapOffset);
+        _integrityGapRepeated = realign.repeated;
         safeOffset = realign.resume;
         _lastSegmentBoundaryOffset = safeOffset;
         onProgress?.call(safeOffset);
@@ -1559,6 +1588,31 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     ({List<Wal> wals, bool complete})? prefetchedWals,
     IWalSyncProgressListener? progress,
   }) async {
+    _lastStorageStats = null;
+    final result = await _syncAllFilesLocked(connection, deviceId, prefetchedWals: prefetchedWals, progress: progress);
+    if (result != null) {
+      // Files processing has stopped waiting for, which no longer make a sync partial
+      // (see [givenUpOn]), are shown on their own in the idle notification and on the
+      // recordings page, with how much more the Omi can record before it overwrites
+      // them: only a complete download deletes them, so that is the one way they end.
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final stuck = _wals
+          .where((w) => w.storage == WalStorage.sdcard && w.status == WalStatus.miss && givenUpOn(w, nowMs))
+          .length;
+      if (stuck > 0 && _lastStorageStats == null) await _updateStorageStatsLocked(connection);
+      final prefs = SharedPreferencesUtil();
+      prefs.lastSyncStuckFiles = stuck;
+      prefs.lastSyncStuckOverwriteMinutes = stuck > 0 ? overwriteMinutesLeft(_lastStorageStats) : -1;
+    }
+    return result;
+  }
+
+  Future<SyncLocalFilesResponse?> _syncAllFilesLocked(
+    DeviceConnection connection,
+    String deviceId, {
+    ({List<Wal> wals, bool complete})? prefetchedWals,
+    IWalSyncProgressListener? progress,
+  }) async {
     final listed = prefetchedWals ?? await _getMissingWalsLocked(connection, deviceId);
     // No answer means we do not know what the device holds — which is NOT the same
     // as it holding nothing. Reporting the empty response here is what let a failed
@@ -1581,7 +1635,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     // the caller must not finalize drafts whose tail may sit in a bin this listing
     // never named. The files it DID name are still synced; the rest come back in
     // the next listing, which is how a backlog past one packet drains.
-    final bool listingIncomplete = !listed.complete;
+    bool listingIncomplete = !listed.complete;
     listener.onWalUpdated();
 
     if (_isCancelled) return null;
@@ -1594,7 +1648,27 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     // listing (see the `synced` carry in _buildWalsFromFilesLocked). This has to run
     // BEFORE the `miss` filter and its empty-list early return below, or a card holding
     // nothing but already-synced files would never be drained again.
-    final bool receivedAllDeleted = await _retryPendingDeletesLocked(connection, deviceId, deletedListIndices);
+    final retried = await _retryPendingDeletesLocked(connection, deviceId, deletedListIndices);
+    bool receivedAllDeleted = retried.allDeleted;
+    if (retried.uncertain && !_isCancelled) {
+      // A failed delete may have taken anyway, and then every index after it is one too
+      // high. Listing again says where each file is now: a file whose delete did take is
+      // gone from it, and one whose delete did not is carried as `synced` again, for the
+      // next sync to retry. Deletes are not retried a second time in this cycle.
+      Logger.warning('SDCardWalSync: a retried delete failed and may still have taken — listing again before '
+          'reading by index');
+      final relisted = await _getMissingWalsLocked(connection, deviceId);
+      if (relisted == null) {
+        Logger.warning('SDCardWalSync: the second listing went unanswered — ending this cycle');
+        await _updateStorageStatsLocked(connection);
+        return SyncLocalFilesResponse(newConversationIds: [], updatedConversationIds: [], isPartial: true);
+      }
+      _wals = relisted.wals;
+      listingIncomplete = !relisted.complete;
+      deletedListIndices.clear();
+      receivedAllDeleted = !_wals.any((w) => w.storage == WalStorage.sdcard && w.status == WalStatus.synced);
+      listener.onWalUpdated();
+    }
     final bool cardNotDrained = listingIncomplete || !receivedAllDeleted;
 
     // The firmware sorts files ascending by timestamp: index 0 = oldest completed
@@ -1767,7 +1841,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
           wal.status = WalStatus.miss;
           wal.isSyncing = false;
           listener.onWalUpdated();
-          anyPartial = true;
+          if (!givenUpOn(wal, DateTime.now().millisecondsSinceEpoch)) anyPartial = true;
           failuresInARow++;
           Logger.error('SDCardWalSync: incomplete transfer for ts=${wal.timerStart} '
               '(${wal.walOffset}/${wal.storageTotalBytes} B, strike ${wal.syncFailCount}) — kept on the device '
@@ -1817,8 +1891,16 @@ class SDCardWalSyncImpl implements SDCardWalSync {
           // the file — and by then processing has pruned the local bin, so the resume
           // rewinds to 0 and the audio is decoded twice.
           await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
-          // Nothing to re-address: the file keeps its place, so every later file keeps
-          // the index _currentIndex gives it.
+          // A delete whose reply was lost may still have taken, and then every later file
+          // sits one place lower than _currentIndex says. Older firmware reads whatever is
+          // at the index it is given, so reading on could fetch one file's bytes into
+          // another's bin. The rest wait for the next sync, which lists them afresh.
+          final remaining = wals.length - i - 1;
+          if (remaining > 0) {
+            Logger.warning('SDCardWalSync: ending this cycle after a failed delete — $remaining file(s) wait for '
+                'the next sync');
+          }
+          break;
         }
 
         final double fileDone = ((i + 1.0) / wals.length).clamp(0.0, 1.0);
@@ -1832,9 +1914,9 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         wal.status = WalStatus.miss;
         wal.isSyncing = false;
         listener.onWalUpdated();
-        anyPartial = true;
 
         if (_isCancelled) {
+          anyPartial = true;
           await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
           break;
         }
@@ -1848,6 +1930,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
           // measured median reconnection was 8.2 s, against ~33 minutes until the next
           // scheduled sync.
           Logger.debug('SDCardWalSync: Connection lost after failure, aborting syncAll');
+          anyPartial = true;
           await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
           break;
         }
@@ -1856,6 +1939,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         // _isCancelled during the delay / isConnected() window. A cancellation is not
         // the file's fault, so it must not count against it.
         if (_isCancelled) {
+          anyPartial = true;
           await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
           break;
         }
@@ -1889,6 +1973,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
                 'recycling connection, not charging file ts=${wal.timerStart}');
             unawaited(recycle());
           }
+          anyPartial = true;
           await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
           break;
         }
@@ -1897,7 +1982,20 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         // stall that outlasted the retries above, a read that would not start. The file
         // stays on the device and is retried next sync (a repeated gap resumes realigned,
         // see _realignRepeatedIntegrityGap), and the batch moves on to the next file.
-        _countFailedAttempt(wal, madeProgress: _lastSegmentBoundaryOffset > initialOffset);
+        //
+        // Except a gap that did not repeat: one lost packet is the link's doing (a weak
+        // background link loses them anywhere), and charging it started the clock that lets
+        // processing stop waiting for the file — splitting a conversation over link noise.
+        // A gap lost again at the same place is the file's: it is what realigning is for,
+        // and if that does not get past it, processing must not wait for it for ever.
+        // Progress still resets the count, as it does for any other failure.
+        final madeProgress = _lastSegmentBoundaryOffset > initialOffset;
+        if (_isStorageIntegrityError(e) && !_integrityGapRepeated) {
+          if (madeProgress) wal.syncFailCount = 0;
+        } else {
+          _countFailedAttempt(wal, madeProgress: madeProgress);
+        }
+        if (!givenUpOn(wal, DateTime.now().millisecondsSinceEpoch)) anyPartial = true;
         failuresInARow++;
         await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
         if (_isStorageIntegrityError(e) && _stopFailedAfterIntegrityGap) {
@@ -1905,6 +2003,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
           // file. A read started now could take those packets for its own.
           Logger.warning('SDCardWalSync: ts=${wal.timerStart} ended on an integrity gap whose STOP failed — '
               'ending this cycle rather than start another read under it');
+          anyPartial = true; // the files after it were not read
           break;
         }
         Logger.warning('SDCardWalSync: ts=${wal.timerStart} stays on the device for the next sync '

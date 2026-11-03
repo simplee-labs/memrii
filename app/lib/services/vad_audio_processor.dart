@@ -1968,6 +1968,24 @@ class VadAudioProcessor {
   /// following force-captured audio as ordinary VAD, losing force-capture and
   /// the red marker. Cleared once audio buffers (refs gains a frame) or the
   /// recording saves.
+  /// Where the audio buffered for the open (not yet saved) recording starts: the bin, the
+  /// byte offset of its first frame there, and the recording's start time. Null with
+  /// nothing buffered. The same run after run while that recording stays open — a resumed
+  /// run restores the same refs — so a failure saving it can be counted against one file,
+  /// and a retry can decode that file from exactly where its unsaved audio begins.
+  ({String path, int byteOffset, int? startMs})? get openRecordingStart {
+    for (final r in _currentRefs) {
+      if (r is FrameRef) {
+        return (
+          path: r.segmentFile.path,
+          byteOffset: r.byteOffset,
+          startMs: _recordingStartTime?.millisecondsSinceEpoch,
+        );
+      }
+    }
+    return null;
+  }
+
   bool get hasOpenPriorityWithoutAudio =>
       _inPriorityRecording && _priorityOpenBinPath != null && !_currentRefs.any((r) => r is FrameRef);
 

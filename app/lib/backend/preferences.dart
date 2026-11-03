@@ -311,14 +311,18 @@ class SharedPreferencesUtil {
   // True while processing is held back because the phone is short of space: a run
   // either decoded only the oldest audio that fit or did not start. Raw bins are kept,
   // so nothing is lost; the recordings page and the idle notification say why audio is
-  // waiting. Cleared by the next run that fits everything.
-  // processingPausedMinutes is the audio left waiting (the native notification reads
-  // both as flutter.* keys).
+  // waiting. processingPausedMinutes is the audio left waiting (the native notification
+  // reads both as flutter.* keys). Both are derived from processingWaitingBins by
+  // RecordingsManager.refreshStoragePause and written nowhere else.
   bool get processingPausedForStorage => getBool('processingPausedForStorage', defaultValue: false);
   set processingPausedForStorage(bool v) => saveBool('processingPausedForStorage', v);
 
   int get processingPausedMinutes => getInt('processingPausedMinutes', defaultValue: 0);
   set processingPausedMinutes(int v) => saveInt('processingPausedMinutes', v);
+
+  // The bins runs left waiting for space, as JSON {<raw_segments-relative path>: <raw bytes>}.
+  String get processingWaitingBins => getString('processingWaitingBins');
+  set processingWaitingBins(String v) => saveString('processingWaitingBins', v);
 
   // The raw bin the last failed processing runs stopped inside, as JSON
   // {"bin": <raw_segments-relative path>, "count": <runs in a row>}. See SetAsideBins.
@@ -703,10 +707,10 @@ class SharedPreferencesUtil {
   set pendingRefiles(String v) => saveString('pendingRefiles', v);
 
   /// Recordings the stitcher folded into an earlier draft after they had already been
-  /// finished — a run completing an interrupted run's join — each as
-  /// "<absorbedStartMs>:<mergedStartMs>". The recordings page shows them once, as a
-  /// single message, and clears them. A pref rather than controller state because the
-  /// stitch usually runs in a background sync with no page to show anything on.
+  /// finished, each as "<absorbedStartMs>:<mergedStartMs>". Nothing writes these now —
+  /// a finished recording is never joined onto a draft — but earlier versions did, and
+  /// the recordings page still shows any they left once, as a single message, and clears
+  /// them. A pref because the stitch usually ran in a background sync with no page.
   List<String> get lateMergeNotices => getStringList('lateMergeNotices');
   set lateMergeNotices(List<String> v) => saveStringList('lateMergeNotices', v);
 
@@ -1026,6 +1030,23 @@ class SharedPreferencesUtil {
   bool get lastSyncPartial => getBool('lastSyncPartial', defaultValue: false);
 
   set lastSyncPartial(bool v) => saveBool('lastSyncPartial', v);
+
+  // Files still on the Omi that processing has stopped waiting for after the last sync
+  // that ran: they keep failing, are retried every sync, and no longer make one partial.
+  // Written by SDCardWalSync; the idle notification (Dart and native, as
+  // flutter.lastSyncStuckFiles) shows them in place of "Complete".
+  int get lastSyncStuckFiles => getInt('lastSyncStuckFiles', defaultValue: 0);
+
+  set lastSyncStuckFiles(int v) => saveInt('lastSyncStuckFiles', v);
+
+  // With files stuck: how much more the Omi can record, in minutes, before it starts
+  // overwriting audio not yet synced — oldest first, which a stuck file usually is.
+  // -1 when nothing is stuck or it cannot be told. Written by SDCardWalSync with
+  // lastSyncStuckFiles; read by the recordings page and both idle notifications
+  // (native as flutter.lastSyncStuckOverwriteMinutes).
+  int get lastSyncStuckOverwriteMinutes => getInt('lastSyncStuckOverwriteMinutes', defaultValue: -1);
+
+  set lastSyncStuckOverwriteMinutes(int v) => saveInt('lastSyncStuckOverwriteMinutes', v);
 
   bool get lastSyncSkipped => getBool('lastSyncSkipped', defaultValue: false);
 

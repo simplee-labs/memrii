@@ -134,6 +134,8 @@ class SyncNotification {
         lastStatusMs: prefs.lastSyncStatusMs,
         skipped: prefs.lastSyncSkipped,
         partial: prefs.lastSyncPartial,
+        stuckFiles: prefs.lastSyncStuckFiles,
+        stuckOverwriteMinutes: prefs.lastSyncStuckOverwriteMinutes,
         batteryLevel: prefs.lastBatteryLevel,
         isConnected: isConnected,
         storagePaused: prefs.processingPausedForStorage,
@@ -141,6 +143,10 @@ class SyncNotification {
       ),
     );
   }
+
+  /// How close, in minutes of recording, the Omi has to come to overwriting a stuck
+  /// recording before the idle line warns of it. Mirrored by native.
+  static const int stuckOverwriteWarnMinutes = 24 * 60;
 
   /// The resting line's body text.
   ///
@@ -157,6 +163,8 @@ class SyncNotification {
     bool? isConnected,
     bool storagePaused = false,
     int storageWaitingMinutes = 0,
+    int stuckFiles = 0,
+    int stuckOverwriteMinutes = -1,
   }) {
     // Audio waiting on phone storage outranks the last sync: nothing else will move
     // it, and only the user can make room. Mirrored by native's idleNotificationContent.
@@ -165,9 +173,26 @@ class SyncNotification {
           ? 'Phone storage full • $storageWaitingMinutes min of audio waiting'
           : 'Phone storage full • audio waiting to process';
     }
+    // So does a stuck recording the Omi is close to overwriting: that audio is about to
+    // be lost. Within a day of recording; the recordings page says it from the start.
+    if (stuckFiles > 0 && stuckOverwriteMinutes >= 0 && stuckOverwriteMinutes < stuckOverwriteWarnMinutes) {
+      final what = stuckFiles == 1 ? 'Stuck recording' : '$stuckFiles stuck recordings';
+      final left = stuckOverwriteMinutes < 60
+          ? '${stuckOverwriteMinutes < 1 ? 1 : stuckOverwriteMinutes} min'
+          : '${stuckOverwriteMinutes ~/ 60} h';
+      return '$what on Omi • overwritten after ~$left of recording';
+    }
     if (lastStatusMs > 0) {
       final time = DateFormat('h:mm a').format(DateTime.fromMillisecondsSinceEpoch(lastStatusMs));
-      final status = skipped ? 'Skipped' : (partial ? 'Partial' : 'Complete');
+      // A file that keeps failing no longer makes a sync partial once processing has
+      // stopped waiting for it, so it is named here instead. Mirrored by native.
+      final status = skipped
+          ? 'Skipped'
+          : partial
+              ? 'Partial'
+              : stuckFiles > 0
+                  ? '$stuckFiles ${stuckFiles == 1 ? 'file' : 'files'} stuck'
+                  : 'Complete';
       // A battery reading is only as fresh as the last time the phone actually reached
       // the Omi. A skipped sync never did — out of range, or the device never answered —
       // so the stored percentage is at least one sync interval old, and goes on ageing

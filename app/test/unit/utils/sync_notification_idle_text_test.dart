@@ -17,6 +17,9 @@ void main() {
     bool partial = false,
     int batteryLevel = 87,
     bool? isConnected,
+    int stuckFiles = 0,
+    int stuckOverwriteMinutes = -1,
+    bool storagePaused = false,
   }) =>
       SyncNotification.idleBodyText(
         lastStatusMs: lastStatusMs,
@@ -24,6 +27,9 @@ void main() {
         partial: partial,
         batteryLevel: batteryLevel,
         isConnected: isConnected,
+        stuckFiles: stuckFiles,
+        stuckOverwriteMinutes: stuckOverwriteMinutes,
+        storagePaused: storagePaused,
       );
 
   group('idle body text — battery freshness', () {
@@ -33,6 +39,33 @@ void main() {
 
     test('a partial sync reached the device too', () {
       expect(body(partial: true), 'Last Sync: Partial • $time • 87% Battery');
+    });
+
+    // A file processing stopped waiting for no longer makes a sync partial; it is named
+    // instead, for as long as it stays on the Omi.
+    test('files that keep failing are named in place of Complete, never over Partial or Skipped', () {
+      expect(body(stuckFiles: 1), 'Last Sync: 1 file stuck • $time • 87% Battery');
+      expect(body(stuckFiles: 2), 'Last Sync: 2 files stuck • $time • 87% Battery');
+      expect(body(stuckFiles: 1, partial: true), 'Last Sync: Partial • $time • 87% Battery');
+      expect(body(stuckFiles: 1, skipped: true), 'Last Sync: Skipped • $time');
+    });
+
+    // Only a complete download deletes a stuck recording, so the Omi overwriting it once
+    // it runs out of room is the one way it ends. Within a day of recording of that, the
+    // line says so instead of the last sync.
+    test('a stuck recording the Omi will soon overwrite takes over the line', () {
+      expect(body(stuckFiles: 1, stuckOverwriteMinutes: 5 * 60 + 20),
+          'Stuck recording on Omi • overwritten after ~5 h of recording');
+      expect(body(stuckFiles: 2, stuckOverwriteMinutes: 40),
+          '2 stuck recordings on Omi • overwritten after ~40 min of recording');
+      expect(body(stuckFiles: 1, stuckOverwriteMinutes: 0),
+          'Stuck recording on Omi • overwritten after ~1 min of recording');
+      expect(body(stuckFiles: 1, stuckOverwriteMinutes: SyncNotification.stuckOverwriteWarnMinutes),
+          'Last Sync: 1 file stuck • $time • 87% Battery',
+          reason: 'a day or more away, the last sync keeps the line');
+      expect(body(stuckFiles: 1), 'Last Sync: 1 file stuck • $time • 87% Battery', reason: 'unknown: no claim');
+      expect(body(stuckFiles: 1, stuckOverwriteMinutes: 30, storagePaused: true),
+          'Phone storage full • audio waiting to process');
     });
 
     test('a skipped sync never reached the device — no percentage', () {

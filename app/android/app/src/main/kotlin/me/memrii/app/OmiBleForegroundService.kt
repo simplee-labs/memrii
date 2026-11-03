@@ -1817,6 +1817,8 @@ class OmiBleForegroundService : Service() {
             prefs.getLong("flutter.lastSyncCompletedMs", 0L)
         }
         val text: String
+        val stuckFiles = prefs.getLong("flutter.lastSyncStuckFiles", 0L)
+        val stuckOverwriteMinutes = prefs.getLong("flutter.lastSyncStuckOverwriteMinutes", -1L)
         if (prefs.getBoolean("flutter.processingPausedForStorage", false)) {
             // Same precedence as Dart's idleBodyText: audio waiting on phone storage
             // outranks the last sync, since only the user can make room for it.
@@ -1826,11 +1828,20 @@ class OmiBleForegroundService : Service() {
             } else {
                 "Phone storage full • audio waiting to process"
             }
+        } else if (stuckFiles > 0 && stuckOverwriteMinutes in 0L until 24L * 60) {
+            // Same as Dart's idleBodyText (stuckOverwriteWarnMinutes): a stuck recording
+            // the Omi is within a day of recording of overwriting.
+            val what = if (stuckFiles == 1L) "Stuck recording" else "$stuckFiles stuck recordings"
+            val left = if (stuckOverwriteMinutes < 60) "${maxOf(1L, stuckOverwriteMinutes)} min" else "${stuckOverwriteMinutes / 60} h"
+            text = "$what on Omi • overwritten after ~$left of recording"
         } else if (lastMs > 0) {
             val skipped = prefs.getBoolean("flutter.lastSyncSkipped", false)
+            // Same as Dart's idleBodyText: files processing stopped waiting for no longer
+            // make a sync partial, so they are named in place of "Complete".
             val status = when {
                 skipped -> "Skipped"
                 prefs.getBoolean("flutter.lastSyncPartial", false) -> "Partial"
+                stuckFiles > 0 -> if (stuckFiles == 1L) "1 file stuck" else "$stuckFiles files stuck"
                 else -> "Complete"
             }
             val time = fmt.format(Date(lastMs))

@@ -2539,6 +2539,31 @@ void main() {
     });
   });
 
+  // A failure saving what a run ends with is charged to this bin. The run's last bin,
+  // charged before, changed whenever a sync brought newer audio, so the count of failed
+  // runs kept restarting and the file was never set aside.
+  test('the open recording starts in the same place in the run that resumes it', () async {
+    final processor = VadAudioProcessor.fromSettings(settings: _settings(), outputDir: tempDir.path);
+    expect(processor.openRecordingStart, isNull, reason: 'nothing buffered');
+    final first = _makeBinFile(tempDir, 5, name: 'first.bin');
+    final second = _makeBinFile(tempDir, 5, name: 'second.bin');
+    await processor.processSegmentFile(first, DateTime(2026, 1, 1, 10));
+    await processor.processSegmentFile(second, DateTime(2026, 1, 1, 10, 0, 0, 100));
+    final start = processor.openRecordingStart!;
+    expect(start.path, first.path);
+    expect(start.startMs, isNotNull);
+    final state = (await processor.serializeState())!;
+    await processor.destroy();
+
+    final resumed = VadAudioProcessor.fromSettings(settings: _settings(), outputDir: tempDir.path);
+    await resumed.restoreState(state);
+    final newer = _makeBinFile(tempDir, 5, name: 'newer.bin');
+    await resumed.processSegmentFile(newer, DateTime(2026, 1, 1, 10, 0, 0, 200));
+    expect(resumed.openRecordingStart?.path, first.path, reason: 'newer audio does not move it');
+    expect(resumed.openRecordingStart?.byteOffset, start.byteOffset);
+    await resumed.destroy();
+  });
+
   test('a restored checkpoint drops refs into a bin that is gone, and keeps the rest', () async {
     final processor = VadAudioProcessor.fromSettings(settings: _settings(), outputDir: tempDir.path);
     final kept = _makeBinFile(tempDir, 5, name: 'kept.bin');

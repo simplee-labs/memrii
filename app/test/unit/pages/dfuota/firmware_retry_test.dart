@@ -113,8 +113,12 @@ class _FakeManager implements mcumgr.FirmwareUpdateManager {
 class _FakeFactory implements mcumgr.FirmwareUpdateManagerFactory {
   final managers = <_FakeManager>[];
 
+  /// When set, a manager is created only once this completes.
+  Completer<void>? gate;
+
   @override
   Future<mcumgr.FirmwareUpdateManager> getUpdateManager(String deviceId) async {
+    await gate?.future;
     final manager = _FakeManager();
     managers.add(manager);
     return manager;
@@ -133,6 +137,13 @@ class _HostState extends State<_Host> with FirmwareMixin<_Host> {
 
   @override
   mcumgr.FirmwareUpdateManagerFactory get managerFactory => factory;
+
+  // As the update page does: leaving it ends the update.
+  @override
+  void dispose() {
+    killMcuUpdateManager();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) => const SizedBox.shrink();
@@ -253,5 +264,26 @@ void main() {
     expect(provider.firmwareStateReset, isFalse);
 
     await host.killMcuUpdateManager();
+  });
+
+  // Leaving the page runs its dispose, which kills the manager and gives the link back. An
+  // attempt still waiting then (for the app's requests to be answered, or for its manager)
+  // would start a session nothing ends, on a link the app is using again.
+  testWidgets('leaving the page while an attempt waits starts no session', (tester) async {
+    final host = await pumpHost(tester);
+    final factory = host.factory;
+    final gate = Completer<void>();
+    factory.gate = gate;
+    unawaited(host.runMcuAttempt(btDevice, images));
+    await tester.pump();
+    expect(NativeBleTransport.linkYieldedToFirmwareUpdate, isTrue);
+
+    await tester.pumpWidget(const SizedBox.shrink()); // the page goes
+    gate.complete();
+    await tester.pump();
+
+    expect(factory.managers.single.killed, isTrue);
+    expect(factory.managers.single.updateCalls, 0);
+    expect(NativeBleTransport.linkYieldedToFirmwareUpdate, isFalse);
   });
 }

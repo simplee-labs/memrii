@@ -100,27 +100,45 @@ void main() {
     expect(SetAsideBins.relBins(), isEmpty, reason: 'three more failures before it is set aside again');
   });
 
-  test('a new build retries what an older one set aside, once', () async {
+  // The bin stays set aside, and so protected from the prune, until the retry has saved
+  // its audio (RecordingsManager.retrySetAsideBin).
+  test('a new build owes what an older one set aside one retry, and keeps it set aside meanwhile', () async {
     await failRuns(bad, 3);
     await SetAsideBins.releaseAfterUpdate();
-    expect(SetAsideBins.relBins(), {bad}, reason: 'same build — nothing changed');
+    expect(SetAsideBins.list().single.retryPending, isFalse, reason: 'same build — nothing changed');
 
     build = '16';
     await SetAsideBins.releaseAfterUpdate();
-    expect(SetAsideBins.relBins(), isEmpty);
+    expect(SetAsideBins.relBins(), {bad});
+    expect(SetAsideBins.list().single.retryPending, isTrue);
 
-    await failRuns(bad, 3);
-    expect(SetAsideBins.relBins(), {bad}, reason: 'the new build has its own allowance');
+    await failRuns(other, 3);
+    expect(SetAsideBins.relBins(), {bad, other},
+        reason: 'the owed retry is not this build\'s, so it leaves the new build its own allowance');
+
+    await SetAsideBins.retryFailed(bad);
+    final retried = SetAsideBins.list().firstWhere((e) => e.relBin == bad);
+    expect(retried.retryPending, isFalse, reason: 'not tried again until a newer build');
+    expect(retried.build, '16');
   });
 
-  test('Delete removes the raw file and its entry; nothing else ever deletes it', () async {
-    final file = File('${tempDir.path}/raw_segments/$bad')..createSync(recursive: true);
-    await failRuns(bad, 3);
-    expect(file.existsSync(), isTrue);
+  test('where the unsaved audio begins goes with the bin from its failures to its entry', () async {
+    await SetAsideBins.recordFailure(bad, startByte: 400, startMs: 1789551900000);
+    await SetAsideBins.recordFailure(bad, startByte: 400, startMs: 1789551900000);
+    await SetAsideBins.recordFailure(bad, startByte: 520, startMs: 1789551930000);
+    final entry = SetAsideBins.entryFor(bad)!;
+    expect(entry.startByte, 520, reason: 'the latest failure says');
+    expect(entry.startMs, 1789551930000);
 
-    await SetAsideBins.delete(bad);
-    expect(file.existsSync(), isFalse);
-    expect(SetAsideBins.relBins(), isEmpty);
+    // Through Skip, too, for a bin processing stopped at.
+    await failRuns(other, 2);
+    await SetAsideBins.recordFailure(other, startByte: 64, startMs: 1789552260000);
+    expect(SetAsideBins.stuckBin(), other);
+    await SetAsideBins.skip(other);
+    expect(SetAsideBins.entryFor(other)!.startByte, 64);
+
+    // And through the stored list.
+    expect(SetAsideBin.fromJson(SetAsideBins.entryFor(bad)!.toJson())!.startByte, 520);
   });
 
   test('the start time comes from a wall-clock bin name, not an uptime one', () {

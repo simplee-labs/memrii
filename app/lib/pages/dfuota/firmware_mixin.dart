@@ -673,6 +673,13 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
       Logger.debug('DFU: ${NativeBleTransport.unansweredNativeOps} app Bluetooth requests still unanswered, '
           'starting the update anyway');
     }
+    // That wait can run 10 s. Leaving the page meanwhile ran its dispose, which killed the
+    // manager, gave the link back and reset the update state; a session started now would
+    // have nothing to end it, and would flash over a link the app is using again.
+    if (_dfuAbandoned) {
+      NativeBleTransport.reclaimLinkFromFirmwareUpdate();
+      return;
+    }
     const configuration = mcumgr.FirmwareUpgradeConfiguration(
       estimatedSwapTime: Duration(seconds: 0),
       eraseAppSettings: false,
@@ -687,6 +694,12 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
       _handleDfuFailure('Could not start the update. Please try again.');
       return;
     }
+    // Likewise across the manager's creation: dispose ran before it existed, so this
+    // session is ours to end.
+    if (_dfuAbandoned) {
+      await killMcuUpdateManager();
+      return;
+    }
 
     // Reset the multi-image progress fold for this attempt (a retry re-enters here).
     installImageIndex = 0;
@@ -698,9 +711,9 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
     _dfuLastImageSize = 0;
     installProgress = 0;
     // Repaint on its own: the card is already on screen showing the failed attempt's
-    // percentage, and the first progress event is several seconds away. Deliberately
-    // NOT an early return when unmounted — the flash must proceed exactly as before.
-    if (mounted) setState(() {});
+    // percentage, and the first progress event is several seconds away. Still mounted:
+    // nothing has been awaited since the check above.
+    setState(() {});
 
     try {
       updateManager.setup().listen((state) {
@@ -801,9 +814,13 @@ mixin FirmwareMixin<T extends StatefulWidget> on State<T> {
     await killMcuUpdateManager();
     await Future.delayed(_dfuRetryPause);
     // Left the page meanwhile: its dispose killed the manager and gave the link back.
-    if (!mounted || _dfuTerminated) return;
+    if (_dfuAbandoned) return;
     await runMcuAttempt(btDevice, images);
   }
+
+  /// The page was left (its dispose ended the update) or the update already ended, so an
+  /// attempt that was waiting must not start a session.
+  bool get _dfuAbandoned => !mounted || _dfuTerminated;
 
   Future<void> startLegacyDfu(BtDevice btDevice, {bool fileInAssets = false, String? zipFilePath}) async {
     setState(() {

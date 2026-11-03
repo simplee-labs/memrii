@@ -78,6 +78,10 @@ List<int> globalDeletedTimestamps = [];
 /// Everything else is deleted for real, so the mock's file listing tracks the device's.
 Set<int> globalRejectDeleteTimestamps = {};
 
+/// Timestamps whose CMD_DELETE_FILE takes, but whose reply is lost: the file leaves the
+/// listing, every later file moves down a place, and the app is told it failed.
+Set<int> globalLostDeleteReplyTimestamps = {};
+
 class MockDeviceConnection implements DeviceConnection {
   Future<bool> Function()? onStop;
   bool connected = true;
@@ -159,6 +163,14 @@ class MockDeviceConnection implements DeviceConnection {
   @override
   Future<bool> deleteFile(StorageFile file, {int? timestamp}) async {
     globalDeletedTimestamps.add(file.timestamp);
+    if (globalLostDeleteReplyTimestamps.contains(file.timestamp)) {
+      final kept = files.where((f) => f.timestamp != file.timestamp).toList();
+      files = [
+        for (var i = 0; i < kept.length; i++)
+          StorageFile(index: i, timestamp: kept[i].timestamp, size: kept[i].size, sessionId: kept[i].sessionId),
+      ];
+      return false;
+    }
     return !globalRejectDeleteTimestamps.contains(file.timestamp);
   }
 
@@ -245,11 +257,15 @@ class MockDeviceConnection implements DeviceConnection {
   @override
   Future<bool> isConnected() async => connected;
 
+  /// The storage backend the stats report: null (older firmware), 0 (LittleFS) or 1 (ring).
+  int? storageBackend;
+
   @override
   Future<StorageFileStats?> getStorageFileStats() async => StorageFileStats(
         totalUsedBytes: 0,
         fileCount: files.length,
         freeBytes: 1000000,
+        storageBackend: storageBackend,
       );
 
   @override
@@ -641,9 +657,9 @@ void main() {
       await reconnect();
     }
 
-    Future<void> run(bool batch) async {
+    Future<void> run(bool batch, {bool partial = true}) async {
       if (batch) {
-        expect((await native.syncAll())!.isPartial, isTrue);
+        expect((await native.syncAll())!.isPartial, partial);
       } else {
         final value = (await native.getMissingWals()).first;
         await expectLater(native.syncWal(wal: value),
@@ -657,6 +673,7 @@ void main() {
       recycles = 0;
       globalDeletedTimestamps = [];
       globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {};
       connection = MockDeviceConnection()..files = [StorageFile(index: 0, timestamp: ts, size: 12)];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockDecodedMessageHandler<Object?>(
         channel,
@@ -737,17 +754,25 @@ void main() {
           expect(args[2]! as int, lessThanOrEqualTo(4), reason: 'no seek-ahead retry');
           return gap(args[2]! as int, (args[2]! as int) + 4);
         };
+        // The head reads from 4 and loses the packet there: the first time is the link's
+        // and costs nothing; again at 4, it counts, and the read realigns to 0; at 0 for the
+        // first time, nothing; at 0 again and on, it counts every time.
+        const headStrikes = [4, 5, 5, 6, 7, 8, 9];
         for (int attempt = 0; attempt < 7; attempt++) {
-          await run(batch);
+          // The second file counts from its second attempt and is given up on at three, after
+          // which neither file makes the sync partial: both are named as stuck instead.
+          await run(batch, partial: attempt < 3);
+          if (batch) expect(SharedPreferencesUtil().lastSyncStuckFiles, attempt < 3 ? 1 : 2);
           expect(requests.length, (attempt + 1) * readsPerCycle, reason: 'one failed read per file per cycle');
           expect(stops, (attempt + 1) * readsPerCycle);
           expect(globalDeletedTimestamps, isEmpty);
           final saved = (await WalFileManager.loadWals()).firstWhere((w) => w.timerStart == ts);
           expect(saved.walOffset, lessThanOrEqualTo(4));
           expect(saved.status, WalStatus.miss);
-          // The batch counts a gap that moved nothing forward — it is what lets newer audio
-          // stop waiting for this file — but the count deletes nothing.
-          expect(saved.syncFailCount, batch ? 5 + attempt : 4);
+          // The batch counts a gap lost again at the same place that moved nothing forward —
+          // it is what lets newer audio stop waiting for this file — but the count deletes
+          // nothing.
+          expect(saved.syncFailCount, batch ? headStrikes[attempt] : 4);
           expect(saved.nativeIntegrityVersion, 1);
           final bytes = await bin().readAsBytes();
           expect(bytes.length, greaterThanOrEqualTo(saved.walOffset));
@@ -815,7 +840,7 @@ void main() {
                 timerStart: ts,
                 storage: WalStorage.sdcard,
                 nativeIntegrityVersion: 1,
-                syncFailCount: 2),
+                syncFailCount: 1),
             data.sublist(0, start),
           );
           receiver = (args) async {
@@ -847,9 +872,9 @@ void main() {
           expect(saved.walOffset, lostAt - SDCardWalSyncImpl.integrityRealignBytes,
               reason: 'the same gap again resumes earlier, on different packet boundaries');
           expect(saved.lastIntegrityGapOffset, lostAt);
-          // syncWal leaves the count alone; the batch counts a gap hit again as no progress
-          // (from 880 the first attempt did progress to the gap, and reset it).
-          expect(saved.syncFailCount, batch ? (start == lostAt ? 4 : 1) : 2);
+          // syncWal leaves the count alone. The batch did not count the first gap, but did
+          // reset the count where it made progress (from 880); it counts the gap hit again.
+          expect(saved.syncFailCount, batch ? (start == lostAt ? 2 : 1) : 1);
           expect(globalDeletedTimestamps, isEmpty, reason: 'a gap never deletes the file');
           expect(captureLog().map((e) => e['event']), ['gap', 'realign']);
           expect(captureLog().last['resumeOffset'], lostAt - SDCardWalSyncImpl.integrityRealignBytes);
@@ -1072,6 +1097,40 @@ void main() {
       });
     }
 
+    // A weak background link loses packets anywhere. Charging each one to the file started
+    // the clock that lets processing stop waiting for it, so link noise could split a
+    // conversation. Only the same packet lost again is the file's.
+    test('a lost packet that does not repeat costs the file nothing: no strike, no clock', () async {
+      await seed(wal(version: 1), const []);
+      var lostAt = 4;
+      receiver = (args) async {
+        final offset = args[2]! as int;
+        await File(args[4]! as String)
+            .writeAsBytes(original.sublist(offset, lostAt), mode: offset == 0 ? FileMode.write : FileMode.append);
+        return gap(lostAt, lostAt + 4);
+      };
+      Future<Wal> afterSync() async {
+        expect((await native.syncAll())!.isPartial, isTrue);
+        final saved = (await WalFileManager.loadWals()).single;
+        await reconnect();
+        return saved;
+      }
+
+      var saved = await afterSync();
+      expect(saved.syncFailCount, 0);
+      expect(saved.failingSinceMs, isNull);
+
+      lostAt = 8; // a different packet next time
+      saved = await afterSync();
+      expect(saved.syncFailCount, 0);
+      expect(saved.failingSinceMs, isNull);
+
+      saved = await afterSync(); // the same one again: the file's
+      expect(saved.syncFailCount, 1);
+      expect(saved.failingSinceMs, isNotNull);
+      expect(globalDeletedTimestamps, isEmpty);
+    });
+
     test('three files failing in a row end the cycle; the rest wait for the next sync', () async {
       connection.files = [
         for (int i = 0; i < 5; i++) StorageFile(index: i, timestamp: ts + i * 600, size: 12),
@@ -1094,8 +1153,8 @@ void main() {
       // may still be sending it when its STOP did not take.
       expect(requests, hasLength(1));
       final saved = await WalFileManager.loadWals();
-      expect(saved.firstWhere((w) => w.timerStart == ts + 60).syncFailCount, 1,
-          reason: 'the gap, not the STOP, is what the attempt is judged by');
+      expect(saved.firstWhere((w) => w.timerStart == ts + 60).syncFailCount, 0,
+          reason: 'the attempt is judged by the gap, not the STOP, and a first gap is the link\'s');
       expect(saved.firstWhere((w) => w.timerStart == ts).syncFailCount, 4, reason: 'not tried this cycle');
       expect(globalDeletedTimestamps, isEmpty);
     });
@@ -1189,6 +1248,7 @@ void main() {
 
     setUp(() async {
       globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {};
       globalDeletedTimestamps = [];
       mockConn = MockDeviceConnection();
       sync = SDCardWalSyncImpl(
@@ -1613,17 +1673,19 @@ void main() {
       expect(globalDeletedTimestamps, equals([ts]), reason: 'only the delete is retried');
     }, timeout: const Timeout(Duration(seconds: 30)));
 
-    test('a file whose delete was refused keeps its place, and the next file is read at its own', () async {
-      // A file that would not delete still holds its index. The next file is read at the
-      // index after it, with its own timestamp, and its bytes land under its own name —
-      // never under the stuck file's, which is what reading index 0 again would do.
+    // A delete that fails may still have taken (its reply was lost), and then every later
+    // file sits a place lower than its listing index. Older firmware reads whatever is at the
+    // index it is given, so reading on could fetch one file's bytes into another's bin.
+    test('a failed delete ends the cycle; the next lists afresh and reads the rest at their own indices', () async {
       final tsA = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 2000;
       final tsB = tsA + 300;
       globalRejectDeleteTimestamps = {tsA};
+      globalLostDeleteReplyTimestamps = {};
       globalDeletedTimestamps = [];
       globalWriteCount = 0;
       final fileA = StorageFile(index: 0, timestamp: tsA, size: 10);
-      mockConn.files = [fileA, StorageFile(index: 1, timestamp: tsB, size: 10)];
+      final fileB = StorageFile(index: 1, timestamp: tsB, size: 10);
+      mockConn.files = [fileA, fileB];
       await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
       await pump(10);
 
@@ -1637,33 +1699,80 @@ void main() {
       await pump();
       mockConn.add(eotPacket());
       await pump(10);
+      final firstResp = await first;
 
+      expect(firstResp!.isPartial, isTrue);
+      expect(globalWriteCount, 1, reason: 'B waits: after a failed delete its index is not known');
+      expect(globalDeletedTimestamps, [tsA]);
+
+      // Next cycle A is still listed and its delete is refused again. B is read where this
+      // cycle's listing puts it, under its own name.
+      globalDeletedTimestamps = [];
+      final second = sync.syncAll();
       await mockConn.waitForWrite(2);
       await pump(10);
-      expect(globalCurrentFileNum, 1, reason: 'A was not deleted, so B is still at index 1');
+      expect(globalCurrentFileNum, 1, reason: 'A did not go, so B is still at index 1');
       mockConn.add(ackPacket(0x00));
       await pump();
       mockConn.add(dataPacket(0, List<int>.filled(10, 0xCD)));
       await pump();
       mockConn.add(eotPacket());
       await pump(10);
-      final firstResp = await first;
+      final secondResp = await second;
 
-      expect(firstResp!.isPartial, isTrue, reason: 'A is still on the card');
+      expect(globalWriteCount, 2, reason: 'A is already on the phone, so only its delete is retried');
       expect(globalDeletedTimestamps, [tsA, tsB]);
       expect(File('${tempDir.path}/raw_segments/$tsA/${tsA}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xAB));
       expect(File('${tempDir.path}/raw_segments/$tsB/${tsB}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xCD),
           reason: 'B landed under its own name');
+      expect(secondResp!.isPartial, isTrue, reason: 'A is still on the card');
+    }, timeout: const Timeout(Duration(seconds: 30)));
 
-      // Next cycle the device lists only A. The sweep retries its delete and nothing is read.
-      mockConn.files = [fileA];
+    test('a retried delete that took although it reported failure leaves the next file read where it now is', () async {
+      final tsA = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 2600;
+      final tsB = tsA + 300;
+      globalRejectDeleteTimestamps = {tsA};
+      globalLostDeleteReplyTimestamps = {};
+      globalDeletedTimestamps = [];
+      globalWriteCount = 0;
+      mockConn.files = [
+        StorageFile(index: 0, timestamp: tsA, size: 10),
+        StorageFile(index: 1, timestamp: tsB, size: 10),
+      ];
+      await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
+      await pump(10);
+
+      final first = sync.syncAll();
+      await mockConn.waitForWrite(1);
+      await pump(10);
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(dataPacket(0, List<int>.filled(10, 0xAB)));
+      await pump();
+      mockConn.add(eotPacket());
+      await pump(10);
+      await first;
+
+      // This time the retried delete of A takes, but its reply is lost.
+      globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {tsA};
       globalDeletedTimestamps = [];
       final second = sync.syncAll();
-      await pump(20);
+      await mockConn.waitForWrite(2);
+      await pump(10);
+      expect(globalCurrentFileNum, 0, reason: 'A is gone, so B moved down to index 0');
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(dataPacket(0, List<int>.filled(10, 0xCD)));
+      await pump();
+      mockConn.add(eotPacket());
+      await pump(10);
       final secondResp = await second;
-      expect(globalWriteCount, 2, reason: 'A is already on the phone, so only its delete is retried');
-      expect(globalDeletedTimestamps, [tsA]);
-      expect(secondResp!.isPartial, isTrue);
+      globalLostDeleteReplyTimestamps = {};
+
+      expect(File('${tempDir.path}/raw_segments/$tsB/${tsB}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xCD));
+      expect(globalDeletedTimestamps, [tsA, tsB]);
+      expect(secondResp!.isPartial, isFalse, reason: 'the second listing shows the card drained');
     }, timeout: const Timeout(Duration(seconds: 30)));
 
     test('deleting one pre-time-sync bin keeps its id-colliding sibling tracked', () async {
@@ -1854,6 +1963,7 @@ void main() {
       // firmware genuinely can't read (rotated-under-read / stale cached size / an empty
       // read error). It used to be deleted after five such syncs to unblock the queue;
       // nothing waits behind it now, so it stays on the device and every sync retries it.
+      mockConn.storageBackend = 1; // the ring: its free space is the room before it overwrites
       int? failingSince;
       for (int attempt = 1; attempt <= 7; attempt++) {
         final f = sync.syncAll();
@@ -1863,7 +1973,14 @@ void main() {
         await pump();
         mockConn.add(eotPacket()); // EOT with no data packet → zero bytes, no progress
         await pump(10);
-        expect((await f)!.isPartial, isTrue);
+        // Partial while processing still waits for it; once it has stopped waiting, the file
+        // no longer holds every sync at "Partial" (nor Force Sync out of force mode), and is
+        // named as stuck instead.
+        final givenUp = attempt >= SDCardWalSyncImpl.heldBackGiveUpFailures;
+        expect((await f)!.isPartial, !givenUp, reason: 'attempt $attempt');
+        expect(SharedPreferencesUtil().lastSyncStuckFiles, givenUp ? 1 : 0);
+        // 1 000 000 B free at ~4 050 B/s: 4 minutes of recording before it is overwritten.
+        expect(SharedPreferencesUtil().lastSyncStuckOverwriteMinutes, givenUp ? 4 : -1);
         expect(globalDeletedTimestamps, isEmpty, reason: 'a file that never fully arrived stays on the device');
         final saved = (await WalFileManager.loadWals()).single;
         failingSince ??= saved.failingSinceMs;
@@ -1906,6 +2023,15 @@ void main() {
       expect(globalDeletedTimestamps, [tsB], reason: 'only the file that fully arrived leaves the device');
       expect(File('${tempDir.path}/raw_segments/$tsB/${tsB}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xCD));
     }, timeout: const Timeout(Duration(seconds: 30)));
+
+    test('only the ring backend says when a stuck file will be overwritten', () {
+      StorageFileStats stats(int? backend) =>
+          StorageFileStats(totalUsedBytes: 0, fileCount: 1, freeBytes: 4050 * 60 * 90, storageBackend: backend);
+      expect(SDCardWalSyncImpl.overwriteMinutesLeft(stats(1)), 90);
+      expect(SDCardWalSyncImpl.overwriteMinutesLeft(stats(0)), -1, reason: 'LittleFS does not overwrite');
+      expect(SDCardWalSyncImpl.overwriteMinutesLeft(stats(null)), -1, reason: 'older firmware cannot say');
+      expect(SDCardWalSyncImpl.overwriteMinutesLeft(null), -1);
+    });
 
     test('syncAll never drops a file that keeps making forward progress', () async {
       // A large recording that only comes down in pieces — background BLE throttling,
@@ -2086,6 +2212,7 @@ void main() {
 
     setUp(() {
       globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {};
       globalDeletedTimestamps = [];
       mockConn = MockDeviceConnection();
       sync = SDCardWalSyncImpl(
@@ -2404,6 +2531,7 @@ void main() {
 
     setUp(() async {
       globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {};
       globalDeletedTimestamps = [];
       recycles = 0;
       mockConn = MockDeviceConnection();

@@ -34,6 +34,34 @@ void main() {
     });
   });
 
+  testWidgets('StuckRecordingBanner is empty with nothing stuck', (tester) async {
+    await tester.pumpWidget(const MaterialApp(home: Scaffold(body: StuckRecordingBanner(stuckFiles: 0))));
+    expect(find.textContaining('download'), findsNothing);
+  });
+
+  testWidgets('StuckRecordingBanner says how much more the Omi can record before it overwrites', (tester) async {
+    await tester.pumpWidget(const MaterialApp(
+        home: Scaffold(body: StuckRecordingBanner(stuckFiles: 1, overwriteMinutes: 3 * 24 * 60 + 5))));
+    expect(
+        find.text('A recording won\'t download from your Omi. It stays there and is tried every sync. '
+            'The Omi will overwrite it after about 3 days of recording.'),
+        findsOneWidget);
+  });
+
+  testWidgets('StuckRecordingBanner makes no claim when the Omi cannot say', (tester) async {
+    await tester.pumpWidget(const MaterialApp(home: Scaffold(body: StuckRecordingBanner(stuckFiles: 2))));
+    expect(find.text('2 recordings won\'t download from your Omi. They stay there and are tried every sync.'),
+        findsOneWidget);
+  });
+
+  test('recording time reads in the largest whole unit', () {
+    expect(StuckRecordingBanner.recordingTime(0), '1 minute');
+    expect(StuckRecordingBanner.recordingTime(59), '59 minutes');
+    expect(StuckRecordingBanner.recordingTime(60), '1 hour');
+    expect(StuckRecordingBanner.recordingTime(47 * 60 + 59), '47 hours');
+    expect(StuckRecordingBanner.recordingTime(48 * 60), '2 days');
+  });
+
   testWidgets('VadFallbackBanner is empty when inactive', (tester) async {
     await tester.pumpWidget(const MaterialApp(home: Scaffold(body: VadFallbackBanner(active: false))));
     expect(find.textContaining('Voice detection unavailable'), findsNothing);

@@ -3,6 +3,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/pages/recordings/recordings_types.dart';
+import 'package:omi/utils/audio/sync_notification.dart';
 
 class StorageWarningBanner extends StatelessWidget {
   final int percentage;
@@ -159,6 +160,57 @@ class PhoneStorageBanner extends StatelessWidget {
           Expanded(
             child: Text(
               'Phone storage is full$waiting. Free up space and processing continues automatically.',
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Recordings on the Omi that keep failing to download and that processing no longer
+/// waits for. They stay on the Omi and are tried every sync; nothing deletes them until
+/// they arrive whole. Once the Omi runs out of room it overwrites the oldest audio not
+/// yet synced, so the banner says how much more it can record first, and turns red
+/// within [SyncNotification.stuckOverwriteWarnMinutes] of recording, when the idle
+/// notification starts warning too. [overwriteMinutes] is -1 when that cannot be told.
+class StuckRecordingBanner extends StatelessWidget {
+  final int stuckFiles;
+  final int overwriteMinutes;
+  const StuckRecordingBanner({super.key, required this.stuckFiles, this.overwriteMinutes = -1});
+
+  /// "40 minutes", "5 hours", "3 days".
+  static String recordingTime(int minutes) {
+    String n(int v, String unit) => '$v $unit${v == 1 ? '' : 's'}';
+    if (minutes < 60) return n(minutes < 1 ? 1 : minutes, 'minute');
+    if (minutes < 48 * 60) return n(minutes ~/ 60, 'hour');
+    return n(minutes ~/ (24 * 60), 'day');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (stuckFiles <= 0) return const SizedBox.shrink();
+    final one = stuckFiles == 1;
+    final what =
+        one ? 'A recording won\'t download from your Omi' : '$stuckFiles recordings won\'t download from your Omi';
+    final stays = one ? 'It stays there and is tried every sync.' : 'They stay there and are tried every sync.';
+    final when = overwriteMinutes < 0
+        ? ''
+        : ' The Omi will overwrite ${one ? 'it' : 'them'} after about ${recordingTime(overwriteMinutes)} of recording.';
+    final urgent = overwriteMinutes >= 0 && overwriteMinutes < SyncNotification.stuckOverwriteWarnMinutes;
+    return Container(
+      width: double.infinity,
+      color: urgent ? Colors.red.shade900 : Colors.orange.shade900,
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      child: Row(
+        children: [
+          FaIcon(urgent ? FontAwesomeIcons.circleExclamation : FontAwesomeIcons.triangleExclamation,
+              color: Colors.white, size: 20),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              '$what. $stays$when',
               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
             ),
           ),

@@ -50,6 +50,33 @@ class RecoverSlice {
   const RecoverSlice({required this.ranges, this.anchorMs});
 }
 
+/// [RecordingsManager.processAll] was called while another run was going. Nothing was
+/// attempted.
+class ProcessingBusy implements Exception {
+  const ProcessingBusy();
+
+  @override
+  String toString() => 'Another processing task is already in progress.';
+}
+
+/// What [RecordingsManager.retrySetAsideBin] did with a set-aside bin.
+enum SetAsideRetry {
+  /// Its unsaved audio was decoded and saved as recordings of its own; it is no longer
+  /// set aside.
+  recovered,
+
+  /// Nothing in it was left to save; it is no longer set aside.
+  nothingLeft,
+
+  /// It is not known where its unsaved audio begins, and a saved recording already holds
+  /// part of it, so decoding it again would duplicate that recording. It stays set aside,
+  /// to share or delete.
+  cannotRetry,
+
+  /// It is no longer on the phone; its entry is gone too.
+  gone,
+}
+
 class RecordingsManager {
   static final RecordingsManager _instance = RecordingsManager._internal();
   factory RecordingsManager() => _instance;
@@ -82,6 +109,12 @@ class RecordingsManager {
       if (!recordingsUnsettled) notifyRecordingsChanged();
     }
   }
+
+  /// [_editArchive] for a change made outside this class to a recording's files —
+  /// passthrough's flag and audio delete. Every `.meta` writer goes through the queue:
+  /// [AtomicFile] stages each target at one temp path, so two writers of the same meta at
+  /// once can tear it.
+  static Future<T> editArchive<T>(Future<T> Function() edit) => _editArchive(edit);
 
   // Retention owns file deletion until this completes. Processing and date
   // correction announce themselves before waiting, so a cleanup still listing
@@ -183,22 +216,15 @@ class RecordingsManager {
     }
   }
 
-  /// Finished (non-draft) audio already on disk when the current [processAll] began,
-  /// so the stitch pass can tell a recording the user could have seen from one this
-  /// run just produced. Null outside a run. See [_noteLateMerge].
+  /// Finished (non-draft) audio already on disk when the current [processAll] began, so
+  /// the stitch pass can tell a recording the user could have seen from one this run just
+  /// produced: only the latter may be joined onto a draft. Null outside a run.
   Set<String>? _finishedBeforeRun;
 
-  /// `_draft` audio already on disk when the current [processAll] began, so a draft NOT
-  /// in it is known to have been written by this run. Null outside a run. See the
-  /// late-merge close in [_stitchDraftRecordings].
-  Set<String>? _draftsBeforeRun;
-
-  /// Sets [_finishedBeforeRun] and [_draftsBeforeRun] from every audio file under
-  /// `recordings/` — listed the same way the stitch pass lists them, so the paths
-  /// compare equal.
+  /// Sets [_finishedBeforeRun] from every audio file under `recordings/` — listed the
+  /// same way the stitch pass lists them, so the paths compare equal.
   Future<void> _snapshotBeforeRun(String docsPath) async {
     final finished = <String>{};
-    final drafts = <String>{};
     final root = Directory('$docsPath/recordings');
     if (await root.exists()) {
       await for (final folder in root.list()) {
@@ -207,30 +233,15 @@ class RecordingsManager {
           if (f is! File) continue;
           final path = f.path;
           if (!(path.endsWith('.m4a') || path.endsWith('.wav')) || path.contains('.tmp')) continue;
-          (path.contains('_draft.') ? drafts : finished).add(path);
+          if (!path.contains('_draft.')) finished.add(path);
         }
       }
     }
     _finishedBeforeRun = finished;
-    _draftsBeforeRun = drafts;
   }
 
-  /// Records, for a one-time message on the recordings page, that the recording that
-  /// started at [absorbedStartMs] — already finished before this run — was folded into
-  /// the draft starting at [mergedStartMs]. A pref because the stitch usually runs in a
-  /// background sync with no page to show it on. Bounded: the page clears it on
-  /// display, so only a long stretch without opening the app accumulates entries.
-  static void _noteLateMerge({required int absorbedStartMs, required int mergedStartMs}) {
-    if (absorbedStartMs <= 0 || mergedStartMs <= 0) return;
-    final prefs = SharedPreferencesUtil();
-    final next = [...prefs.lateMergeNotices, '$absorbedStartMs:$mergedStartMs'];
-    prefs.lateMergeNotices = next.length > 20 ? next.sublist(next.length - 20) : next;
-    Logger.debug('RecordingsManager: late merge — recording_$absorbedStartMs was finished before this run '
-        'and is now part of recording_$mergedStartMs.');
-  }
-
-  /// Keeps [SharedPreferencesUtil.lateMergeNotices] naming the recording the list will
-  /// show. A notice gives the merged recording by its start, and a re-file changes that
+  /// Keeps [SharedPreferencesUtil.lateMergeNotices] — left by earlier versions, which
+  /// joined finished recordings onto drafts — naming the recording the list will show. A notice gives the merged recording by its start, and a re-file changes that
   /// start — in the same run (the clock pass runs after the stitch) or a later one — so
   /// without this the message names a time no recording has. The absorbed half is left
   /// alone: that recording is gone, and its old time is the one the user last saw.
@@ -623,28 +634,37 @@ class RecordingsManager {
   /// in the processor's own order. Once one bin doesn't fit, every later one waits
   /// too, so a run never decodes past a gap a later run would have to fill.
   @visibleForTesting
-  static ({List<Batch> batches, int keptBytes, int waitingBytes}) fitToFreeSpace(List<Batch> batches, int freeBytes) {
+  static ({List<Batch> batches, int keptBytes, int waitingBytes, Map<String, int> waitingBins}) fitToFreeSpace(
+      List<Batch> batches, int freeBytes) {
     final bins = batches.expand((b) => b.rawSegments).toList()..sort((a, b) => compareSegmentPaths(a.path, b.path));
     final budget = freeBytes - _storageHeadroomBytes;
     var kept = 0;
     var waiting = 0;
-    final wait = <String>{};
+    final wait = <String, int>{};
     for (final bin in bins) {
-      int size;
-      try {
-        size = bin.lengthSync();
-      } catch (_) {
-        size = 0;
-      }
+      final size = _sizeOrZero(bin);
       if (wait.isEmpty && (kept + size) * _wavExpansion <= budget) {
         kept += size;
       } else {
         waiting += size;
-        wait.add(VadAudioProcessor.relBinPath(bin.path));
+        wait[VadAudioProcessor.relBinPath(bin.path)] = size;
       }
     }
-    if (wait.isEmpty) return (batches: batches, keptBytes: kept, waitingBytes: 0);
-    return (batches: stripBinsByRelPath(batches, wait), keptBytes: kept, waitingBytes: waiting);
+    if (wait.isEmpty) return (batches: batches, keptBytes: kept, waitingBytes: 0, waitingBins: const {});
+    return (
+      batches: stripBinsByRelPath(batches, wait.keys.toSet()),
+      keptBytes: kept,
+      waitingBytes: waiting,
+      waitingBins: wait,
+    );
+  }
+
+  static int _sizeOrZero(File f) {
+    try {
+      return f.lengthSync();
+    } catch (_) {
+      return 0;
+    }
   }
 
   /// What a failed run leaves for the next one.
@@ -654,46 +674,106 @@ class RecordingsManager {
   /// leaves, in which no bin was released before a checkpoint naming it was on disk.
   /// A failed restore is the exception, since that checkpoint would fail every run at
   /// the same spot. A full phone pauses processing; any other failure inside a
-  /// segment counts against that bin, and one in the final flush against the run's last
-  /// bin (see [SetAsideBins]) — uncharged, a flush that failed alike every run stopped
-  /// processing with nothing offering Try again or Skip.
-  static Future<void> _recordRunFailure(Map<dynamic, dynamic> msg, File checkpointFile,
-      {required int waitingRawBytes}) async {
-    if (msg['phase'] == 'restore') {
+  /// segment counts against that bin, and one in the final flush against the bin the
+  /// unsaved recording starts in (see [SetAsideBins]) — uncharged, a flush that failed
+  /// alike every run stopped processing with nothing offering Try again or Skip.
+  ///
+  /// [runBins] are the run's bins in processing order. Out of space, the one it failed
+  /// inside and every one after it wait for space.
+  static Future<void> _recordRunFailure(Map<dynamic, dynamic> msg, File? checkpointFile,
+      {required List<File> runBins}) async {
+    if (msg['phase'] == 'restore' && checkpointFile != null) {
       try {
         if (await checkpointFile.exists()) await checkpointFile.delete();
       } catch (_) {}
     }
     if (msg['storageFull'] == true) {
-      _pauseForStorage(waitingRawBytes);
-    } else if ((msg['phase'] == 'segment' || msg['phase'] == 'flush') && msg['bin'] is String) {
-      await SetAsideBins.recordFailure(VadAudioProcessor.relBinPath(msg['bin'] as String));
+      final failedAt = msg['bin'] is String ? runBins.indexWhere((f) => f.path == msg['bin']) : -1;
+      await _noteStorageFit(waiting: {
+        for (final f in runBins.skip(max(0, failedAt))) VadAudioProcessor.relBinPath(f.path): _sizeOrZero(f),
+      });
+      return;
     }
+    if ((msg['phase'] == 'segment' || msg['phase'] == 'flush') && msg['bin'] is String) {
+      await SetAsideBins.recordFailure(
+        VadAudioProcessor.relBinPath(msg['bin'] as String),
+        startByte: msg['binStartByte'] as int?,
+        startMs: msg['binStartMs'] as int?,
+      );
+    }
+    await refreshStoragePause(); // a bin just set aside no longer waits
   }
 
   @visibleForTesting
   static Future<void> recordRunFailureForTest(Map<dynamic, dynamic> msg, File checkpointFile,
-          {int waitingRawBytes = 0}) =>
-      _recordRunFailure(msg, checkpointFile, waitingRawBytes: waitingRawBytes);
+          {List<File> runBins = const []}) =>
+      _recordRunFailure(msg, checkpointFile, runBins: runBins);
 
-  /// Raw audio is waiting for phone storage — say so on the recordings page and in
-  /// the idle notification, with how much is waiting.
-  static void _pauseForStorage(int waitingRawBytes) {
-    final prefs = SharedPreferencesUtil();
-    prefs.processingPausedForStorage = true;
-    prefs.processingPausedMinutes = max(1, (waitingRawBytes / 4050 / 60).ceil());
-    notifyRecordingsChanged();
+  /// The bins runs left waiting for phone storage, by `raw_segments/`-relative path, with
+  /// their raw size.
+  static Map<String, int> _storageWaitingBins() {
+    final raw = SharedPreferencesUtil().processingWaitingBins;
+    if (raw.isEmpty) return {};
+    try {
+      return (jsonDecode(raw) as Map).map((k, v) => MapEntry(k as String, v is int ? v : 0));
+    } catch (_) {
+      return {};
+    }
   }
 
-  /// No audio is waiting for space: the latest run fit it all, or there was nothing
-  /// left to process. The pause describes the most recent attempt, so every path that
-  /// finds nothing to decode clears it too — otherwise audio deleted or set aside while
-  /// it waited left the banner and the notification line up for good.
-  static void clearStoragePause() {
+  static void _saveStorageWaitingBins(Map<String, int> bins) =>
+      SharedPreferencesUtil().processingWaitingBins = bins.isEmpty ? '' : jsonEncode(bins);
+
+  /// Records what a run's space check decided for the bins it was given: [decoding] no
+  /// longer wait, [waiting] do. Bins outside the run keep what an earlier run decided — a
+  /// run over a few of them (Recover Discard, a mode-switch backlog pass) says nothing
+  /// about the rest.
+  static Future<void> _noteStorageFit(
+      {Iterable<String> decoding = const [], Map<String, int> waiting = const {}}) async {
+    final bins = _storageWaitingBins();
+    for (final rel in decoding) {
+      bins.remove(rel);
+    }
+    bins.addAll(waiting);
+    _saveStorageWaitingBins(bins);
+    await refreshStoragePause();
+  }
+
+  /// Publishes the storage pause — [SharedPreferencesUtil.processingPausedForStorage] and
+  /// [SharedPreferencesUtil.processingPausedMinutes], which the recordings page and both
+  /// notifications read — from the bins still waiting: on disk, not deleted, not set
+  /// aside. The rest are dropped.
+  ///
+  /// Derived, not set and cleared by whichever run happens to look: audio deleted or set
+  /// aside while it waited takes the banner with it at the next refresh, whatever path gets
+  /// there, and a run over a few bins neither clears the backlog's pause nor rewrites its
+  /// size. Refreshed at the start of every run, by its space check, by a run that ran out
+  /// of space, by every prune, and when the recordings pipeline settles.
+  ///
+  /// Never throws: it runs at the start of runs and inside every prune, and a banner left
+  /// as it was is no reason to stop either.
+  static Future<void> refreshStoragePause() async {
+    try {
+      await _refreshStoragePause();
+    } catch (e) {
+      Logger.error('RecordingsManager: storage-pause refresh failed: $e');
+    }
+  }
+
+  static Future<void> _refreshStoragePause() async {
+    final gone = {...await deletedRelBins(), ...SetAsideBins.relBins()};
+    final rawDir = '${(await getApplicationDocumentsDirectory()).path}/raw_segments';
+    // No await from here on, so a run noting its space check cannot interleave and be lost.
+    final bins = _storageWaitingBins();
+    final before = bins.length;
+    bins.removeWhere((rel, _) => gone.contains(rel) || !File('$rawDir/$rel').existsSync());
+    if (bins.length != before) _saveStorageWaitingBins(bins);
     final prefs = SharedPreferencesUtil();
-    if (!prefs.processingPausedForStorage) return;
-    prefs.processingPausedForStorage = false;
-    prefs.processingPausedMinutes = 0;
+    final paused = bins.isNotEmpty;
+    final minutes = paused ? max(1, (bins.values.fold<int>(0, (a, b) => a + b) / 4050 / 60).ceil()) : 0;
+    if (prefs.processingPausedForStorage == paused && prefs.processingPausedMinutes == minutes) return;
+    prefs.processingPausedForStorage = paused;
+    prefs.processingPausedMinutes = minutes;
     notifyRecordingsChanged();
   }
 
@@ -877,6 +957,9 @@ class RecordingsManager {
     // recording instead of a stitchable `_draft`, so the recovered clip isn't
     // merged into an abutting recording.
     bool finalizeRemainingDirectly = false,
+    // An automatic run's held-back set ([SDCardWalSync.heldBackBinRelPaths]) when the
+    // caller has just read it, so the run does not read it again. Null reads it here.
+    Set<String>? heldBackRelBins,
   }) =>
       _processAll(
         batches,
@@ -888,6 +971,7 @@ class RecordingsManager {
         recoverSlices: recoverSlices,
         seedProtectedBinPaths: seedProtectedBinPaths,
         finalizeRemainingDirectly: finalizeRemainingDirectly,
+        heldBackRelBins: heldBackRelBins,
       );
 
   Future<void> _processAll(
@@ -902,11 +986,17 @@ class RecordingsManager {
     bool finalizeRemainingDirectly = false,
     bool processingReserved = false,
     bool preserveSourceBins = false,
+    Set<String>? heldBackRelBins,
+    // retrySetAsideBin only: the set-aside bin this run decodes. It is left in the run
+    // although set aside, a failure does not count against it, and a run with no room
+    // for it throws instead of waiting.
+    String? retryingSetAside,
   }) async {
     // A delete that finished while the caller was listing still wins: its bins are
     // out of the run, whatever the caller's snapshot says.
     await _archiveEditQueue;
     batches = stripBinsByRelPath(batches, await deletedRelBins());
+    await refreshStoragePause();
 
     // Strip bins that already produced a discard record. They stay on disk
     // for the 48 h recovery window, but re-running VAD on them just re-derives
@@ -926,7 +1016,7 @@ class RecordingsManager {
     // Bins processing could not get past stay out of every run until the user retries
     // them or a new build does — Force included, where they would only stop the run at
     // the same spot again. See SetAsideBins.
-    batches = stripBinsByRelPath(batches, SetAsideBins.relBins());
+    batches = stripBinsByRelPath(batches, SetAsideBins.relBins()..remove(retryingSetAside));
 
     // Bins still mid-transfer (walOffset < the device-advertised size — see
     // Wal.isIncompleteTransfer). Such a bin holds only a PREFIX of the recording,
@@ -972,7 +1062,7 @@ class RecordingsManager {
     // strip: Force decodes what has arrived, by design. Fails closed the same way.
     if (autoRun) {
       try {
-        batches = stripBinsByRelPath(batches, await _resolveHeldBackRelBins());
+        batches = stripBinsByRelPath(batches, heldBackRelBins ?? await _resolveHeldBackRelBins());
       } catch (e) {
         Logger.error('RecordingsManager: processAll held-back set unavailable (skipping run, fail-closed): $e');
         return;
@@ -988,11 +1078,8 @@ class RecordingsManager {
     var activeBatches = batches.where((b) => b.rawSegments.isNotEmpty).toList();
     final hasDrafts = batches.any((b) => b.draftRecordings.isNotEmpty);
 
-    if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) {
-      clearStoragePause();
-      return;
-    }
-    if (_isProcessingAny && !processingReserved) throw Exception("Another processing task is already in progress.");
+    if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) return;
+    if (_isProcessingAny && !processingReserved) throw const ProcessingBusy();
 
     _isProcessingAny = true;
     if (!processingReserved) _cancelRequested = false;
@@ -1008,10 +1095,7 @@ class RecordingsManager {
       activeBatches = _withoutMissingBins(stripBinsByRelPath(activeBatches, await deletedRelBins()))
           .where((b) => b.rawSegments.isNotEmpty)
           .toList();
-      if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) {
-        clearStoragePause();
-        return;
-      }
+      if (activeBatches.isEmpty && !(finalizeDrafts && hasDrafts)) return;
 
       await _waitForRetention();
       final directory = await getApplicationDocumentsDirectory();
@@ -1024,18 +1108,18 @@ class RecordingsManager {
       // waiting loses nothing. Unknown free space (no platform answer) decodes it all
       // and leaves a full disk to the save path, which now stops the run cleanly.
       final freeBytes = await freeDiskBytes();
+      final runRelBins = activeBatches.expand((b) => b.rawSegments).map((f) => VadAudioProcessor.relBinPath(f.path));
       if (freeBytes == null) {
-        clearStoragePause(); // decoding it all, so nothing is held back for space
+        await _noteStorageFit(decoding: runRelBins); // decoding it all, so none of it waits for space
       } else {
         final fit = fitToFreeSpace(activeBatches, freeBytes);
-        if (fit.waitingBytes == 0) {
-          clearStoragePause();
-        } else {
-          _pauseForStorage(fit.waitingBytes);
+        await _noteStorageFit(
+            decoding: runRelBins.where((rel) => !fit.waitingBins.containsKey(rel)), waiting: fit.waitingBins);
+        if (fit.waitingBytes != 0) {
           if (fit.keptBytes == 0) {
             Logger.error('RecordingsManager: ${freeBytes ~/ (1024 * 1024)} MB free is too little to decode any '
                 'audio — ${fit.waitingBytes} B of raw segments kept until space is freed.');
-            if (processingReserved) {
+            if (processingReserved || retryingSetAside != null) {
               throw FileSystemException('Not enough storage to rebuild recordings.', directory.path);
             }
             return;
@@ -1220,8 +1304,13 @@ class RecordingsManager {
         // unlike the checkpoint it is NOT deleted on clean completion, which is exactly
         // what lets a Priority Recording keep force-capturing across a sync boundary.
         final priorityLatchFile = File('${directory.path}/vad_priority_latch.json');
+        // A standalone run (Recover Discard, a set-aside retry) decodes a few slices for
+        // recordings of their own. The checkpoint belongs to the regular runs: resuming
+        // from it, writing over it or deleting it on completion would lose the place, and
+        // the buffered audio, of a regular run that failed or was cut short.
+        final usesCheckpoint = !finalizeRemainingDirectly;
         try {
-          if (await checkpointFile.exists()) {
+          if (usesCheckpoint && await checkpointFile.exists()) {
             final content = await checkpointFile.readAsString();
             final data = jsonDecode(content) as Map<String, dynamic>;
             final currentPaths = allSegments.map((f) => f.path).toList();
@@ -1270,7 +1359,7 @@ class RecordingsManager {
               devLogsEnabled: SharedPreferencesUtil().devLogsToFileEnabled,
               checkpointState: checkpointState,
               checkpointResumeIndex: checkpointResumeIndex,
-              checkpointPath: checkpointFile.path,
+              checkpointPath: usesCheckpoint ? checkpointFile.path : null,
               checkpointPendingDeletes: checkpointPendingDeletes,
               // Disabled for Recover Discard: a recovered slice is a self-contained
               // clip and must not read or write live priority state.
@@ -1461,14 +1550,18 @@ class RecordingsManager {
                 // Checkpoint preserved on cancel so the next run can resume from it.
                 if (!wasCancelled) {
                   try {
-                    if (await checkpointFile.exists()) await checkpointFile.delete();
+                    if (usesCheckpoint && await checkpointFile.exists()) await checkpointFile.delete();
                   } catch (_) {}
                   SetAsideBins.recordSuccess(allSegments.map((f) => VadAudioProcessor.relBinPath(f.path)));
                 }
               case 'error':
                 isolateDone = true;
                 receivePort.close();
-                await _recordRunFailure(msg, checkpointFile, waitingRawBytes: rawTotalBytes - processedBytes);
+                // A retry's failure is reported to whoever asked; the bin stays set aside.
+                if (retryingSetAside == null) {
+                  // A standalone run restored no checkpoint, so it has none to discard.
+                  await _recordRunFailure(msg, usesCheckpoint ? checkpointFile : null, runBins: allSegments);
+                }
                 throw Exception(msg['message']);
             }
           }
@@ -1531,7 +1624,6 @@ class RecordingsManager {
       // run's own error.
       await _applyClockAnchorsLogged();
       _finishedBeforeRun = null;
-      _draftsBeforeRun = null;
       if (!processingReserved) _isProcessingAny = false;
       _activeIsolate = null;
       _activeIsolateControlPort = null;
@@ -1751,18 +1843,16 @@ class RecordingsManager {
           break;
         }
 
-        // Late audio — a draft this run wrote, followed by a recording that was already
-        // finished before the run — is never folded into it. That recording may have been
-        // seen, played, uploaded or exported; joining the late part onto its front would
-        // replace it under a new name and send it all again. The late part is finished as
-        // its own recording, ending where the saved one begins. Decided before any ghost is
-        // folded in, so nothing is left half-joined. A draft that was already on disk when
-        // the run began, meeting a finished recording, is an interrupted run's own join and
-        // still stitches below.
-        if (audioToStitch != null &&
-            (_finishedBeforeRun?.contains(audioToStitch.path) ?? false) &&
-            !(_draftsBeforeRun?.contains(draftFile.path) ?? true)) {
-          Logger.debug('RecordingsManager: Finalizing late draft $draftTs on its own — '
+        // A recording that was already finished before this run is never folded into a
+        // draft. It may have been seen, played, uploaded or exported; joining onto its front
+        // would replace it under a new name and send it all again. The draft is finished as
+        // its own recording, ending where the saved one begins — whether it is late audio
+        // this run wrote, or a draft an interrupted run left before the recording it went
+        // on to finish (that conversation stays split where the run was cut short). Decided
+        // before any ghost is folded in, so nothing is left half-joined. Only a recording
+        // this run created, which nothing can have seen yet, joins a draft.
+        if (audioToStitch != null && (_finishedBeforeRun?.contains(audioToStitch.path) ?? false)) {
+          Logger.debug('RecordingsManager: Finalizing draft $draftTs on its own — '
               '${audioToStitch.path.split('/').last} was finished before this run and is left as it is.');
           finalizeAttempted.add(draftFile.path);
           await _finalizeDraft(draftFile, isForceSynced: false);
@@ -1959,7 +2049,6 @@ class RecordingsManager {
       await _convertPendingToM4a();
     } finally {
       _finishedBeforeRun = null;
-      _draftsBeforeRun = null;
     }
   }
 
@@ -2100,55 +2189,76 @@ class RecordingsManager {
     final metaPath = path.replaceAll(RegExp(r'\.(m4a|wav|ogg)$'), '.meta');
 
     try {
-      // Renamed, never encoded here. This runs in the stitch pass, inside the archive edit
+      final metaBytes = await File(metaPath).exists() ? await File(metaPath).readAsBytes() : null;
+      // In M4A mode a WAV draft is marked for _convertPendingToM4a, which encodes it after
+      // the stitch pass. The mark needs a meta with its upload key whole; one with fewer
+      // than four flag bytes gets the fourth added below.
+      final wantM4a = targetExt == 'm4a' && currentExt == 'wav';
+      final canMark = metaBytes != null && metaBytes.length >= 417 && metaBytes.length >= 417 + metaBytes[416];
+
+      // Renamed, not encoded here. This runs in the stitch pass, inside the archive edit
       // queue, and encoding a long draft would hold every delete, crop and re-file for as
-      // long as it took. In M4A mode the recording is marked below like any other finished
-      // one, and _convertPendingToM4a encodes it after the stitch pass.
-      final finalAudioPath = path.replaceAll('_draft.', '.');
-      if (await File(finalAudioPath).exists()) await File(finalAudioPath).delete();
-      await file.rename(finalAudioPath);
+      // long as it took. The exception is a draft with no meta to carry the mark (none, or
+      // torn): nothing would ever convert it, so it is encoded now, as before marking.
+      var finalAudioPath = path.replaceAll('_draft.', '.');
+      var transcoded = false;
+      if (wantM4a && !canMark) {
+        final m4aPath = path.replaceAll('_draft.wav', '.m4a');
+        if (await File(m4aPath).exists()) await File(m4aPath).delete();
+        if (await _transcodeWavToM4a(file, m4aPath)) {
+          await file.delete();
+          finalAudioPath = m4aPath;
+          transcoded = true;
+        }
+      }
+      if (!transcoded) {
+        if (await File(finalAudioPath).exists()) await File(finalAudioPath).delete();
+        await file.rename(finalAudioPath);
+      }
 
       final newFilename = finalAudioPath.split('/').last;
       final newMetaPath = metaPath.replaceAll('_draft.', '.');
 
-      if (await File(metaPath).exists()) {
-        final bytes = await File(metaPath).readAsBytes();
+      if (metaBytes != null) {
+        final bytes = metaBytes;
         var outBytes = bytes;
-        var markedForM4a = false;
+        final markForM4a = wantM4a && canMark;
 
-        // 1. Update flags (passthrough, forceSynced, capEnded).
-        // Layout at flagOffset: [0]=passthrough, [1]=forceSynced, [2]=capEnded.
+        // 1. Update flags (passthrough, forceSynced, capEnded, and m4aPending in M4A mode).
+        // Layout at flagOffset: [0]=passthrough, [1]=forceSynced, [2]=capEnded, [3]=bits.
         // capEnded is set by VAD when the recording was written; we preserve it across
         // draft promotion (Force Process / stitch fallback should not relabel a cap-end
         // recording as silence-end).
         if (bytes.length >= 417) {
           final keyLen = bytes[416];
           final flagOffset = 417 + keyLen;
-          if (bytes.length < flagOffset + 3) {
-            // Extend to fit all 3 flag bytes, preserving any existing earlier bytes.
+          final hasFourthByte = bytes.length > flagOffset + 3;
+          if (!hasFourthByte && (bytes.length < flagOffset + 3 || markForM4a)) {
+            // Extend to fit the flag bytes, preserving any existing earlier bytes: three, or
+            // four when the m4aPending bit needs the fourth. A meta without a fourth byte
+            // has no bins tail (that only ever follows four), so nothing after the flags
+            // can be misread for the added byte.
             final existingPassthrough = (bytes.length > flagOffset) ? bytes[flagOffset] : 0;
             final existingCapEnded = (bytes.length > flagOffset + 2) ? bytes[flagOffset + 2] : 0;
-            final newBytes = Uint8List(flagOffset + 3);
+            final newBytes = Uint8List(flagOffset + (markForM4a ? 4 : 3));
             newBytes.setRange(0, bytes.length, bytes);
             newBytes[flagOffset] = existingPassthrough;
             newBytes[flagOffset + 1] = isForceSynced ? 1 : 0;
             newBytes[flagOffset + 2] = existingCapEnded;
+            // Only the pending bit: no modeKnown bit, so the mode stays unknown.
+            if (markForM4a) newBytes[flagOffset + 3] = 0x40;
             outBytes = newBytes;
           } else {
             outBytes[flagOffset + 1] = isForceSynced ? 1 : 0;
             // capEnded byte preserved as-is at flagOffset + 2.
-            // Wanted as M4A: marked for _convertPendingToM4a (see above).
-            if (targetExt == 'm4a' && currentExt == 'wav' && outBytes.length > flagOffset + 3) {
-              outBytes[flagOffset + 3] |= 0x40;
-              markedForM4a = true;
-            }
+            if (markForM4a) outBytes[flagOffset + 3] |= 0x40;
           }
         }
 
-        // 2. Key it as the .m4a it will become, as the processor keys every recording it
-        // marks. The conversion leaves the key alone, so an upload before it and the
-        // delivered mark that upload left still name the same recording afterwards.
-        if (markedForM4a) {
+        // 2. Key it as the .m4a it will become (or already is), as the processor keys every
+        // recording it marks. The conversion leaves the key alone, so an upload before it
+        // and the delivered mark that upload left still name the same recording afterwards.
+        if (markForM4a) {
           final keyLen = outBytes[416];
           final key = String.fromCharCodes(outBytes, 417, 417 + keyLen);
           final newKey = key.replaceAll('.$currentExt', '.m4a');
@@ -2171,9 +2281,9 @@ class RecordingsManager {
       // Update any .edl files that were pointing to this draft
       int? finalDurationMs;
       try {
-        final metaBytes = await File(newMetaPath).readAsBytes();
-        if (metaBytes.length >= 8) {
-          finalDurationMs = ByteData.sublistView(metaBytes).getUint32(4, Endian.little);
+        final finalMeta = await File(newMetaPath).readAsBytes();
+        if (finalMeta.length >= 8) {
+          finalDurationMs = ByteData.sublistView(finalMeta).getUint32(4, Endian.little);
         }
       } catch (_) {}
 
@@ -2466,17 +2576,6 @@ class RecordingsManager {
     await nextFile.delete();
     final nextMeta = File(nextFile.path.replaceAll(RegExp(r'\.wav$'), '.meta'));
     if (await nextMeta.exists()) await nextMeta.delete();
-
-    // A recording that was already finished before this run — one the user could have
-    // seen, played or uploaded — was just folded into an earlier draft and is gone from
-    // the list. Only a run resuming an interrupted one's join does that: late audio is
-    // finished on its own instead (see _stitchDraftRecordings), and the everyday
-    // cross-sync join absorbs a recording this same run created, before anything could
-    // upload it. Say so once.
-    if (_finishedBeforeRun?.contains(nextFile.path) ?? false) {
-      _noteLateMerge(
-          absorbedStartMs: _extractTimestamp(nextFile.path), mergedStartMs: _extractTimestamp(draftFile.path));
-    }
 
     return true;
   }
@@ -2998,6 +3097,8 @@ class RecordingsManager {
   /// running.
   static Future<void> processAllCompletedSessions() async {
     if (_isProcessingAny) return;
+    await retryPendingSetAsideBins();
+    if (_isProcessingAny) return;
     // Resolve the mid-transfer set BEFORE anything deletes a bin. [processAll]
     // re-reads it for its own strip (it is called directly elsewhere), but the
     // prune below runs first and deletes by exact membership only — which is
@@ -3043,7 +3144,6 @@ class RecordingsManager {
           }).toList();
     final activeBatches = processableBatches.where((b) => b.rawSegments.isNotEmpty).toList();
     if (activeBatches.isEmpty) {
-      clearStoragePause();
       // Nothing new to decode, but this connect may have brought the anchor that places
       // recordings an earlier run filed before any anchor existed — the case where the
       // first connect's diagnostics read lost the race to its own sync. processAll runs
@@ -3089,6 +3189,8 @@ class RecordingsManager {
     }
     if (incompleteRelBins != null) {
       await pruneConsumedBins(protectedRelBins: incompleteRelBins);
+    } else {
+      await refreshStoragePause(); // the prune would have
     }
     final manager = RecordingsManager();
     final batches = await manager.getBatches();
@@ -3114,7 +3216,6 @@ class RecordingsManager {
     final activeBatches =
         candidateBatches.where((b) => b.rawSegments.isNotEmpty || b.draftRecordings.isNotEmpty).toList();
     if (activeBatches.isEmpty) {
-      clearStoragePause();
       Logger.debug('RecordingsManager: forceProcessAll — nothing to process '
           '(reprocessCovered=$reprocessCovered; covered bins skipped)');
       return;
@@ -3424,6 +3525,113 @@ class RecordingsManager {
     await pruneConsumedBins(protectedRelBins: incomplete);
   }
 
+  /// Delete, for a bin processing set aside (recordings page). Recorded as deleted, like a
+  /// deleted recording's bins, so no run decodes it again; the file itself goes through
+  /// [pruneConsumedBins], the one raw-bin deleter outside a run, once nothing protects it —
+  /// the checkpoint a failed run kept may still name it, and a run going now prunes it when
+  /// it ends. Its set-aside entry and failure count go with it.
+  static Future<void> deleteSetAsideBin(String relBin) async {
+    await _editArchive(() async {
+      await _addDeletedRelBins({relBin});
+      SetAsideBins.release(relBin);
+      if (!_isProcessingAny) await _pruneAfterDelete();
+    });
+  }
+
+  /// Try again, for a bin processing set aside: decodes it from where its unsaved audio
+  /// begins ([SetAsideBin.startByte]) to its end, and saves what it finds as recordings
+  /// of their own — never as a draft, so nothing is joined onto a recording already
+  /// saved, and never resuming or touching the regular runs' checkpoint.
+  ///
+  /// Where that start is unknown (an older entry, or a failure with nothing buffered),
+  /// the whole bin is decoded if no saved recording holds any of it; otherwise it stays
+  /// set aside ([SetAsideRetry.cannotRetry]), since decoding it again would duplicate what
+  /// that recording holds.
+  ///
+  /// The bin stays set aside, and so protected from the prune, until the audio is saved.
+  /// A failure keeps it that way, on this build's account ([SetAsideBins.retryFailed]),
+  /// and is rethrown. Throws [ProcessingBusy], with nothing changed, if a run is going.
+  static Future<SetAsideRetry> retrySetAsideBin(String relBin) async {
+    final entry = SetAsideBins.entryFor(relBin);
+    if (entry == null) return SetAsideRetry.gone;
+    final file = await SetAsideBins.fileFor(relBin);
+    if (!await file.exists()) {
+      SetAsideBins.release(relBin);
+      return SetAsideRetry.gone;
+    }
+    final length = await file.length();
+    var startByte = entry.startByte;
+    if (startByte == null) {
+      final heldBySaved = (await _buildCoverageSources()).namedBins.contains(relBin);
+      if (heldBySaved) {
+        Logger.warning('RecordingsManager: set-aside $relBin cannot be retried — a saved recording holds part of it '
+            'and where the rest begins is unknown');
+        return SetAsideRetry.cannotRetry;
+      }
+      startByte = 0;
+    }
+    if (startByte >= length) {
+      SetAsideBins.release(relBin);
+      return SetAsideRetry.nothingLeft;
+    }
+
+    final binStart = entry.startTime ?? file.lastModifiedSync();
+    final recordedAt =
+        entry.startMs != null && startByte > 0 ? DateTime.fromMillisecondsSinceEpoch(entry.startMs!) : binStart;
+    final batch = Batch(
+      dateString: _dateStringFromMillis(recordedAt.millisecondsSinceEpoch),
+      date: DateTime(recordedAt.year, recordedAt.month, recordedAt.day),
+      rawSegments: [file],
+      draftRecordings: const [],
+      finalizedRecordings: const [],
+      markerTimestamps: const [],
+      discards: const [],
+    );
+    Logger.info('RecordingsManager: retrying set-aside $relBin from byte $startByte of $length');
+    try {
+      await RecordingsManager()._processAll(
+        [batch],
+        (_, __) {},
+        recoverSlices: {
+          file.path: RecoverSlice(
+            ranges: [
+              [startByte, length]
+            ],
+            anchorMs: startByte > 0 ? entry.startMs : null,
+          ),
+        },
+        finalizeRemainingDirectly: true,
+        retryingSetAside: relBin,
+      );
+    } on ProcessingBusy {
+      rethrow; // never tried: the retry is still owed
+    } catch (e) {
+      Logger.error('RecordingsManager: retry of set-aside $relBin failed: $e');
+      await SetAsideBins.retryFailed(relBin);
+      rethrow;
+    }
+    SetAsideBins.release(relBin);
+    return SetAsideRetry.recovered;
+  }
+
+  /// Runs the one retry a newer build gives each set-aside bin
+  /// ([SetAsideBins.releaseAfterUpdate]), before a regular run. A failure leaves the bin
+  /// set aside and is logged; the regular run goes ahead either way.
+  static Future<void> retryPendingSetAsideBins() async {
+    for (final e in SetAsideBins.list().where((e) => e.retryPending)) {
+      if (_isProcessingAny) return;
+      try {
+        final outcome = await retrySetAsideBin(e.relBin);
+        if (outcome == SetAsideRetry.cannotRetry) await SetAsideBins.retryFailed(e.relBin);
+        Logger.info('RecordingsManager: update retry of set-aside ${e.relBin}: ${outcome.name}');
+      } on ProcessingBusy {
+        return; // a run started meanwhile; the retry stays owed
+      } catch (_) {
+        // Logged by retrySetAsideBin; the bin stays set aside.
+      }
+    }
+  }
+
   /// Lists recordings and removes expired files while date correction and
   /// processing wait. Every deletion re-reads metadata and the current retention
   /// setting; unknown dates and recordings awaiting correction stay on disk.
@@ -3490,7 +3698,8 @@ class RecordingsManager {
 
     // On disk before any file goes: a kill mid-delete must not leave bins that
     // nothing names, or the next run decodes the recording straight back.
-    final released = conversations.where((c) => shouldDelete == null || shouldDelete(c)).expand(_ownBinsOnDisk).toSet();
+    final selected = conversations.where((c) => shouldDelete == null || shouldDelete(c)).toList();
+    final released = {...selected.expand(_ownBinsOnDisk), ...await _legacyWindowBinsOnDisk(selected)};
     await _addDeletedRelBins(released);
 
     // Group conversations by directory to minimize directory listings for EDL cleanup
@@ -3790,9 +3999,11 @@ class RecordingsManager {
     // Everything for the date goes, raw audio not yet processed included. Its bins
     // are recorded as deleted — never decoded again — and pruned below once nothing
     // protects them; one still downloading goes when its download completes.
+    final dayRecordings = [...batch.finalizedRecordings, ...batch.draftRecordings];
     final released = {
       ...batch.rawSegments.map((f) => VadAudioProcessor.relBinPath(f.path)),
-      ...[...batch.finalizedRecordings, ...batch.draftRecordings].expand(_ownBinsOnDisk),
+      ...dayRecordings.expand(_ownBinsOnDisk),
+      ...await _legacyWindowBinsOnDisk(dayRecordings),
     };
     await _addDeletedRelBins(released);
 
@@ -4620,7 +4831,6 @@ class RecordingsManager {
     final recordingsDir = Directory('${directory.path}/recordings');
     if (!await recordingsDir.exists()) return _CoverageSources(namedBins, const []);
 
-    const int leftSlackMs = 10 * 60 * 1000;
     final int silenceSlackMs = SharedPreferencesUtil().vadSplitSeconds * 1000;
 
     final List<List<int>> intervals = [];
@@ -4651,12 +4861,8 @@ class RecordingsManager {
           continue;
         }
 
-        if (conv.isUnknown) continue;
-        final recStartMs = conv.startTime.millisecondsSinceEpoch;
-        if (recStartMs <= 0) continue;
-        final recEndMs = recStartMs + conv.duration.inMilliseconds;
-        final rightEdge = (conv.capEnded || isDraft) ? recEndMs : recEndMs + silenceSlackMs;
-        intervals.add([recStartMs - leftSlackMs, rightEdge]);
+        final window = _legacyWindowMs(conv, isDraft: isDraft, silenceSlackMs: silenceSlackMs);
+        if (window != null) intervals.add(window);
       }
     }
     if (intervals.isEmpty) return _CoverageSources(namedBins, const []);
@@ -4675,22 +4881,88 @@ class RecordingsManager {
     return _CoverageSources(namedBins, merged);
   }
 
+  /// The window a recording with no bin list in its `.meta` covers geometrically,
+  /// `[start - 10 min, end + silence slack]` in epoch ms (no right slack for a draft or a
+  /// cap-ended recording), or null when it covers nothing: a bin list answers exactly, a
+  /// copy owns no source audio, and an unknown date places nothing.
+  static List<int>? _legacyWindowMs(Conversation conv, {required bool isDraft, required int silenceSlackMs}) {
+    if (conv.relativeBins.isNotEmpty || conv.isCropped || conv.isUnknown) return null;
+    const int leftSlackMs = 10 * 60 * 1000;
+    final recStartMs = conv.startTime.millisecondsSinceEpoch;
+    if (recStartMs <= 0) return null;
+    final recEndMs = recStartMs + conv.duration.inMilliseconds;
+    final rightEdge = (conv.capEnded || isDraft) ? recEndMs : recEndMs + silenceSlackMs;
+    return [recStartMs - leftSlackMs, rightEdge];
+  }
+
+  /// The audio a raw bin holds, `(start, end)` in epoch ms, estimated from its name and
+  /// size for the legacy geometric windows; null for a bin with no wall-clock name or no
+  /// audio.
+  ///
+  /// The size-to-duration estimate intentionally overestimates: a measured 227 KB bin
+  /// contains 42 s rather than the estimated 56 s because about 16 percent is padding. A
+  /// wider span makes a window harder to satisfy; reducing it makes the windows more
+  /// aggressive and risks skipping audio.
+  static Future<(int, int)?> _legacyBinSpanMs(File bin) async {
+    const double opusBytesPerMs = 4050 / 1000;
+    const int binHeaderBytes = 36;
+    final folderName = p.basename(bin.parent.path);
+    if (folderName.startsWith('session_') || folderName.startsWith('unknown_') || folderName.startsWith('.')) {
+      return null;
+    }
+    final parts = p.basename(bin.path).split('.').first.split('_');
+    if (parts.isEmpty) return null;
+    final timerStart = int.tryParse(parts.first);
+    if (timerStart == null || timerStart < 946684800) return null;
+    int binSize;
+    try {
+      binSize = await bin.length();
+    } catch (_) {
+      return null;
+    }
+    if (binSize <= binHeaderBytes) return null;
+    final binStartMs = timerStart * 1000;
+    return (binStartMs, binStartMs + ((binSize - binHeaderBytes) / opusBytesPerMs).ceil());
+  }
+
+  /// The raw bins on disk that [conversations] without a bin list in their `.meta` hold
+  /// as decoded through their legacy windows ([_legacyWindowMs]) — the bins
+  /// [coveredBinPaths] skips because of them. Deleting such a recording records these as
+  /// deleted: otherwise its window goes with it, the bins read as undecoded, and the next
+  /// run brings the recording back. Each recording's own window, never the merged ones,
+  /// so a deletion takes no more than that recording was keeping out of processing.
+  static Future<Set<String>> _legacyWindowBinsOnDisk(Iterable<Conversation> conversations) async {
+    final silenceSlackMs = SharedPreferencesUtil().vadSplitSeconds * 1000;
+    final windows = <List<int>>[];
+    for (final c in conversations) {
+      final window = _legacyWindowMs(Conversation.fromFile(c.file),
+          isDraft: c.file.path.contains('_draft.'), silenceSlackMs: silenceSlackMs);
+      if (window != null) windows.add(window);
+    }
+    if (windows.isEmpty) return const {};
+    final rawDir = Directory('${(await getApplicationDocumentsDirectory()).path}/raw_segments');
+    if (!await rawDir.exists()) return const {};
+    final released = <String>{};
+    await for (final entity in rawDir.list(recursive: true)) {
+      if (entity is! File || !entity.path.endsWith('.bin')) continue;
+      final span = await _legacyBinSpanMs(entity);
+      if (span == null) continue;
+      final (start, end) = span;
+      if (windows.any((w) => start >= w[0] && end <= w[1])) released.add(VadAudioProcessor.relBinPath(entity.path));
+    }
+    return released;
+  }
+
   /// Return candidates already decoded by a recording, without deleting anything.
   ///
   /// Prefer exact Conversation.relativeBins membership, as pruneConsumedBins does. Use geometric windows only
   /// for old or truncated metadata without a bin list: merging windows of [rec_start - 10min, rec_end +
-  /// vadSplit] around clustered recordings can otherwise hide a nearby undecoded bin permanently.
-  ///
-  /// The size-to-duration estimate intentionally overestimates coverage needed: a measured 227 KB bin contains
-  /// 42 s rather than the estimated 56 s because about 16 percent is padding. A wider candidate interval makes
-  /// coverage harder to satisfy. Reducing it makes this filter more aggressive and risks skipping audio.
+  /// vadSplit] around clustered recordings can otherwise hide a nearby undecoded bin permanently. A bin's
+  /// span is estimated generously from its size ([_legacyBinSpanMs]).
   static Future<Set<String>> coveredBinPaths(List<File> candidates) async {
     if (candidates.isEmpty) return const {};
     final sources = await _buildCoverageSources();
     final merged = sources.legacyIntervals;
-
-    const double opusBytesPerMs = 4050 / 1000;
-    const int binHeaderBytes = 36;
 
     final covered = <String>{};
     for (final bin in candidates) {
@@ -4700,25 +4972,9 @@ class RecordingsManager {
         continue;
       }
       if (merged.isEmpty) continue;
-      final folderName = p.basename(bin.parent.path);
-      if (folderName.startsWith('session_') || folderName.startsWith('unknown_') || folderName.startsWith('.')) {
-        continue;
-      }
-      final binName = p.basename(bin.path);
-      final parts = binName.split('.').first.split('_');
-      if (parts.isEmpty) continue;
-      final timerStart = int.tryParse(parts.first);
-      if (timerStart == null || timerStart < 946684800) continue;
-      int binSize;
-      try {
-        binSize = await bin.length();
-      } catch (_) {
-        continue;
-      }
-      if (binSize <= binHeaderBytes) continue;
-      final binStartMs = timerStart * 1000;
-      final binDurationMs = (((binSize - binHeaderBytes) / opusBytesPerMs)).ceil();
-      final binEndMs = binStartMs + binDurationMs;
+      final span = await _legacyBinSpanMs(bin);
+      if (span == null) continue;
+      final (binStartMs, binEndMs) = span;
       for (final iv in merged) {
         if (binStartMs >= iv[0] && binEndMs <= iv[1]) {
           covered.add(bin.path);
@@ -4779,8 +5035,17 @@ class RecordingsManager {
   /// recording over the prefix). Callers resolve the set themselves and skip the
   /// prune entirely when it can't be read — see [processAllCompletedSessions].
   ///
-  /// Returns the number of bins deleted.
+  /// Returns the number of bins deleted. Refreshes the storage pause after, since a bin
+  /// that waited for space may be gone ([refreshStoragePause]).
   static Future<int> pruneConsumedBins({Set<String> protectedRelBins = const {}}) async {
+    try {
+      return await _pruneConsumedBins(protectedRelBins);
+    } finally {
+      await refreshStoragePause();
+    }
+  }
+
+  static Future<int> _pruneConsumedBins(Set<String> protectedRelBins) async {
     final directory = await getApplicationDocumentsDirectory();
     final rawDir = Directory('${directory.path}/raw_segments');
     if (!await rawDir.exists()) return 0;
@@ -4800,6 +5065,11 @@ class RecordingsManager {
     // Frames the checkpoint still buffers — the conversation an interrupted or failed
     // run stopped inside. Its resume saves them from these bins.
     protectedBins.addAll(await _checkpointRelBins(directory.path));
+    // Bins set aside after processing kept failing inside them. A recording finished
+    // earlier in a run that then failed can name one — the run's audio up to the failure
+    // was saved, the rest of the bin was not — so it would read as consumed. It stays
+    // until the user deletes it ([deleteSetAsideBin]) or retries it.
+    protectedBins.addAll(SetAsideBins.relBins());
     final recordingsDir = Directory('${directory.path}/recordings');
     if (await recordingsDir.exists()) {
       await for (final dayFolder in recordingsDir.list()) {

@@ -650,7 +650,7 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
                   icon: const Icon(Icons.more_vert, color: Colors.white70),
                   onSelected: (action) {
                     Navigator.of(sheetContext).pop();
-                    unawaited(_onSetAsideAction(file.relBin, action));
+                    unawaited(_onSetAsideAction(file.relBin, action, stuck: file.stuck));
                   },
                   itemBuilder: (_) => [
                     const PopupMenuItem(value: 'retry', child: Text('Try again')),
@@ -666,13 +666,25 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
     );
   }
 
-  Future<void> _onSetAsideAction(String relBin, String action) async {
+  Future<void> _onSetAsideAction(String relBin, String action, {required bool stuck}) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
       switch (action) {
-        case 'retry':
+        case 'retry' when stuck:
+          // Not set aside: processing stopped at it. The next run decodes it again.
           SetAsideBins.release(relBin);
           unawaited(_controller.startProcessingWithoutSync());
+        case 'retry':
+          final outcome = await _controller.retrySetAsideBin(relBin);
+          final message = switch (outcome) {
+            null => 'Processing is busy. Try again when it finishes.',
+            SetAsideRetry.recovered => 'Saved as a new recording.',
+            SetAsideRetry.nothingLeft => 'Nothing in this file was left to save.',
+            SetAsideRetry.cannotRetry => 'This file can\'t be processed again without duplicating a saved recording. '
+                'Share it for a bug report, or delete it.',
+            SetAsideRetry.gone => null,
+          };
+          if (message != null) messenger.showSnackBar(SnackBar(content: Text(message)));
         case 'skip':
           await SetAsideBins.skip(relBin);
           unawaited(_controller.startProcessingWithoutSync());
@@ -693,7 +705,7 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
             ),
           );
           if (confirm != true) return;
-          await SetAsideBins.delete(relBin);
+          await RecordingsManager.deleteSetAsideBin(relBin);
       }
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('Could not complete that: $e')));
@@ -1233,6 +1245,11 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
                 ),
                 StorageWarningBanner(
                   percentage: deviceProvider.storageFullPercentage,
+                ),
+                // From the last sync; a forgotten Omi leaves nothing to warn about.
+                StuckRecordingBanner(
+                  stuckFiles: _prefs.btDevice.id.isEmpty ? 0 : _prefs.lastSyncStuckFiles,
+                  overwriteMinutes: _prefs.lastSyncStuckOverwriteMinutes,
                 ),
                 VadFallbackBanner(active: _prefs.lastVadFallbackActive),
                 PhoneStorageBanner(

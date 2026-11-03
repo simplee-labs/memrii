@@ -146,8 +146,8 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     }
     final integrationMessage = _integrations.consumePendingSnack();
     if (integrationMessage != null) return integrationMessage;
-    // A late merge is reported here, once, rather than as anything in the list itself.
-    // Not while recordings are unsettled: a run's clock pass comes after its stitch and
+    // A late merge an earlier version made (nothing makes them now) is reported here,
+    // once, rather than as anything in the list itself. Not while recordings are unsettled: a run's clock pass comes after its stitch and
     // can re-file the recording a notice names, and the notice is brought up to date
     // only once that rename has happened (RecordingsManager._remapLateMergeNotices).
     if (RecordingsManager.recordingsUnsettled) return null;
@@ -1386,16 +1386,35 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// audio no run takes.
   Future<Set<String>> _heldBins() async {
     final held = {...SetAsideBins.relBins()};
-    if (!_isForcePipeline) {
-      try {
-        held.addAll(await _walSync.heldBackBinRelPaths());
-      } catch (e) {
-        // Callers here only size an estimate or pre-filter; the run itself fails closed
-        // on the same read in RecordingsManager.processAll.
-        Logger.error('RecordingsController: could not read the held-back bin set: $e');
-      }
-    }
+    if (!_isForcePipeline) held.addAll(await _heldBack() ?? const {});
     return held;
+  }
+
+  // The held-back set reads wals.json and walks every raw bin folder, and a pipeline pass
+  // asks for it several times: the estimate on each reload and promotion, then the run's
+  // pre-filter. One read serves the estimates for a few seconds. The run reads afresh and
+  // hands its answer to processAll, which would otherwise read it once more.
+  static const Duration _heldBackReuseFor = Duration(seconds: 10);
+  Future<Set<String>?>? _heldBackRead;
+  DateTime? _heldBackReadAt;
+
+  /// The bins held back for an older file of their boot still on the Omi
+  /// ([SDCardWalSync.heldBackBinRelPaths]), or null when the sync state could not be
+  /// read. Callers here only size an estimate or pre-filter; given null, the run reads
+  /// the set itself in RecordingsManager.processAll and fails closed.
+  Future<Set<String>?> _heldBack({bool fresh = false}) {
+    final cached = _heldBackRead;
+    final at = _heldBackReadAt;
+    if (!fresh && cached != null && at != null && DateTime.now().difference(at) < _heldBackReuseFor) return cached;
+    _heldBackReadAt = DateTime.now();
+    return _heldBackRead = () async {
+      try {
+        return await _walSync.heldBackBinRelPaths();
+      } catch (e) {
+        Logger.error('RecordingsController: could not read the held-back bin set: $e');
+        return null;
+      }
+    }();
   }
 
   Future<void> _runProcessing() async {
@@ -1410,6 +1429,13 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
 
     _acquireWake('pipeline');
     await SyncNotification.preparingProcessing();
+
+    // The retry a newer build owes each set-aside bin, before the regular run.
+    if (SetAsideBins.list().any((e) => e.retryPending)) {
+      await RecordingsManager.retryPendingSetAsideBins();
+      if (gen != _pipelineGeneration) return; // watchdog already recovered
+      await reloadBatchesSilently();
+    }
 
     final allBins = _batches.expand((b) => b.rawSegments).toList();
     // Always-on idempotency guard: skip bins already covered by a recording so we
@@ -1440,7 +1466,9 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       return;
     }
 
-    final heldBins = await _heldBins();
+    // Read afresh: the sync that just ended may have changed which files still wait.
+    final heldBack = _isForcePipeline ? null : await _heldBack(fresh: true);
+    final heldBins = {...SetAsideBins.relBins(), ...?heldBack};
     final notYet = {...incompleteBins, ...heldBins};
     var processableBatches = _batches.map((b) {
       final filtered = b.rawSegments.where((f) => isProcessableBin(f, discardedBins, coveredBins, notYet)).toList();
@@ -1481,10 +1509,6 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       }
     }
 
-    // Taken before the drain below, which removes the backlog's bins from this run
-    // whether or not its own runs found room for them.
-    final nothingToDecode = processableBatches.every((b) => b.rawSegments.isEmpty);
-
     // Drain any pre-mode-switch backlogs with the settings that were live when
     // they were recorded, and take those bins out of this run so only
     // current-mode audio is processed below. Returns the batches unchanged when
@@ -1497,9 +1521,6 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     final hasMarkers = processableBatches.any((b) => b.markerTimestamps.isNotEmpty);
 
     if (activeBatches.isEmpty && !(_isForcePipeline && hasDrafts) && !hasMarkers) {
-      // Nothing waits for space when nothing waits at all — e.g. the waiting audio was
-      // deleted. The runs that do decode settle the pause themselves.
-      if (nothingToDecode) RecordingsManager.clearStoragePause();
       await _finishPipelineRun();
       return;
     }
@@ -1540,6 +1561,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
         onRecordingFinalized: () {
           unawaited(reloadBatchesSilently());
         },
+        heldBackRelBins: heldBack,
       );
     } catch (e) {
       if (gen != _pipelineGeneration) return; // watchdog already recovered
@@ -1613,6 +1635,10 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     // Idempotent (Set-based) — the main processing path already released, but the
     // "nothing to process" early-return reaches here still holding it.
     _releaseWakelock();
+
+    // Whatever this pass ran or skipped, the storage pause shows the audio still waiting
+    // for space now (none, if it was deleted or set aside meanwhile).
+    await RecordingsManager.refreshStoragePause();
 
     // Re-file anything the Omi mis-dated. processAll already did, for a run that had
     // audio; this covers the "nothing to process" early-return, which also reaches this
@@ -2184,6 +2210,35 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     Logger.debug('RecoverDiscard: DONE — processed ${bins.length} bin(s), ghost removed '
         '(start=${d.startTime.toUtc()}). Look for a recording near this time.');
     return true;
+  }
+
+  /// Try again on a set-aside bin, from the recordings page: its unsaved audio is saved as
+  /// recordings of their own (see [RecordingsManager.retrySetAsideBin]). Null when the
+  /// pipeline is busy and nothing was tried. A failure is rethrown, for the page to show;
+  /// the bin stays set aside.
+  Future<SetAsideRetry?> retrySetAsideBin(String relBin) async {
+    if (_spState == SyncProcessState.successUi) dismissSuccess();
+    if (isPipelineBusy) return null;
+    _lastActiveStage = 'processing';
+    _transitionTo(SyncProcessState.processing);
+    final SetAsideRetry outcome;
+    try {
+      outcome = await RecordingsManager.retrySetAsideBin(relBin);
+    } on ProcessingBusy {
+      _transitionTo(SyncProcessState.idle);
+      return null;
+    } catch (e) {
+      _transitionToError('processing', e.toString());
+      await _loadBatches();
+      rethrow;
+    }
+    await _loadBatches();
+    if (outcome == SetAsideRetry.recovered) {
+      unawaited(_finishSuccess());
+    } else {
+      _transitionTo(SyncProcessState.idle);
+    }
+    return outcome;
   }
 
   /// Drops [d] and its bins immediately. Used when the user decides the

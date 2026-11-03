@@ -361,10 +361,13 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
       }
     }
 
-    // A failure saving what the run ends with is charged to its last bin, so one that
-    // fails every run alike is set aside like a failure inside a segment, rather than
-    // stopping every run with nothing offering Try again or Skip.
-    currentBin = params.segmentPaths.isEmpty ? null : params.segmentPaths.last;
+    // A failure saving what the run ends with is charged to the bin the unsaved
+    // recording starts in, so one that fails every run alike is set aside like a failure
+    // inside a segment, rather than stopping every run with nothing offering Try again or
+    // Skip. That bin stays the same while the recording stays open; the run's last bin,
+    // charged before, changed with every sync that brought newer audio and restarted the
+    // count each time. With nothing buffered, the last bin.
+    currentBin = processor.openRecordingStart?.path ?? (params.segmentPaths.isEmpty ? null : params.segmentPaths.last);
     phase = 'flush';
 
     // Skip the draft flush on cancel — flushRemaining triggers another save
@@ -410,11 +413,20 @@ Future<void> processingIsolateEntry(IsolateParams params) async {
 
     params.sendPort.send({'type': 'done', 'cancelled': cancelled});
   } catch (e, st) {
+    // Where in the charged bin the audio no recording holds begins, so a retry can save it
+    // as a recording of its own without decoding again what a saved one already holds. The
+    // open recording's first frame when it starts in that bin; the bin's head when it
+    // started in an earlier one (then nothing saved can be in this bin); unknown without
+    // an open recording.
+    final open = processor.openRecordingStart;
+    final startsInBin = open != null && open.path == currentBin;
     params.sendPort.send({
       'type': 'error',
       'message': '$e\n$st',
       'phase': phase,
       'bin': currentBin,
+      'binStartByte': open == null || currentBin == null ? null : (startsInBin ? open.byteOffset : 0),
+      'binStartMs': startsInBin ? open.startMs : null,
       'storageFull': RecordingWriteFailed.isStorageFull(e),
     });
   } finally {
