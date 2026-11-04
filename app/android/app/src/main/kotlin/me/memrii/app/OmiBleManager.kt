@@ -1199,39 +1199,81 @@ class OmiBleManager private constructor(private val application: Application) {
         outputPath: String,
         callback: (Result<Unit>) -> Unit
     ) {
+        startStorageRead(address, fileIndex, timerStart, { callback(Result.failure(it)) }) { addr ->
+            StorageDownloadSession(addr, offset, outputPath, timerStart, callback = callback)
+        }
+    }
+
+    /**
+     * Downloads the rest of a storage file into a new part file whose first byte is the
+     * file's logical byte [appendOffset] (the sealed-chunk layout of
+     * RECORDINGS_PIPELINE_REDESIGN.md §1). The Omi is asked to start [overlap].size bytes
+     * earlier: those resent bytes are compared with [overlap] and skipped, so a realignment
+     * can change where the Omi cuts packets without rewriting anything already on the
+     * phone. A resent byte that differs fails with "storage-mismatch".
+     *
+     * Nothing is appended until every overlap byte has arrived and matched; a file that
+     * ends on the Omi before [appendOffset] fails with "storage-short-source".
+     *
+     * Success carries the logical end of the bytes written to the part and whether the
+     * first start ACK echoed the requested timestamp. Every failure is a FlutterError whose
+     * details carry the same two facts, so the caller can seal exactly that prefix.
+     */
+    fun downloadStorageChunk(
+        address: String,
+        fileIndex: Int,
+        appendOffset: Long,
+        timerStart: Long,
+        partPath: String,
+        overlap: ByteArray,
+        callback: (Result<StorageChunkResult>) -> Unit
+    ) {
+        if (appendOffset < overlap.size) {
+            callback(Result.failure(FlutterError("storage-argument", "Overlap reaches before the file's start", null)))
+            return
+        }
+        startStorageRead(address, fileIndex, timerStart, { callback(Result.failure(it)) }) { addr ->
+            lateinit var session: StorageDownloadSession
+            session = StorageDownloadSession(addr, appendOffset, partPath, timerStart, chunkOverlap = overlap) { result ->
+                callback(
+                    if (result.isSuccess) Result.success(StorageChunkResult(session.acceptedEnd(), session.echoedAck))
+                    else Result.failure(session.chunkFailure(result.exceptionOrNull()!!))
+                )
+            }
+            session
+        }
+    }
+
+    private fun startStorageRead(
+        address: String,
+        fileIndex: Int,
+        timerStart: Long,
+        fail: (Throwable) -> Unit,
+        newSession: (String) -> StorageDownloadSession
+    ) {
         val addr = address.uppercase()
         val gatt = connectedGatts[addr]
         if (gatt == null) {
-            callback(Result.failure(Exception("Not connected")))
+            fail(Exception("Not connected"))
             return
         }
         val characteristic = gatt.getService(STORAGE_SERVICE_UUID)?.getCharacteristic(STORAGE_CHAR_UUID)
         if (characteristic == null) {
-            callback(Result.failure(Exception("Storage characteristic not found")))
+            fail(Exception("Storage characteristic not found"))
             return
         }
 
         // Register session BEFORE enqueuing CMD_READ_FILE so the start-ACK (0x03 0x00)
         // is never missed if the write callback and the notification race.
-        val session = StorageDownloadSession(addr, offset, outputPath, timerStart, callback)
+        val session = newSession(addr)
+        val offset = session.requestOffset
         activeDownloads[addr] = session
         // Registered, so applyConnectionPriority now reads "transferring". Raised before
         // CMD_READ_FILE is enqueued rather than on the first packet: the whole point is
         // for the fast interval to be in force by the time data starts arriving.
         applyConnectionPriority(addr)
 
-        // Build CMD_READ_FILE: [0x11, fileIndex, offset 4B LE, timerStart 4B LE]
-        val cmd = ByteArray(10)
-        cmd[0] = 0x11.toByte()
-        cmd[1] = fileIndex.toByte()
-        cmd[2] = (offset and 0xFF).toByte()
-        cmd[3] = ((offset shr 8) and 0xFF).toByte()
-        cmd[4] = ((offset shr 16) and 0xFF).toByte()
-        cmd[5] = ((offset shr 24) and 0xFF).toByte()
-        cmd[6] = (timerStart and 0xFF).toByte()
-        cmd[7] = ((timerStart shr 8) and 0xFF).toByte()
-        cmd[8] = ((timerStart shr 16) and 0xFF).toByte()
-        cmd[9] = ((timerStart shr 24) and 0xFF).toByte()
+        val cmd = session.readCommand(fileIndex)
 
         val writeType = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -1270,13 +1312,57 @@ class OmiBleManager private constructor(private val application: Application) {
     inner class StorageDownloadSession(
         private val address: String,
         startOffset: Long,
-        outputPath: String,
+        private val outputPath: String,
         // The file timestamp this read asked for; oo-3.1.4+ echoes it in the start ACK.
         private val expectedTs: Long,
+        // Non-null for a sealed-chunk part (downloadStorageChunk): the part's first byte is
+        // the file's logical byte [startOffset], and these are the sealed bytes just before
+        // it, which the Omi is asked to resend and which are compared, never written. Null
+        // for a whole bin, which keeps its original behaviour exactly.
+        chunkOverlap: ByteArray? = null,
         private val callback: (Result<Unit>) -> Unit
     ) {
+        private val isPart = chunkOverlap != null
+        private val overlap = chunkOverlap ?: ByteArray(0)
+        private val appendStart = startOffset
+        // The logical offset of the output file's first byte. Offsets on the wire and in
+        // errors stay logical; only positions in the file are relative to this.
+        private val fileBase = if (isPart) startOffset else 0L
+
+        /** Where the Omi is asked to start reading. */
+        val requestOffset = startOffset - overlap.size
+
+        /** CMD_READ_FILE for this read: [0x11, fileIndex, requestOffset 4B LE, timestamp 4B LE]. */
+        fun readCommand(fileIndex: Int): ByteArray {
+            val cmd = ByteArray(10)
+            cmd[0] = 0x11.toByte()
+            cmd[1] = fileIndex.toByte()
+            cmd[2] = (requestOffset and 0xFF).toByte()
+            cmd[3] = ((requestOffset shr 8) and 0xFF).toByte()
+            cmd[4] = ((requestOffset shr 16) and 0xFF).toByte()
+            cmd[5] = ((requestOffset shr 24) and 0xFF).toByte()
+            cmd[6] = (expectedTs and 0xFF).toByte()
+            cmd[7] = ((expectedTs shr 8) and 0xFF).toByte()
+            cmd[8] = ((expectedTs shr 16) and 0xFF).toByte()
+            cmd[9] = ((expectedTs shr 24) and 0xFF).toByte()
+            return cmd
+        }
+
         private var expectedOffset = startOffset
+        // Part only: the next logical byte expected from the Omi. It starts at the request
+        // offset, so the overlap must arrive, contiguously, and match before anything is
+        // appended.
+        private var receivedOffset = requestOffset
+        // Part only: the end of the bytes fully written to the part. Unlike expectedOffset it
+        // is not reset by a failed rollback or close: those bytes are on disk, and the caller
+        // cuts the part back to exactly here.
+        private var acceptedOffset = startOffset
         private val fos: java.io.FileOutputStream
+        // Whether the first accepted start ACK echoed the requested timestamp: the read is
+        // then known to be this file's. Older firmware's two-byte ACK cannot say. Latched:
+        // a later ACK cannot vouch for bytes accepted before it.
+        @Volatile var echoedAck = false
+            private set
         private val completed = java.util.concurrent.atomic.AtomicBoolean(false)
         private var hasReceivedStartAck = false
         // Whether CMD_READ_FILE has been handed to the stack yet. An ACK before that is not
@@ -1337,7 +1423,8 @@ class OmiBleManager private constructor(private val application: Application) {
         init {
             val file = java.io.File(outputPath)
             file.parentFile?.mkdirs()
-            fos = java.io.FileOutputStream(file, startOffset > 0)
+            // A part file starts empty; a whole bin resumes by appending.
+            fos = java.io.FileOutputStream(file, !isPart && startOffset > 0)
             rearmTimeout()
         }
 
@@ -1362,6 +1449,7 @@ class OmiBleManager private constructor(private val application: Application) {
                     // which marks it synced and deletes the real one from the card. 0 (from
                     // firmware or a request without a timestamp) cannot be correlated, so it
                     // is taken as before; a two-byte ACK is older firmware.
+                    var echoMatched = false
                     if (value.size >= 6 && expectedTs != 0L) {
                         val echoed = (value[2].toLong() and 0xFF) or
                             ((value[3].toLong() and 0xFF) shl 8) or
@@ -1371,11 +1459,14 @@ class OmiBleManager private constructor(private val application: Application) {
                             Log.w(TAG, "ACK for ts=$echoed while reading ts=$expectedTs — a late ACK from an earlier read; ignored")
                             return
                         }
+                        echoMatched = echoed != 0L
                     }
                     if (value.size >= 2) {
                         val code = value[1].toInt() and 0xFF
-                        if (code == 0) hasReceivedStartAck = true
-                        else {
+                        if (code == 0) {
+                            if (!hasReceivedStartAck) echoedAck = echoMatched
+                            hasReceivedStartAck = true
+                        } else {
                             complete(Result.failure(Exception("Error ACK: $code")))
                         }
                     }
@@ -1391,6 +1482,10 @@ class OmiBleManager private constructor(private val application: Application) {
                         ((value[3].toLong() and 0xFF) shl 16) or
                         ((value[4].toLong() and 0xFF) shl 24)
                     val payload = value.copyOfRange(5, value.size)
+                    if (isPart) {
+                        onPartData(incoming, payload)
+                        return
+                    }
                     when {
                         incoming > expectedOffset -> {
                             // Length must represent received, contiguous bytes. Never invent
@@ -1431,24 +1526,128 @@ class OmiBleManager private constructor(private val application: Application) {
                     // being harmless when priority restoration moved there, since the link
                     // would then stay at CONNECTION_PRIORITY_HIGH after every successful
                     // download and never return to the idle interval.
+                    if (isPart && receivedOffset < appendStart) {
+                        // The Omi's copy ends before the phone's sealed end (mount recovery can
+                        // shorten a closed segment), so part of the overlap was never compared.
+                        complete(Result.failure(FlutterError(
+                            "storage-short-source",
+                            "The Omi's file ends at $receivedOffset, before the sealed end $appendStart",
+                            mapOf("receivedEnd" to receivedOffset)
+                        )))
+                        return
+                    }
                     complete(Result.success(Unit))
                 }
             }
+        }
+
+        // DATA for a part. Every byte the phone already holds (the sealed overlap, or what
+        // this part has written) is compared and skipped; only bytes past both are appended,
+        // and only once everything before them has arrived.
+        private fun onPartData(incoming: Long, payload: ByteArray) {
+            if (incoming > receivedOffset) {
+                complete(Result.failure(FlutterError(
+                    "storage-integrity",
+                    "Non-contiguous storage DATA: incoming=$incoming expected=$receivedOffset",
+                    mapOf("expectedOffset" to receivedOffset, "incomingOffset" to incoming)
+                )))
+                return
+            }
+            val end = incoming + payload.size
+            val known = minOf(end, expectedOffset)
+            if (incoming < known) {
+                val differs = try {
+                    firstMismatch(incoming, payload, known)
+                } catch (e: Exception) {
+                    // The part could not be read back for the comparison. Nothing more is
+                    // accepted unchecked; what the part already holds stays accepted.
+                    complete(Result.failure(FlutterError(
+                        "storage-compare",
+                        "Could not read the part to compare resent DATA: $e",
+                        mapOf("expectedOffset" to receivedOffset)
+                    )))
+                    return
+                }
+                if (differs != null) {
+                    // The Omi resent bytes the phone already holds, and they are not the same:
+                    // its copy changed, or this is another file's stream. Nothing more may be
+                    // appended to a copy it no longer matches.
+                    complete(Result.failure(FlutterError(
+                        "storage-mismatch",
+                        "Resent storage DATA differs from the phone's copy at $differs",
+                        mapOf("offset" to differs)
+                    )))
+                    return
+                }
+            }
+            if (end > expectedOffset) {
+                appendPayload(payload.copyOfRange((expectedOffset - incoming).toInt(), payload.size))
+                if (completed.get()) return
+            }
+            if (end > receivedOffset) receivedOffset = end
+        }
+
+        // The first of payload's bytes at logical [incoming, until) that differs from the
+        // phone's copy: the overlap below the append offset, the part above it. Bytes before
+        // the requested start have nothing to compare with and are ignored.
+        private fun firstMismatch(incoming: Long, payload: ByteArray, until: Long): Long? {
+            val partFrom = maxOf(incoming, appendStart)
+            val written = if (partFrom < until) readPart(partFrom, until) else null
+            var position = maxOf(incoming, requestOffset)
+            while (position < until) {
+                val expected = if (position < appendStart) overlap[(position - requestOffset).toInt()]
+                    else written!![(position - partFrom).toInt()]
+                if (payload[(position - incoming).toInt()] != expected) return position
+                position++
+            }
+            return null
+        }
+
+        // Reads the part's logical bytes [from, until) back for a comparison. A member, like
+        // [fos], so the native harness can make it fail without touching the part.
+        private var readPart: (Long, Long) -> ByteArray = { from, until ->
+            val bytes = ByteArray((until - from).toInt())
+            java.io.RandomAccessFile(outputPath, "r").use {
+                it.seek(from - fileBase)
+                it.readFully(bytes)
+            }
+            bytes
         }
 
         private fun appendPayload(payload: ByteArray) {
             try {
                 fos.write(payload)
                 expectedOffset += payload.size
+                acceptedOffset = expectedOffset
             } catch (e: Exception) {
                 // A failed write may have written some bytes. Keep only the last
                 // fully accepted packet; if rollback fails, require a fresh read.
-                try { fos.channel.truncate(expectedOffset) } catch (_: Exception) { expectedOffset = 0 }
+                try { fos.channel.truncate(expectedOffset - fileBase) } catch (_: Exception) { expectedOffset = 0 }
                 complete(Result.failure(FlutterError(
                     "storage-integrity", "Storage write failed: $e",
                     mapOf("expectedOffset" to expectedOffset)
                 )))
             }
+        }
+
+        /**
+         * The logical end of the bytes written whole. For a part it survives a failed
+         * rollback or close: those bytes are on disk, and the caller cuts the part to here.
+         */
+        @Synchronized
+        fun acceptedEnd(): Long = if (isPart) acceptedOffset else expectedOffset
+
+        /**
+         * [error] as a chunk download reports it: a FlutterError with its own code, message
+         * and details, plus [acceptedEnd] and [echoedAck].
+         */
+        fun chunkFailure(error: Throwable): FlutterError {
+            val reported = (error as? FlutterError)?.details as? Map<*, *>
+            val details = HashMap<String, Any?>()
+            reported?.forEach { (key, value) -> details[key.toString()] = value }
+            details["acceptedEnd"] = acceptedEnd()
+            details["echoedAck"] = echoedAck
+            return FlutterError((error as? FlutterError)?.code ?: "storage-transfer", error.message, details)
         }
 
         // Binder DATA, main-thread timeout and disconnect must not close the stream

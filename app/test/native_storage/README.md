@@ -16,12 +16,23 @@ The runner uses `kotlinc` on PATH or cached Gradle compiler dependencies
 (Kotlin 2.1.0 by default, overridable with `--kotlin-version`). Extraction fails
 if the production seam changes instead of silently testing a copied receiver.
 
-The 20 cases cover contiguous bytes, duplicates/overlap, gaps (including the
+Of the 31 cases, twenty cover contiguous bytes, duplicates/overlap, gaps (including the
 maximum unsigned wire offset), late packets/EOT, repeated failures and correct
 resume, legitimate zeros, legacy, timestamped and command-naming ACKs, conditional session
 removal, partial-write rollback, close failure, and serialization of a write
-against completion. I/O-failure tests replace the writer with a fault-injecting
+against completion. The other eleven cover the sealed-chunk part session
+(`downloadStorageChunk`, not yet switched on): the emitted read command; a part holding
+only the bytes after its append offset; a differing resent byte failing with
+`storage-mismatch`; nothing appended before the whole overlap has arrived; a file
+ending on the Omi before the sealed end (`storage-short-source`); resends inside the
+part compared with what it holds; a part that cannot be read back for that comparison
+(`storage-compare`); part-local rollback; accepted bytes kept through a failed rollback
+and a failed close; the echo latched at the first start ACK; and every failure reporting
+its accepted end. I/O-failure tests replace the writer with a fault-injecting
 FileOutputStream subclass; production error handling still runs unchanged.
+`test_extraction.py` also checks that the generated Dart and Kotlin Pigeon code agree on
+`downloadStorageChunk`'s argument order, its result's fields and their codec type, since
+each side's tests exercise only their own codec.
 
 Android logging, Handler scheduling and connection-priority effects are stubbed.
 Immediate posts run synchronously and delayed posts do not fire. A controlled

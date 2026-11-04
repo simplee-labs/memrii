@@ -38,6 +38,18 @@ class BleService {
   BleService({required this.uuid, required this.characteristicUuids});
 }
 
+/// What a native chunk download ([BleHostApi.downloadStorageChunk]) accepted.
+class StorageChunkResult {
+  /// The file's logical offset just past the last byte written to the part.
+  final int acceptedEnd;
+
+  /// Whether the firmware's start ACK echoed the requested timestamp, so the bytes are
+  /// known to be this file's. Older firmware's two-byte ACK cannot say.
+  final bool echoedAck;
+
+  StorageChunkResult({required this.acceptedEnd, required this.echoedAck});
+}
+
 /// Dart → Native: commands sent from Flutter to the native BLE module.
 @HostApi()
 abstract class BleHostApi {
@@ -124,6 +136,22 @@ abstract class BleHostApi {
     int offset,
     int timerStart,
     String outputPath,
+  );
+
+  /// (Android only) Download the rest of a storage file into a new part file whose first
+  /// byte is the file's logical byte [appendOffset]. The Omi is asked to start
+  /// [overlap].length bytes earlier; those resent bytes are compared with [overlap] (the
+  /// sealed bytes just before [appendOffset]) and skipped, and a difference fails with
+  /// "storage-mismatch". Every failure's details carry `acceptedEnd` and `echoedAck`.
+  @async
+  @SwiftFunction('downloadStorageChunk(peripheralUuid:fileIndex:appendOffset:timerStart:partPath:overlap:)')
+  StorageChunkResult downloadStorageChunk(
+    String peripheralUuid,
+    int fileIndex,
+    int appendOffset,
+    int timerStart,
+    String partPath,
+    Uint8List overlap,
   );
 
   /// (Android only) Acquire a CPU partial wake-lock so the OS does not throttle

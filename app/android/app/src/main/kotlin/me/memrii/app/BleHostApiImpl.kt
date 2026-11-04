@@ -219,6 +219,20 @@ class BleHostApiImpl(
         bleManager.downloadStorageFile(peripheralUuid, fileIndex.toInt(), offset, timerStart, outputPath, callback)
     }
 
+    override fun downloadStorageChunk(
+        peripheralUuid: String,
+        fileIndex: Long,
+        appendOffset: Long,
+        timerStart: Long,
+        partPath: String,
+        overlap: ByteArray,
+        callback: (Result<StorageChunkResult>) -> Unit
+    ) {
+        bleManager.downloadStorageChunk(
+            peripheralUuid, fileIndex.toInt(), appendOffset, timerStart, partPath, overlap, callback
+        )
+    }
+
     override fun requestCompanionDeviceAssociation(deviceAddress: String, callback: (Result<String>) -> Unit) {
         Log.i(TAG, "requestCompanionDeviceAssociation: $deviceAddress")
 

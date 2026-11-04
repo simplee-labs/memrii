@@ -156,6 +156,46 @@ data class BleService (
 
   override fun hashCode(): Int = toList().hashCode()
 }
+
+/**
+ * What a native chunk download ([BleHostApi.downloadStorageChunk]) accepted.
+ *
+ * Generated class from Pigeon that represents data sent in messages.
+ */
+data class StorageChunkResult (
+  /** The file's logical offset just past the last byte written to the part. */
+  val acceptedEnd: Long,
+  /**
+   * Whether the firmware's start ACK echoed the requested timestamp, so the bytes are
+   * known to be this file's. Older firmware's two-byte ACK cannot say.
+   */
+  val echoedAck: Boolean
+)
+ {
+  companion object {
+    fun fromList(pigeonVar_list: List<Any?>): StorageChunkResult {
+      val acceptedEnd = pigeonVar_list[0] as Long
+      val echoedAck = pigeonVar_list[1] as Boolean
+      return StorageChunkResult(acceptedEnd, echoedAck)
+    }
+  }
+  fun toList(): List<Any?> {
+    return listOf(
+      acceptedEnd,
+      echoedAck,
+    )
+  }
+  override fun equals(other: Any?): Boolean {
+    if (other !is StorageChunkResult) {
+      return false
+    }
+    if (this === other) {
+      return true
+    }
+    return PigeonCommunicatorPigeonUtils.deepEquals(toList(), other.toList())  }
+
+  override fun hashCode(): Int = toList().hashCode()
+}
 private open class PigeonCommunicatorPigeonCodec : StandardMessageCodec() {
   override fun readValueOfType(type: Byte, buffer: ByteBuffer): Any? {
     return when (type) {
@@ -169,6 +209,11 @@ private open class PigeonCommunicatorPigeonCodec : StandardMessageCodec() {
           BleService.fromList(it)
         }
       }
+      131.toByte() -> {
+        return (readValue(buffer) as? List<Any?>)?.let {
+          StorageChunkResult.fromList(it)
+        }
+      }
       else -> super.readValueOfType(type, buffer)
     }
   }
@@ -180,6 +225,10 @@ private open class PigeonCommunicatorPigeonCodec : StandardMessageCodec() {
       }
       is BleService -> {
         stream.write(130)
+        writeValue(stream, value.toList())
+      }
+      is StorageChunkResult -> {
+        stream.write(131)
         writeValue(stream, value.toList())
       }
       else -> super.writeValue(stream, value)
@@ -235,6 +284,14 @@ interface BleHostApi {
    * iOS throws 'unimplemented' — callers must check Platform.isAndroid.
    */
   fun downloadStorageFile(peripheralUuid: String, fileIndex: Long, offset: Long, timerStart: Long, outputPath: String, callback: (Result<Unit>) -> Unit)
+  /**
+   * (Android only) Download the rest of a storage file into a new part file whose first
+   * byte is the file's logical byte [appendOffset]. The Omi is asked to start
+   * [overlap].length bytes earlier; those resent bytes are compared with [overlap] (the
+   * sealed bytes just before [appendOffset]) and skipped, and a difference fails with
+   * "storage-mismatch". Every failure's details carry `acceptedEnd` and `echoedAck`.
+   */
+  fun downloadStorageChunk(peripheralUuid: String, fileIndex: Long, appendOffset: Long, timerStart: Long, partPath: String, overlap: ByteArray, callback: (Result<StorageChunkResult>) -> Unit)
   /**
    * (Android only) Acquire a CPU partial wake-lock so the OS does not throttle
    * the processing isolate during VAD inference. Call before processAll; release
@@ -626,6 +683,31 @@ interface BleHostApi {
         }
       }
       run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.omi_pigeon.BleHostApi.downloadStorageChunk$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val peripheralUuidArg = args[0] as String
+            val fileIndexArg = args[1] as Long
+            val appendOffsetArg = args[2] as Long
+            val timerStartArg = args[3] as Long
+            val partPathArg = args[4] as String
+            val overlapArg = args[5] as ByteArray
+            api.downloadStorageChunk(peripheralUuidArg, fileIndexArg, appendOffsetArg, timerStartArg, partPathArg, overlapArg) { result: Result<StorageChunkResult> ->
+              val error = result.exceptionOrNull()
+              if (error != null) {
+                reply.reply(PigeonCommunicatorPigeonUtils.wrapError(error))
+              } else {
+                val data = result.getOrNull()
+                reply.reply(PigeonCommunicatorPigeonUtils.wrapResult(data))
+              }
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
         val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.omi_pigeon.BleHostApi.acquireProcessingWakeLock$separatedMessageChannelSuffix", codec)
         if (api != null) {
           channel.setMessageHandler { _, reply ->
@@ -883,21 +965,14 @@ class BleFlutterApi(private val binaryMessenger: BinaryMessenger, private val me
     }
   }
   /**
-   * Diagnostic records native produced, as complete JSON lines in
-   * `DebugLogManager`'s schema, for Dart to append to the debug log.
+   * Native diagnostic records as complete JSON lines in DebugLogManager's schema, for Dart to append under its
+   * write lock.
    *
-   * Native used to append to that file itself. It cannot: Dart's
-   * `FileMode.append` is **not** `O_APPEND` — it resolves the write offset when
-   * the file is opened, not when the bytes are written — while Kotlin's
-   * `FileOutputStream(append = true)` is. So a native record landing between
-   * Dart's open and Dart's write was overwritten by it, one-directionally, and
-   * native emits precisely during the Dart logging bursts that describe the same
-   * disconnect. A 4.4 h capture on 2026-08-31 kept **one** native record out of
-   * eight expected, and the survivor was a deliberate disconnect rather than one
-   * of the timeouts the records exist to classify.
+   * Dart FileMode.append resolves its offset at open time. An independent native O_APPEND write between that
+   * open and write can be overwritten, especially during correlated disconnect bursts. Native must hand
+   * records to Dart instead of writing the file.
    *
-   * Lines arrive pre-encoded so the timestamp inside each one is still the
-   * instant native observed the event, not the instant Dart got the batch.
+   * Preserve each encoded timestamp so delayed batches retain the time native observed the event.
    */
   fun onNativeLogRecords(linesArg: List<String>, callback: (Result<Unit>) -> Unit)
 {

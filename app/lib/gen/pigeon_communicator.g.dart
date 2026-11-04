@@ -141,6 +141,56 @@ class BleService {
   int get hashCode => Object.hashAll(_toList());
 }
 
+/// What a native chunk download ([BleHostApi.downloadStorageChunk]) accepted.
+class StorageChunkResult {
+  StorageChunkResult({
+    required this.acceptedEnd,
+    required this.echoedAck,
+  });
+
+  /// The file's logical offset just past the last byte written to the part.
+  int acceptedEnd;
+
+  /// Whether the firmware's start ACK echoed the requested timestamp, so the bytes are
+  /// known to be this file's. Older firmware's two-byte ACK cannot say.
+  bool echoedAck;
+
+  List<Object?> _toList() {
+    return <Object?>[
+      acceptedEnd,
+      echoedAck,
+    ];
+  }
+
+  Object encode() {
+    return _toList();
+  }
+
+  static StorageChunkResult decode(Object result) {
+    result as List<Object?>;
+    return StorageChunkResult(
+      acceptedEnd: result[0]! as int,
+      echoedAck: result[1]! as bool,
+    );
+  }
+
+  @override
+  // ignore: avoid_equals_and_hash_code_on_mutable_classes
+  bool operator ==(Object other) {
+    if (other is! StorageChunkResult || other.runtimeType != runtimeType) {
+      return false;
+    }
+    if (identical(this, other)) {
+      return true;
+    }
+    return _deepEquals(encode(), other.encode());
+  }
+
+  @override
+  // ignore: avoid_equals_and_hash_code_on_mutable_classes
+  int get hashCode => Object.hashAll(_toList());
+}
+
 class _PigeonCodec extends StandardMessageCodec {
   const _PigeonCodec();
   @override
@@ -154,6 +204,9 @@ class _PigeonCodec extends StandardMessageCodec {
     } else if (value is BleService) {
       buffer.putUint8(130);
       writeValue(buffer, value.encode());
+    } else if (value is StorageChunkResult) {
+      buffer.putUint8(131);
+      writeValue(buffer, value.encode());
     } else {
       super.writeValue(buffer, value);
     }
@@ -166,6 +219,8 @@ class _PigeonCodec extends StandardMessageCodec {
         return BlePeripheral.decode(readValue(buffer)!);
       case 130:
         return BleService.decode(readValue(buffer)!);
+      case 131:
+        return StorageChunkResult.decode(readValue(buffer)!);
       default:
         return super.readValueOfType(type, buffer);
     }
@@ -659,6 +714,41 @@ class BleHostApi {
     }
   }
 
+  /// (Android only) Download the rest of a storage file into a new part file whose first
+  /// byte is the file's logical byte [appendOffset]. The Omi is asked to start
+  /// [overlap].length bytes earlier; those resent bytes are compared with [overlap] (the
+  /// sealed bytes just before [appendOffset]) and skipped, and a difference fails with
+  /// "storage-mismatch". Every failure's details carry `acceptedEnd` and `echoedAck`.
+  Future<StorageChunkResult> downloadStorageChunk(String peripheralUuid, int fileIndex, int appendOffset,
+      int timerStart, String partPath, Uint8List overlap) async {
+    final String pigeonVar_channelName =
+        'dev.flutter.pigeon.omi_pigeon.BleHostApi.downloadStorageChunk$pigeonVar_messageChannelSuffix';
+    final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture =
+        pigeonVar_channel.send(<Object?>[peripheralUuid, fileIndex, appendOffset, timerStart, partPath, overlap]);
+    final List<Object?>? pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+    if (pigeonVar_replyList == null) {
+      throw _createConnectionError(pigeonVar_channelName);
+    } else if (pigeonVar_replyList.length > 1) {
+      throw PlatformException(
+        code: pigeonVar_replyList[0]! as String,
+        message: pigeonVar_replyList[1] as String?,
+        details: pigeonVar_replyList[2],
+      );
+    } else if (pigeonVar_replyList[0] == null) {
+      throw PlatformException(
+        code: 'null-error',
+        message: 'Host platform returned null value for non-null return value.',
+      );
+    } else {
+      return (pigeonVar_replyList[0] as StorageChunkResult?)!;
+    }
+  }
+
   /// (Android only) Acquire a CPU partial wake-lock so the OS does not throttle
   /// the processing isolate during VAD inference. Call before processAll; release
   /// in finally. iOS no-op.
@@ -865,21 +955,14 @@ abstract class BleFlutterApi {
   /// but sourced from the OS scheduler instead of the Dart timer.
   void onBackgroundSyncRequested();
 
-  /// Diagnostic records native produced, as complete JSON lines in
-  /// `DebugLogManager`'s schema, for Dart to append to the debug log.
+  /// Native diagnostic records as complete JSON lines in DebugLogManager's schema, for Dart to append under its
+  /// write lock.
   ///
-  /// Native used to append to that file itself. It cannot: Dart's
-  /// `FileMode.append` is **not** `O_APPEND` — it resolves the write offset when
-  /// the file is opened, not when the bytes are written — while Kotlin's
-  /// `FileOutputStream(append = true)` is. So a native record landing between
-  /// Dart's open and Dart's write was overwritten by it, one-directionally, and
-  /// native emits precisely during the Dart logging bursts that describe the same
-  /// disconnect. A 4.4 h capture on 2026-08-31 kept **one** native record out of
-  /// eight expected, and the survivor was a deliberate disconnect rather than one
-  /// of the timeouts the records exist to classify.
+  /// Dart FileMode.append resolves its offset at open time. An independent native O_APPEND write between that
+  /// open and write can be overwritten, especially during correlated disconnect bursts. Native must hand
+  /// records to Dart instead of writing the file.
   ///
-  /// Lines arrive pre-encoded so the timestamp inside each one is still the
-  /// instant native observed the event, not the instant Dart got the batch.
+  /// Preserve each encoded timestamp so delayed batches retain the time native observed the event.
   void onNativeLogRecords(List<String> lines);
 
   static void setUp(
