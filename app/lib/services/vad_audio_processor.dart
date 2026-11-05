@@ -2525,10 +2525,17 @@ class VadAudioProcessor {
   Future<String?> saveRecordingTest(List<Object> refs, DateTime startTime, {bool isDerivedTimestamp = false}) =>
       _saveRecording(refs, startTime, isDerivedTimestamp: isDerivedTimestamp);
 
+  /// Test seam: each recording as it is saved, its frames and silences in order. The
+  /// planner's equivalence test (test/unit/services/raw/plan_equivalence_test.dart)
+  /// compares against it; it goes with this processor.
+  @visibleForTesting
+  static void Function(List<Object> refs, DateTime startTime)? debugOnSave;
+
   /// Throws [RecordingWriteFailed] rather than returning without a file, so a
   /// recording that could not be written never lets its frames' bins be released.
   Future<String> _saveRecording(List<Object> refs, DateTime startTime,
       {bool? isDerivedTimestamp, bool isDraft = false, bool capEnded = false}) async {
+    debugOnSave?.call(List.of(refs), startTime);
     final String result;
     try {
       result = await _saveRecordingCore(refs, startTime,

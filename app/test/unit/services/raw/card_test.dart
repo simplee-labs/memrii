@@ -284,6 +284,23 @@ void main() {
       expect(back.frameCount, 2);
       expect(back.events, s.events);
       expect(back.events.map((e) => e.kind), [CardEventKind.header, CardEventKind.tap]);
+      expect(back.hasVad, isTrue);
+      expect(back.firstFrameOffset, s.firstFrameOffset);
+      expect(back.firstFrameOffset, 36);
+    });
+
+    test('a summary keeps a card made without VAD as such', () {
+      final c = card();
+      final noVad = FileCard(
+        key: c.key,
+        indexerVersion: c.indexerVersion,
+        chunks: c.chunks,
+        records: c.records,
+        decoderId: c.decoderId,
+        vadModelId: FileCard.noVad,
+        audio: c.audio,
+      );
+      expect(EventSummary.fromJson(noVad.summary.toJson()).hasVad, isFalse);
     });
   });
 }

@@ -355,8 +355,14 @@ class FileCard {
     return true;
   }
 
-  EventSummary get summary =>
-      EventSummary(key: key, length: records.length, frameCount: records.frameCount, events: records.events);
+  EventSummary get summary => EventSummary(
+        key: key,
+        length: records.length,
+        frameCount: records.frameCount,
+        firstFrameOffset: records.frameCount == 0 ? null : records.frameOffsets[0],
+        events: records.events,
+        hasVad: hasVad,
+      );
 
   static const _magic = 0x4452434D; // "MCRD"
 
@@ -453,23 +459,41 @@ class EventSummary {
   final RawFileKey key;
   final int length;
   final int frameCount;
+
+  /// Where the first frame is, if any: what a released file's audio wall is placed at.
+  final int? firstFrameOffset;
   final List<CardEvent> events;
 
-  const EventSummary({required this.key, required this.length, required this.frameCount, required this.events});
+  /// Whether the card was made with the VAD model: the planner's flood guard, an event
+  /// rule, applies only without it, so a receipt keeps it.
+  final bool hasVad;
+
+  const EventSummary({
+    required this.key,
+    required this.length,
+    required this.frameCount,
+    required this.firstFrameOffset,
+    required this.events,
+    required this.hasVad,
+  });
 
   Map<String, Object?> toJson() => {
         'timerStart': key.timerStart,
         'sessionId': key.sessionId,
         'length': length,
         'frames': frameCount,
+        if (firstFrameOffset != null) 'firstFrame': firstFrameOffset,
         'events': [for (final e in events) e.toJson()],
+        'vad': hasVad,
       };
 
   factory EventSummary.fromJson(Map<String, Object?> j) => EventSummary(
         key: RawFileKey(j['timerStart']! as int, j['sessionId'] as int?),
         length: j['length']! as int,
         frameCount: j['frames']! as int,
+        firstFrameOffset: j['firstFrame'] as int?,
         events: [for (final e in (j['events']! as List).cast<Map<String, Object?>>()) CardEvent.fromJson(e)],
+        hasVad: j['vad']! as bool,
       );
 }
 
