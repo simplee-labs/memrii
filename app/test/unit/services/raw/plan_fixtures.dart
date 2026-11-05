@@ -25,6 +25,10 @@ const manualPolicy = PlanPolicy(
 );
 
 const speech = 0.9;
+
+/// Names a file in its frames' payloads: its `timerStart` (low 20 bits) and session (11
+/// bits). Files of one session start less than 12 days apart.
+int frameTag(RawFileKey k) => (k.timerStart & 0xFFFFF) | (((k.sessionId ?? 0) & 0x7FF) << 20);
 const quiet = 0.1;
 
 /// Builds a bin the way the firmware writes it, keeping the Omi's clock and uptime as it
@@ -64,12 +68,23 @@ class Bin {
   int get frameCount => _speech.length;
   int get length => _bytes.length;
 
-  /// [n] frames with speech probability [p] (−1: no VAD window completed in it).
+  /// Each frame's record offset, as written (not parsed back).
+  final frameOffsetsWritten = <int>[];
+
+  /// Each frame, whether it can be decoded.
+  List<int> get decodable => List.unmodifiable(_decoded);
+
+  /// [n] frames with speech probability [p] (−1: no VAD window completed in it). Each
+  /// 8-byte payload names the frame: its index in the file (bit 31 set when it cannot be
+  /// decoded) and the file's [frameTag], which the publication tests' fake decoder
+  /// renders into its samples. The planner never reads payloads.
   Bin frames(int n, {double p = -1, bool decoded = true}) {
     for (var i = 0; i < n; i++) {
+      frameOffsetsWritten.add(_bytes.length);
       _bytes.add((ByteData(12)
             ..setUint32(0, 8, Endian.little)
-            ..setUint32(4, _speech.length, Endian.little))
+            ..setUint32(4, _speech.length | (decoded ? 0 : 0x80000000), Endian.little)
+            ..setUint32(8, frameTag(key), Endian.little))
           .buffer
           .asUint8List());
       _speech.add(p);
