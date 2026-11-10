@@ -26,95 +26,6 @@ import 'package:omi/services/raw/render.dart';
 import 'plan_fixtures.dart';
 import 'publish_fixtures.dart';
 
-const _short = PlanPolicy(
-    vadEnabled: true, speechThreshold: 0.5, silenceSplitMs: 20000, minSpeechMs: 2000, maxChunkMs: 60000, manual: false);
-const _policies = [_short, manualPolicy, autoPolicy];
-
-class _Gen {
-  final Random r;
-  _Gen(int seed) : r = Random(seed);
-
-  T pick<T>(List<T> xs) => xs[r.nextInt(xs.length)];
-  bool chance(int percent) => r.nextInt(100) < percent;
-
-  /// Small timelines: a few sessions and files, every marker kind, short gaps.
-  List<Bin> timeline() {
-    final bins = <Bin>[];
-    var t = 1789000000000 + r.nextInt(100000) * 1000;
-    for (var s = 0; s < 1 + r.nextInt(2); s++) {
-      // Before the Omi's clock is set: files named by uptime seconds, no clock anywhere, so
-      // recordings are dated by when the phone sealed them (`unknown_` names).
-      final preSync = chance(20);
-      var uptime = 10000 + r.nextInt(100000);
-      Bin fresh(int at, int up) => preSync
-          ? Bin(at, session: 100 + s, uptimeMs: up, keySeconds: up ~/ 1000, headerUtcMs: 0)
-          : Bin(at, session: 100 + s, uptimeMs: up);
-      var b = fresh(t, uptime);
-      final files = 1 + r.nextInt(3);
-      for (var f = 0; f < files; f++) {
-        if (f > 0) {
-          final prev = b.key.timerStart;
-          final gap = pick([0, 0, 3000, 25000]) + r.nextInt(1000);
-          b = fresh(b.clockMs + gap, b.uptimeMs + gap);
-          if (b.key.timerStart == prev) b = fresh(b.clockMs + 1000, b.uptimeMs + 1000);
-        }
-        for (var i = 0; i < 2 + r.nextInt(8); i++) {
-          final k = r.nextInt(100);
-          if (k < 50) {
-            b.frames(1 + r.nextInt(chance(50) ? 20 : 250), p: pick([speech, speech, quiet, -1.0]), decoded: !chance(6));
-          } else if (k < 65) {
-            b.resume(pick([300, 2000, 16000, 25000, 40000]) + r.nextInt(999),
-                clockSet: !preSync && chance(8), clockless: preSync || chance(5));
-          } else if (k < 77) {
-            b.tap(atMs: preSync || chance(10) ? 0 : null);
-          } else if (k < 84) {
-            b.stop(atMs: preSync ? 0 : null);
-          } else if (k < 90) {
-            b.priority(atMs: preSync ? 0 : null);
-          } else if (k < 95) {
-            b.muteOn(atMs: preSync ? 0 : null);
-          } else {
-            b.muteOff(atMs: preSync ? 0 : null);
-          }
-        }
-        bins.add(b);
-      }
-      t = b.clockMs + 600000 + r.nextInt(100000) * 10;
-    }
-    return bins;
-  }
-
-  /// Force at the end of each session, sometimes one inside a file too.
-  List<PlanBoundary> forces(List<Bin> bins) => [
-        for (var i = 0; i < bins.length; i++) ...[
-          if (chance(15))
-            PlanBoundary(BoundaryKind.force, bins[i].key,
-                pick(bins[i].frameOffsetsWritten.isEmpty ? [0] : bins[i].frameOffsetsWritten)),
-          if (i == bins.length - 1 || bins[i + 1].key.sessionId != bins[i].key.sessionId) bins[i].force,
-        ]
-      ];
-
-  PublishSettings settings() => PublishSettings(
-        deviceId: 'AA:BB:CC:DD:EE:FF',
-        opusSidecar: true,
-        maxItemsPerCommit: 1 + r.nextInt(4),
-        maxAudioMsPerCommit: pick([1000, 60000, 1 << 40]),
-      );
-}
-
-/// Every session but the last has ended, each when the next began (unknown before the
-/// Omi's clock was set). [bins] are in the order the Omi wrote them.
-Map<int?, int?> _ended(List<Bin> bins) {
-  final firsts = <Bin>[];
-  for (final b in bins) {
-    if (firsts.isEmpty || firsts.last.key.sessionId != b.key.sessionId) firsts.add(b);
-  }
-  return {
-    for (var i = 0; i + 1 < firsts.length; i++)
-      firsts[i].key.sessionId: firsts[i + 1].file().header!.hasClock ? firsts[i + 1].file().header!.utcMs : null
-  };
-}
-
 /// The byte ranges the oracle expects for [spans], from the offsets the fixture wrote.
 Map<String, List<List<int>>> _expectedRanges(List<FrameSpan> spans, Map<RawFileKey, Bin> bins) {
   final out = <String, List<List<int>>>{};
@@ -291,7 +202,7 @@ Future<void> _expectEveryFrameOwnedOnce(World w, String reason) async {
   expect(a.edls.length, markers, reason: '$reason: one EDL per marker');
 }
 
-Future<World> _world(Directory root, List<Bin> bins, _Gen g) async {
+Future<World> _world(Directory root, List<Bin> bins, TimelineGen g) async {
   final w = World(root);
   for (final b in bins) {
     await w.arrive(b, hasVad: !g.chance(10));
@@ -300,30 +211,30 @@ Future<World> _world(Directory root, List<Bin> bins, _Gen g) async {
 }
 
 void main() {
-  const seeds = 40;
+  const seeds = int.fromEnvironment('PIPELINE_SEEDS', defaultValue: 40);
 
   test('drained in batches of any size, the archive is exactly the continuous plan', () async {
     var items = 0;
     for (var seed = 0; seed < seeds; seed++) {
-      final g = _Gen(seed);
+      final g = TimelineGen(seed);
       final bins = g.timeline();
       final root = Directory.systemTemp.createTempSync('publish_');
       try {
         final w = await _world(root, bins, g);
         final boundaries = g.forces(bins);
-        final policy = g.pick(_policies);
+        final policy = g.pick(genPolicies);
         final files = await w.planFiles();
         final full = plan(PlanInput(
           files: files,
           boundaries: boundaries,
           policies: PolicyHistory(policy),
           caps: CapHistory.constant(120),
-          endedSessions: _ended(bins),
+          endedSessions: endedOf(bins),
         ));
         expect(full.open, isEmpty, reason: 'seed $seed');
         items += full.items.length;
         final last = await w.drain(OwnershipCoordinator(root.path),
-            policy: policy, boundaries: boundaries, endedSessions: _ended(bins), settings: g.settings());
+            policy: policy, boundaries: boundaries, endedSessions: endedOf(bins), settings: g.settings());
         expect(last.items, isEmpty);
         await _expectArchiveIs(full, w, 'seed $seed');
         await _expectEveryFrameOwnedOnce(w, 'seed $seed');
@@ -332,18 +243,18 @@ void main() {
       }
     }
     expect(items, greaterThan(seeds * 2));
-  });
+  }, timeout: const Timeout(Duration(minutes: 10)));
 
   test('a crash at any step, recovered from disk alone, ends with the same archive and ledger', () async {
     var crashes = 0;
     for (var seed = 0; seed < seeds ~/ 2; seed++) {
-      final g = _Gen(100 + seed);
+      final g = TimelineGen(100 + seed);
       final bins = g.timeline();
       final boundaries = g.forces(bins);
-      final policy = g.pick(_policies);
+      final policy = g.pick(genPolicies);
       final settings = g.settings();
       final m4a = g.chance(30);
-      final ended = _ended(bins);
+      final ended = endedOf(bins);
 
       Future<void> run(World w, OwnershipCoordinator c, void Function(String)? fault) async {
         c.faultHook = fault;
@@ -366,7 +277,7 @@ void main() {
       late Map<String, String> clean;
       final counter = CrashAt(1 << 30);
       try {
-        final w = await _world(cleanRoot, bins, _Gen(100 + seed));
+        final w = await _world(cleanRoot, bins, TimelineGen(100 + seed));
         await run(w, OwnershipCoordinator(cleanRoot.path), counter.call);
         clean = await treeOf(cleanRoot.path, ['recordings', 'ledger']);
       } finally {
@@ -378,7 +289,7 @@ void main() {
         for (final twice in [false, true]) {
           final root = Directory.systemTemp.createTempSync('publish_crash_');
           try {
-            final w = await _world(root, bins, _Gen(100 + seed));
+            final w = await _world(root, bins, TimelineGen(100 + seed));
             final crash = CrashAt(k);
             await expectLater(run(w, OwnershipCoordinator(root.path), crash.call), throwsA(isA<Crash>()),
                 reason: 'seed $seed: crash at point $k');
@@ -412,14 +323,14 @@ void main() {
       }
     }
     expect(crashes, greaterThan(seeds * 4));
-  });
+  }, timeout: const Timeout(Duration(minutes: 10)));
 
   test('files arriving in any order, some in parts, with publication between: one owner each', () async {
     for (var seed = 0; seed < seeds; seed++) {
-      final g = _Gen(200 + seed);
+      final g = TimelineGen(200 + seed);
       final bins = g.timeline();
-      final ended = _ended(bins);
-      final policy = g.pick(_policies);
+      final ended = endedOf(bins);
+      final policy = g.pick(genPolicies);
       final root = Directory.systemTemp.createTempSync('publish_arrival_');
       try {
         final w = World(root);
@@ -461,5 +372,5 @@ void main() {
         root.deleteSync(recursive: true);
       }
     }
-  });
+  }, timeout: const Timeout(Duration(minutes: 10)));
 }

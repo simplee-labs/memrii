@@ -26,6 +26,44 @@ void main() {
   });
   tearDown(() => root.deleteSync(recursive: true));
 
+  test('bounded transfers split ranges and preserve their bounds through journal replay', () async {
+    const key = RawFileKey(1789100000, 7);
+    const markerOnly = RawFileKey(1789100001, 7);
+    const from = Owner(OwnerKind.discard, 'discard');
+    const to = Owner(OwnerKind.recording, 'recording');
+    const other = Owner(OwnerKind.recording, 'other');
+    final day = ledgerDayOf(key);
+    await c.transact(
+        'seed',
+        () async => (
+              <JournalOp>[
+                ClaimOp(day, const [
+                  Claim(key, from, [(10, 100)], [5]),
+                  Claim(key, other, [(100, 120)], [6]),
+                  Claim(markerOnly, from, [(10, 100)], [5]),
+                ], const [])
+              ],
+              null
+            ));
+    final op = TransferOp(day, [key, markerOnly], [from], to,
+        ranges: {
+          key: [(20, 40), (60, 110)]
+        });
+    c.faultHook = (point) {
+      if (point == 'journal.delete') throw StateError('crash after apply');
+    };
+    await expectLater(c.transact('bounded', () async => (<JournalOp>[op], null)), throwsStateError);
+    c.faultHook = null;
+    await OwnershipCoordinator(root.path).recover();
+    final entries = await ledgerOf(root.path);
+    expect([for (final r in entries[key]!.frames) (r.start, r.end, r.owner)],
+        [(10, 20, from), (20, 40, to), (40, 60, from), (60, 100, to), (100, 120, other)]);
+    expect(entries[key]!.events, {5: to, 6: other});
+    expect([for (final r in entries[markerOnly]!.frames) (r.start, r.end, r.owner)], [(10, 100, from)]);
+    expect(entries[markerOnly]!.events, {5: to});
+    expect(c.journalFile.existsSync(), isFalse);
+  });
+
   /// Speech, a tap, speech, a long sleep that closes it, quiet, and Force.
   Future<Bin> oneConversation() async {
     final b = Bin(1789100000000)

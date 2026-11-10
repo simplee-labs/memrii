@@ -171,6 +171,16 @@ Map<String, Object?> edlPayload({
       'isHighPriority': marker.highPriority,
     };
 
+/// An EDL's marker time, or null when it cannot be read.
+int? edlMarkerMs(String json) {
+  try {
+    final ms = (jsonDecode(json) as Map)['markerTimestampMs'];
+    return ms is int ? ms : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /// A discard's id: where its first frame is, or its mute-on, or where it closed. Frames
 /// and markers have one owner each, so no two discards share one.
 String discardIdOf(PlannedDiscard d, Map<RawFileKey, List<(int, int)>> bytes) {

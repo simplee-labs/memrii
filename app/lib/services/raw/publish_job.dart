@@ -142,7 +142,10 @@ class PublishJob {
     required PublishSettings settings,
   }) async {
     if (items.isEmpty) return const PublishReport(PublishStop.done, 0);
-    final job = await coordinator.startJob();
+    final job = await coordinator.startJob(holds: {
+      for (final i in items)
+        for (final s in i.spans) s.key
+    });
     final renderer = RecordingRenderer(
       source: (key) async => RenderSource(await coordinator.store.load(key), cards[key]!),
       newDecoder: newDecoder,

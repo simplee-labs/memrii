@@ -192,6 +192,43 @@ class LedgerEntry {
     }
   }
 
+  /// Hands [from]'s markers and frames to [to], limiting frames to [ranges] when
+  /// supplied. Splits at the requested boundaries; replay is idempotent.
+  void transfer(Set<Owner> from, Owner to, {List<(int, int)>? ranges}) {
+    final next = <OwnedRange>[];
+    for (final r in frames) {
+      if (!from.contains(r.owner)) {
+        next.add(r);
+        continue;
+      }
+      if (ranges == null) {
+        next.add(OwnedRange(r.start, r.end, to));
+        continue;
+      }
+      final cuts = {r.start, r.end};
+      for (final (start, end) in ranges) {
+        if (r.start < start && start < r.end) cuts.add(start);
+        if (r.start < end && end < r.end) cuts.add(end);
+      }
+      final sorted = cuts.toList()..sort();
+      for (var i = 1; i < sorted.length; i++) {
+        final start = sorted[i - 1], end = sorted[i];
+        final rendered = ranges.any((range) => range.$1 <= start && end <= range.$2);
+        next.add(OwnedRange(start, end, rendered ? to : r.owner));
+      }
+    }
+    _normalizeInto(next);
+    frames
+      ..clear()
+      ..addAll(next);
+    for (final o in events.keys.toList()) {
+      if (from.contains(events[o])) events[o] = to;
+    }
+  }
+
+  /// Whether [rs] together cover [start, end) with no gap.
+  static bool covers(List<OwnedRange> rs, int start, int end) => _covers(rs, start, end);
+
   static bool _covers(List<OwnedRange> rs, int start, int end) {
     final sorted = [...rs]..sort((a, b) => a.start.compareTo(b.start));
     var at = start;
@@ -405,14 +442,15 @@ class Ledger {
 }
 
 /// What the planner sees of [entries] for [files]: owned frames as index ranges, and
-/// owned markers. A tombstoned file is owned whole (R5). A released file needs nothing:
-/// the planner owns it whole from its receipt.
+/// owned markers. A tombstoned file is owned whole (R5). A released file's frames are
+/// owned whole from its receipt; its markers are owned as the ledger says, like any
+/// file's (the gate releases a file whose mute-on is not yet published).
 PlanOwnership planOwnershipOf(Map<RawFileKey, LedgerEntry> entries, Iterable<PlanFile> files) {
   final frames = <RawFileKey, List<(int, int)>>{};
   final events = <EventId>{};
   for (final f in files) {
     final e = entries[f.key];
-    if (e == null || f.released) continue;
+    if (e == null) continue;
     if (e.tombstone != null) {
       if (f.frameCount > 0) frames[f.key] = [(0, f.frameCount)];
       for (final m in f.events) {
@@ -422,6 +460,10 @@ PlanOwnership planOwnershipOf(Map<RawFileKey, LedgerEntry> entries, Iterable<Pla
       }
       continue;
     }
+    for (final o in e.events.keys) {
+      events.add(EventId(f.key, o));
+    }
+    if (f.released) continue;
     final offsets = f.frameOffsets!;
     final ranges = <(int, int)>[];
     for (final r in e.frames) {
@@ -435,9 +477,6 @@ PlanOwnership planOwnershipOf(Map<RawFileKey, LedgerEntry> entries, Iterable<Pla
       }
     }
     if (ranges.isNotEmpty) frames[f.key] = ranges;
-    for (final o in e.events.keys) {
-      events.add(EventId(f.key, o));
-    }
   }
   return PlanOwnership(frames: frames, events: events);
 }

@@ -248,9 +248,11 @@ class PlanFile {
   /// Set aside after repeated failures: its markers still count, its frames wait.
   final bool setAside;
 
-  /// Released by the gate (§6): chunks and card deleted, every frame and marker owned.
-  /// Only its receipt's summary is left. It is walked exactly as its card would be with
-  /// everything owned: its markers count, and its first frame is the audio wall.
+  /// Released by the gate (§6): chunks and card deleted, every frame owned, and every tap
+  /// and Priority Recording start. Only its receipt's summary is left. It is walked
+  /// exactly as its card would be with all its frames owned: its markers count, and its
+  /// first frame is the audio wall. Its mute-ons are owned as the ledger says: one whose
+  /// muted interval had not closed yet when the file was released is listed when it does.
   final bool released;
 
   final SourceLifecycle lifecycle;
@@ -408,6 +410,9 @@ enum CloseType {
 
   /// A muted interval ended (mute off, or the session ended).
   unmute,
+
+  /// Not the planner's: discarded audio the user recovered as one recording (§7).
+  recovered,
 }
 
 /// Where an item closed: while handling the record at [offset] of [key], or, with offset
@@ -1280,7 +1285,9 @@ class _SessionWalker {
     final id = EventId(_file.key, ev.offset);
     // Whether a marker is owned decides only whether this plan lists it again, and what it
     // may open: a published tap still forces an open conversation around it to be kept,
-    // but opens none (the one it opened is published, or closed with no audio).
+    // but opens none (the one it opened is published, or closed with no audio). A released
+    // file's taps and Priority Recording starts were all owned when the gate released it;
+    // its audio is gone, so none is listed again, even after Reprocess all.
     final listed = !input.owned.events.contains(id) && !_file.released;
     final framesHere = _framesHere(_file);
     switch (ev.kind) {

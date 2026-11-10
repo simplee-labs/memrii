@@ -189,7 +189,7 @@ String _open(Plan p) => [
     ].join(' ');
 
 void main() {
-  const seeds = 150;
+  const seeds = int.fromEnvironment('PIPELINE_SEEDS', defaultValue: 150);
 
   test('I8: publishing any closed items leaves the plan of everything else unchanged', () {
     var checked = 0;

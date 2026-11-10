@@ -2,9 +2,11 @@
 // they are, a world of sealed files on disk, and an oracle that reads the archive back.
 
 import 'dart:convert';
+import 'dart:math';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter_test/flutter_test.dart';
 import 'package:omi/services/raw/card.dart';
 import 'package:omi/services/raw/card_audio.dart';
 import 'package:omi/services/raw/coordinator.dart';
@@ -129,8 +131,15 @@ class World {
   /// Each file's first seal, fixed so that runs compare (sealing records the real time).
   static int sealedAtOf(RawFileKey k) => 1789000000000 + (k.timerStart % 100000) * 1000;
 
-  Future<List<PlanFile>> planFiles() async => [
-        for (final k in cards.keys)
+  /// What the planner is given: each file from its card, or, once the gate released it,
+  /// from its receipt.
+  Future<List<PlanFile>> planFiles() async {
+    final ledger = await ledgerOf(docs);
+    return [
+      for (final k in cards.keys)
+        if (ledger[k]?.receipt != null)
+          PlanFile.released(ledger[k]!.summary!, firstSealedAtMs: sealedAtOf(k))
+        else
           PlanFile(
             key: k,
             records: cards[k]!.records,
@@ -139,7 +148,8 @@ class World {
             lifecycle: (await store.load(k)).lifecycle,
             firstSealedAtMs: sealedAtOf(k),
           ),
-      ];
+    ];
+  }
 
   /// Plans everything here and publishes what closes, until nothing more does. Returns
   /// the last plan.
@@ -163,7 +173,7 @@ class World {
         files: files,
         missing: missing,
         waived: waived,
-        boundaries: boundaries,
+        boundaries: [...boundaries, ...snap.stream.boundaries],
         owned: snap.ownershipFor(files),
         policies: PolicyHistory(policy),
         caps: CapHistory.constant(120),
@@ -336,4 +346,104 @@ class CrashAt {
       throw Crash();
     }
   }
+}
+
+const genShort = PlanPolicy(
+    vadEnabled: true, speechThreshold: 0.5, silenceSplitMs: 20000, minSpeechMs: 2000, maxChunkMs: 60000, manual: false);
+const genPolicies = [genShort, manualPolicy, autoPolicy];
+
+/// Small generated timelines for the publication tests: a few sessions and files, every
+/// marker kind, short gaps, some sessions before the clock was set.
+class TimelineGen {
+  final Random r;
+  TimelineGen(int seed) : r = Random(seed);
+
+  T pick<T>(List<T> xs) => xs[r.nextInt(xs.length)];
+  bool chance(int percent) => r.nextInt(100) < percent;
+
+  /// Small timelines: a few sessions and files, every marker kind, short gaps.
+  List<Bin> timeline() {
+    final bins = <Bin>[];
+    var t = 1789000000000 + r.nextInt(100000) * 1000;
+    for (var s = 0; s < 1 + r.nextInt(2); s++) {
+      // Before the Omi's clock is set: files named by uptime seconds, no clock anywhere, so
+      // recordings are dated by when the phone sealed them (`unknown_` names).
+      final preSync = chance(20);
+      var uptime = 10000 + r.nextInt(100000);
+      Bin fresh(int at, int up) => preSync
+          ? Bin(at, session: 100 + s, uptimeMs: up, keySeconds: up ~/ 1000, headerUtcMs: 0)
+          : Bin(at, session: 100 + s, uptimeMs: up);
+      var b = fresh(t, uptime);
+      final files = 1 + r.nextInt(3);
+      for (var f = 0; f < files; f++) {
+        if (f > 0) {
+          final prev = b.key.timerStart;
+          final gap = pick([0, 0, 3000, 25000]) + r.nextInt(1000);
+          b = fresh(b.clockMs + gap, b.uptimeMs + gap);
+          if (b.key.timerStart == prev) b = fresh(b.clockMs + 1000, b.uptimeMs + 1000);
+        }
+        for (var i = 0; i < 2 + r.nextInt(8); i++) {
+          final k = r.nextInt(100);
+          if (k < 50) {
+            b.frames(1 + r.nextInt(chance(50) ? 20 : 250), p: pick([speech, speech, quiet, -1.0]), decoded: !chance(6));
+          } else if (k < 65) {
+            b.resume(pick([300, 2000, 16000, 25000, 40000]) + r.nextInt(999),
+                clockSet: !preSync && chance(8), clockless: preSync || chance(5));
+          } else if (k < 77) {
+            b.tap(atMs: preSync || chance(10) ? 0 : null);
+          } else if (k < 84) {
+            b.stop(atMs: preSync ? 0 : null);
+          } else if (k < 90) {
+            b.priority(atMs: preSync ? 0 : null);
+          } else if (k < 95) {
+            b.muteOn(atMs: preSync ? 0 : null);
+          } else {
+            b.muteOff(atMs: preSync ? 0 : null);
+          }
+        }
+        bins.add(b);
+      }
+      t = b.clockMs + 600000 + r.nextInt(100000) * 10;
+    }
+    return bins;
+  }
+
+  /// Force at the end of each session, sometimes one inside a file too.
+  List<PlanBoundary> forces(List<Bin> bins) => [
+        for (var i = 0; i < bins.length; i++) ...[
+          if (chance(15))
+            PlanBoundary(BoundaryKind.force, bins[i].key,
+                pick(bins[i].frameOffsetsWritten.isEmpty ? [0] : bins[i].frameOffsetsWritten)),
+          if (i == bins.length - 1 || bins[i + 1].key.sessionId != bins[i].key.sessionId) bins[i].force,
+        ]
+      ];
+
+  PublishSettings settings() => PublishSettings(
+        deviceId: 'AA:BB:CC:DD:EE:FF',
+        opusSidecar: true,
+        maxItemsPerCommit: 1 + r.nextInt(4),
+        maxAudioMsPerCommit: pick([1000, 60000, 1 << 40]),
+      );
+}
+
+/// Every session but the last has ended, each when the next began (unknown before the
+/// Omi's clock was set). [bins] are in the order the Omi wrote them.
+Map<int?, int?> endedOf(List<Bin> bins) {
+  final firsts = <Bin>[];
+  for (final b in bins) {
+    if (firsts.isEmpty || firsts.last.key.sessionId != b.key.sessionId) firsts.add(b);
+  }
+  return {
+    for (var i = 0; i + 1 < firsts.length; i++)
+      firsts[i].key.sessionId: firsts[i + 1].file().header!.hasClock ? firsts[i + 1].file().header!.utcMs : null
+  };
+}
+
+/// Drains [w] and fails if that published anything: [World.drain] returns its last plan,
+/// which is empty whether or not anything was published before it.
+Future<void> expectNothingPublished(World w, OwnershipCoordinator c,
+    {List<PlanBoundary> boundaries = const [], String? reason}) async {
+  final before = await treeOf(w.docs, ['recordings', 'ledger']);
+  await w.drain(c, boundaries: boundaries);
+  expect(await treeOf(w.docs, ['recordings', 'ledger']), before, reason: reason);
 }

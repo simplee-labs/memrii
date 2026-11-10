@@ -80,6 +80,16 @@ class RawFileKey {
   /// file by.
   String get rel => '$folder/${chunkName(0)}';
 
+  /// The key a [rel] path names, or null when it is not a raw file's.
+  static RawFileKey? fromRel(String rel) {
+    final parts = rel.replaceAll('\\', '/').split('/').where((s) => s.isNotEmpty).toList();
+    if (parts.length < 2) return null;
+    final m = RegExp(r'^(\d+)_(\d+)\.bin$').firstMatch(parts.last);
+    if (m == null) return null;
+    final folder = parts[parts.length - 2];
+    return RawFileKey(int.parse(m.group(1)!), folder == 'session_null' ? null : int.parse(m.group(2)!));
+  }
+
   @override
   bool operator ==(Object other) =>
       other is RawFileKey && other.timerStart == timerStart && other.sessionId == sessionId;
@@ -297,6 +307,38 @@ class RawChunkStore {
     await part.rename(chunk.path);
     return RawChunk(offset: appendOffset, length: keep, provenance: provenance, path: chunk.path);
   }
+
+  /// Every logical file with a chunk or a manifest under `raw_segments/`.
+  Future<Set<RawFileKey>> listKeys() async {
+    final root = Directory('$documentsPath/raw_segments');
+    final keys = <RawFileKey>{};
+    if (!await root.exists()) return keys;
+    await for (final folder in root.list(followLinks: false)) {
+      if (folder is! Directory) continue;
+      final name = folder.uri.pathSegments.lastWhere((s) => s.isNotEmpty);
+      await for (final e in folder.list(followLinks: false)) {
+        if (e is! File) continue;
+        final m = RegExp(r'^(\d+_\d+)(?:\.bin|\.chunks\.json)$').firstMatch(e.uri.pathSegments.last);
+        if (m == null) continue;
+        final key = RawFileKey.fromRel('$name/${m.group(1)}.bin');
+        if (key != null) keys.add(key);
+      }
+    }
+    return keys;
+  }
+
+  /// Deletes everything of [key] on the phone: its chunks, manifest, card, parts and kept
+  /// conflicts, and its folder once empty. Only the gate (§6) and the debug reset call
+  /// this; it is idempotent.
+  Future<void> deleteLogicalFile(RawFileKey key) => _locked(key, () async {
+        final folder = folderOf(key);
+        if (!await folder.exists()) return;
+        await for (final e in folder.list(followLinks: false)) {
+          final name = e.uri.pathSegments.lastWhere((s) => s.isNotEmpty);
+          if (e is File && (name.startsWith('${key.stem}.') || name.startsWith('${key.stem}@'))) await e.delete();
+        }
+        if (await folder.list().isEmpty) await folder.delete();
+      });
 
   /// Records where the device file stands. A terminal state is final; the advertised
   /// length is set once. [SourceLifecycle.complete] needs every advertised byte sealed:
