@@ -15,6 +15,7 @@ import 'package:omi/services/raw/card.dart';
 import 'package:omi/services/raw/coordinator.dart';
 import 'package:omi/services/raw/ledger.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
+import 'package:omi/utils/logger.dart';
 
 class RawBinGate {
   final OwnershipCoordinator coordinator;
@@ -28,22 +29,47 @@ class RawBinGate {
   Future<Set<RawFileKey>> release({Iterable<RawFileKey>? candidates}) async {
     final keys = candidates ?? await _store.listKeys();
     final released = <RawFileKey>{};
+    final kept = <String, List<String>>{};
     for (final key in keys) {
       final done = await coordinator.transact('gate', () async {
-        final ops = await _releaseOps(key);
+        final ops = await _releaseOps(key, (why) => _noteKept(kept, key, why));
         return (ops, ops.isNotEmpty);
       });
       if (done) released.add(key);
     }
+    if (released.isNotEmpty || kept.isNotEmpty) {
+      Logger.debug('RawBinGate: released ${released.length}${_listed(released.map((k) => k.stem))}; '
+          'kept ${kept.values.fold(0, (n, l) => n + l.length)}'
+          '${kept.entries.map((e) => ', ${e.key} ${e.value.length}${_listed(e.value)}').join()}');
+    }
     return released;
+  }
+
+  /// Groups a file the gate keeps by reason, for the debug log, with the place in the file
+  /// where the reason names one.
+  static void _noteKept(Map<String, List<String>> kept, RawFileKey key, String why) {
+    final damaged = why.startsWith('damaged');
+    final unowned = why.startsWith('frame ') || why.startsWith('marker ');
+    final group = damaged ? 'damaged' : (unowned ? 'not all owned yet' : why);
+    kept.putIfAbsent(group, () => []).add(damaged || unowned ? '${key.stem} ($why)' : key.stem);
+  }
+
+  static String _listed(Iterable<String> names) {
+    const shown = 10;
+    final all = names.toList();
+    if (all.isEmpty) return '';
+    return ' [${all.take(shown).join(', ')}${all.length > shown ? ', +${all.length - shown} more' : ''}]';
   }
 
   /// Why [key] may not go now, or null. In the queue.
   Future<String?> blocked(RawFileKey key) async => (await _assess(key)).$1;
 
-  Future<List<JournalOp>> _releaseOps(RawFileKey key) async {
+  Future<List<JournalOp>> _releaseOps(RawFileKey key, void Function(String why) onKept) async {
     var (why, file, records, entry) = await _assess(key);
-    if (why != null) return const [];
+    if (why != null) {
+      onKept(why);
+      return const [];
+    }
     if (entry?.receipt != null) {
       // Released before; these chunks are a copy that came back. The receipt stands.
       return [DeleteRawOp(key)];

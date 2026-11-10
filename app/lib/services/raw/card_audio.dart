@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import 'package:omi/services/raw/card.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/vad_batch_runner_channel.dart';
+import 'package:omi/utils/logger.dart';
 import 'package:opus_dart/opus_dart.dart';
 
 /// Silero's window: 512 samples at 16 kHz (32 ms).
@@ -167,8 +168,22 @@ class CardBuilder {
     final file = await store.load(key);
     final saved = await loadCard(store, key);
     if (saved != null && saved.isCurrentFor(file, decoderId: decoderId, vadModelId: vadModelId)) return saved;
-    final card = await _build(file);
+    final watch = Stopwatch()..start();
+    final FileCard card;
+    try {
+      card = await _build(file);
+    } on CardBuildCancelled {
+      rethrow;
+    } catch (e) {
+      Logger.error('CardBuilder: ${key.rel}: no card: $e');
+      rethrow;
+    }
     await saveCard(store, card);
+    final undecodable = card.audio.decoded.where((d) => d == 0).length;
+    Logger.debug('CardBuilder: ${key.rel}: card ${saved == null ? 'made' : 'remade'}, ${file.length} bytes in '
+        '${file.chunks.length} chunk(s), ${card.records.frameCount} frames'
+        '${undecodable == 0 ? '' : ', $undecodable undecodable'}${card.hasVad ? '' : ', no VAD'}, '
+        'ends ${card.records.endFor(file.lifecycle).name}, ${watch.elapsedMilliseconds} ms');
     return card;
   }
 

@@ -286,6 +286,9 @@ class RawChunkStore {
     final partLength = await part.length();
     final keep = keepLength < 0 ? 0 : (keepLength < partLength ? keepLength : partLength);
     if (keep == 0) {
+      if (partLength > 0) {
+        Logger.debug('RawChunkStore: ${key.rel}: none of the $partLength byte(s) at $appendOffset was accepted');
+      }
       await part.delete();
       if (advertisedLength != null) await _updateManifest(key, (m) => m.advertisedLength ??= advertisedLength);
       return null;
@@ -305,6 +308,8 @@ class RawChunkStore {
       m.advertisedLength ??= advertisedLength;
     });
     await part.rename(chunk.path);
+    Logger.debug('RawChunkStore: ${key.rel}: sealed [$appendOffset,${appendOffset + keep}) (${provenance.name})'
+        '${partLength > keep ? ', ${partLength - keep} unaccepted byte(s) cut' : ''}');
     return RawChunk(offset: appendOffset, length: keep, provenance: provenance, path: chunk.path);
   }
 
@@ -358,6 +363,10 @@ class RawChunkStore {
           if (m.lifecycle.isTerminal && m.lifecycle != lifecycle) {
             throw RawFileInconsistent('${key.rel}: already ${m.lifecycle.name}, cannot become ${lifecycle.name}');
           }
+          if (m.lifecycle != lifecycle) {
+            Logger.debug('RawChunkStore: ${key.rel}: ${m.lifecycle.name} -> ${lifecycle.name}'
+                '${advertisedLength == null ? '' : ', $advertisedLength bytes listed'}');
+          }
           m.lifecycle = lifecycle;
           m.advertisedLength ??= advertisedLength;
         });
@@ -401,11 +410,14 @@ class RawChunkStore {
             await raf.close();
           }
           await part.rename(chunk.path);
+          Logger.debug('RawChunkStore: ${key.rel}: finished sealing the chunk at $offset that a crash interrupted');
         } else if ((await load(key)).length != offset) {
           // Not where the sealed chunks end, so no transfer can have been writing it last.
           await _setAsideStray(key, part, null);
         } else {
           final end = persistedEnd(key);
+          Logger.debug('RawChunkStore: ${key.rel}: a crash left a part at $offset; '
+              '${end == null ? 'no progress was saved, so it is fetched again' : 'keeping what precedes $end'}');
           await _seal(key,
               appendOffset: offset,
               keepLength: end == null ? 0 : end - offset,

@@ -25,6 +25,7 @@ import 'package:omi/services/raw/publish_job.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/raw/render.dart';
 import 'package:omi/services/recording_sidecars.dart';
+import 'package:omi/utils/logger.dart';
 
 const int _minValidEpochSeconds = 946684800;
 
@@ -128,6 +129,8 @@ class ArchiveActions {
   /// gate can release. Returns how many were found.
   Future<int> deleteDiscards(Iterable<String> ids) => coordinator.transact('deleteDiscards', () async {
         final ds = await _discards(ids.toSet());
+        final missing = ids.toSet().difference({for (final d in ds) d.id});
+        if (missing.isNotEmpty) Logger.debug('ArchiveActions: Delete Discard: $missing not found');
         return (_dropDiscards(ds), ds.length);
       });
 
@@ -154,6 +157,37 @@ class ArchiveActions {
     Future<int?> Function()? freeBytes,
     bool Function()? isCancelled,
   }) async {
+    try {
+      final result = await _recoverDiscards(ids,
+          cards: cards,
+          newDecoder: newDecoder,
+          settings: settings,
+          encoder: encoder,
+          freeBytes: freeBytes,
+          isCancelled: isCancelled);
+      final line = 'ArchiveActions: Recover $ids: ${result.stop.name}'
+          '${result.published == null ? '' : ', as ${result.published}'}${result.error == null ? '' : ': ${result.error}'}';
+      if (result.stop == RecoverStop.failed) {
+        Logger.error(line);
+      } else {
+        Logger.debug(line);
+      }
+      return result;
+    } catch (e) {
+      Logger.error('ArchiveActions: Recover $ids stopped by $e');
+      rethrow;
+    }
+  }
+
+  Future<RecoverResult> _recoverDiscards(
+    List<String> ids, {
+    required Map<RawFileKey, FileCard> cards,
+    required FrameDecoder Function() newDecoder,
+    required PublishSettings settings,
+    AudioEncoder? encoder,
+    Future<int?> Function()? freeBytes,
+    bool Function()? isCancelled,
+  }) async {
     // What the discards own, as the ledger has it now, in files still on the phone: one
     // deleted at its source (tombstoned, perhaps released since) has nothing to recover.
     final found = await coordinator.transact('recover-read', () async {
@@ -166,7 +200,10 @@ class ArchiveActions {
       return (const <JournalOp>[], (ds, entries, generation));
     });
     final (ds, entries, generation) = found;
-    if (ds.length != ids.toSet().length) return const RecoverResult(RecoverStop.stale);
+    if (ds.length != ids.toSet().length) {
+      Logger.debug('ArchiveActions: Recover: ${ids.toSet().difference({for (final d in ds) d.id})} not found');
+      return const RecoverResult(RecoverStop.stale);
+    }
 
     final pieces = <PlanPiece>[];
     final bytes = <RawFileKey, List<(int, int)>>{};
@@ -231,7 +268,10 @@ class ArchiveActions {
           sourceBytes: bytes.values.expand((r) => r).fold(0, (n, r) => n + r.$2 - r.$1),
           sidecar: settings.opusSidecar);
       final free = await freeBytes?.call();
-      if (free != null && free - storageHeadroomBytes < need) return const RecoverResult(RecoverStop.storageFull);
+      if (free != null && free - storageHeadroomBytes < need) {
+        Logger.debug('ArchiveActions: Recover: $need bytes to render, $free free');
+        return const RecoverResult(RecoverStop.storageFull);
+      }
       final RenderedRecording rendered;
       try {
         rendered = await renderer.render(recording, Directory('${job.staging.path}/recover'));
@@ -296,6 +336,7 @@ class ArchiveActions {
           ...await _filesOfItemsEndingAfter(localDateOf(dayStart - 1), dayStart),
         };
         var keptAny = false;
+        final keptItems = <String>[];
         if (await folder.exists()) {
           final names = <String>{
             await for (final e in folder.list(followLinks: false))
@@ -323,6 +364,7 @@ class ArchiveActions {
             if (conv.endTime.millisecondsSinceEpoch > dayEnd) {
               keptAny = true;
               protect.addAll(bins);
+              keptItems.add(audio ?? '$stem.meta');
               if (audio != null) keptAudio.add(audio);
               continue;
             }
@@ -358,6 +400,7 @@ class ArchiveActions {
             if ((r['endMs'] as int? ?? 0) > dayEnd) {
               keptAny = true;
               protect.addAll(keys);
+              keptItems.add('discard $id');
             } else {
               candidates.addAll(keys);
               if (id is String) deletedIds.add(id);
@@ -368,6 +411,11 @@ class ArchiveActions {
           if (k.timerStart >= _minValidEpochSeconds && localDateOf(k.timerStart * 1000) == date) candidates.add(k);
         }
         final tombstoned = candidates.difference(protect);
+        Logger.debug('ArchiveActions: Delete Day $date: ${deletedPaths.length} recording(s), ${deletedIds.length} '
+            'discard(s) and ${deletedFiles.where((n) => n.startsWith('marker_')).length} marker(s) go; '
+            '${keptItems.isEmpty ? 'nothing crosses midnight' : 'kept across midnight: ${keptItems.join(', ')}'}; '
+            'raw files: ${tombstoned.length} tombstoned, ${candidates.intersection(protect).length} kept'
+            '${keep.isEmpty ? '' : ' (${keep.length} held for audio not saved yet)'}');
         final tombstone = Tombstone(nowMs, 'deleteDay');
         return (
           <JournalOp>[

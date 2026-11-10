@@ -426,7 +426,10 @@ class OwnershipCoordinator {
   Future<void> _recoverHeld() async {
     if (await journalFile.exists()) {
       final j = jsonDecode(await journalFile.readAsString()) as Map<String, Object?>;
-      if (j['v'] != 1) throw JournalStuck('journal version ${j['v']} is not 1');
+      if (j['v'] != 1) {
+        Logger.error('OwnershipCoordinator: journal version ${j['v']} is not 1; it stays and processing stops');
+        throw JournalStuck('journal version ${j['v']} is not 1');
+      }
       final ops = [for (final o in (j['ops']! as List)) JournalOp.fromJson((o as Map).cast())];
       Logger.debug('OwnershipCoordinator: completing journaled transaction ${j['id']} (${ops.length} ops)');
       await _apply(ops);
@@ -439,6 +442,7 @@ class OwnershipCoordinator {
       if (e is Directory && name.startsWith('job-') && !_live.containsKey(name)) {
         _fault('recover.staging');
         await e.delete(recursive: true);
+        Logger.debug('OwnershipCoordinator: removed the staging of $name, a job that stopped');
       }
     }
   }
@@ -717,6 +721,7 @@ class OwnershipCoordinator {
   }
 
   Future<void> _journalAndApply(String id, List<JournalOp> ops) async {
+    Logger.debug('OwnershipCoordinator: $id: ${describeOps(ops)}');
     _fault('journal.write');
     await AtomicFile.writeString(
         journalFile,
@@ -734,7 +739,13 @@ class OwnershipCoordinator {
   Future<void> _apply(List<JournalOp> ops) async {
     for (var i = 0; i < ops.length; i++) {
       _fault('op.$i');
-      await _applyOne(ops[i]);
+      try {
+        await _applyOne(ops[i]);
+      } catch (e) {
+        Logger.error('OwnershipCoordinator: step ${i + 1} of ${ops.length} (${describeOp(ops[i])}) failed: $e; '
+            'the journal stays and is completed before anything else');
+        rethrow;
+      }
     }
   }
 
@@ -863,6 +874,61 @@ class OwnershipCoordinator {
         await ledger.saveStream(stream);
     }
   }
+}
+
+/// A transaction's operations in brief, for the debug log; a run of moves as one list.
+String describeOps(List<JournalOp> ops) {
+  final out = <String>[];
+  final moved = <String>[];
+  void endMoves() {
+    if (moved.isEmpty) return;
+    out.add('move [${moved.join(', ')}]');
+    moved.clear();
+  }
+
+  for (final op in ops) {
+    if (op is MoveOp) {
+      moved.add(op.to.startsWith('recordings/') ? op.to.substring('recordings/'.length) : op.to);
+    } else {
+      endMoves();
+      out.add(describeOp(op));
+    }
+  }
+  endMoves();
+  return out.join('; ');
+}
+
+/// One journal operation in brief, for the debug log.
+String describeOp(JournalOp op) {
+  String stems(Iterable<RawFileKey> keys) => '[${keys.map((k) => k.stem).join(', ')}]';
+  return switch (op) {
+    MoveOp(:final to) => 'move to $to',
+    WriteJsonOp(:final path) => 'write $path',
+    UpsertDiscardsOp(:final date, :final records) => 'add discards $date ${[for (final r in records) r['id']]}',
+    ClaimOp(:final day, :final claims) => 'claim $day ${[
+        for (final c in claims)
+          '${c.key.stem} ${c.owner} ${c.ranges.map((r) => '[${r.$1},${r.$2})').join()}'
+              '${c.markers.isEmpty ? '' : ' markers ${c.markers}'}'
+      ]}',
+    SetGenerationOp(:final generation) => 'generation $generation',
+    TransferOp(:final keys, :final from, :final to, :final ranges) =>
+      'transfer ${stems(keys)} from $from to $to${ranges == null ? '' : ' (rendered ranges only)'}',
+    TombstoneOp(:final keys, :final tombstone) => 'tombstone ${stems(keys)} (${tombstone.reason})',
+    ReceiptOp(:final receipt, :final summary) =>
+      'receipt ${summary.key.stem} (${receipt.length} bytes, ${receipt.lifecycle.name})',
+    DeleteRawOp(:final key) => 'delete raw ${key.stem}',
+    DeletePathsOp(:final paths) => 'delete $paths',
+    RemoveDiscardsOp(:final date, :final ids) => 'remove discards $date $ids',
+    ClearOwnershipOp(:final day) => 'clear owners $day',
+    StreamOp(:final boundaries, :final cap, :final setAside, :final release) => [
+        'stream',
+        if (boundaries.isNotEmpty)
+          'boundaries ${[for (final b in boundaries) '${b.kind.name} ${b.key.stem}@${b.offset}']}',
+        if (cap != null) 'cap ${cap.minutes} min from ${cap.atMs}',
+        if (setAside.isNotEmpty) 'set aside ${stems(setAside)}',
+        if (release.isNotEmpty) 'not set aside ${stems(release)}',
+      ].join(' '),
+  };
 }
 
 /// Runs bodies one at a time, in order.

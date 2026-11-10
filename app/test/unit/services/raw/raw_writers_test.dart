@@ -52,6 +52,7 @@ void main() {
             l.contains('DeleteRawOp(') &&
             !l.contains('const DeleteRawOp(this') &&
             !l.contains('case DeleteRawOp(') &&
+            !l.contains('DeleteRawOp(:') && // a pattern reads an op; it makes none
             !l.contains("'deleteRaw' =>")))
           path
     };

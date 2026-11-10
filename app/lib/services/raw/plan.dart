@@ -714,7 +714,39 @@ class Plan {
   final Map<int?, PlanPosition> stoppedAt;
 
   const Plan(this.items, this.open, this.stoppedAt);
+
+  /// One line for the debug log: what closed, what is open, and where a session waits.
+  String describe() => [
+        describeItems(items),
+        for (final o in open)
+          'session ${o.sessionId} open from ${o.startMs == null ? '?' : _clock(o.startMs!)} '
+              '+${o.durationMs ~/ 1000}s, ${o.markerCount} marker(s)${o.inPriority ? ', in Priority Recording' : ''}',
+        for (final e in stoppedAt.entries) 'session ${e.key} waits for a hole at ${e.value}',
+      ].join('; ');
 }
+
+/// [items] in brief, for the debug log: each recording, and how many discards and orphan
+/// groups.
+String describeItems(List<PlanItem> items) {
+  const shown = 20;
+  final recordings = items.whereType<PlannedRecording>().toList();
+  final listed = recordings.isEmpty
+      ? ''
+      : ' [${recordings.take(shown).map(describeItem).join(', ')}'
+          '${recordings.length > shown ? ', +${recordings.length - shown} more' : ''}]';
+  return '${recordings.length} recording(s)$listed, ${items.whereType<PlannedDiscard>().length} discard(s), '
+      '${items.whereType<PlannedOrphans>().length} orphan group(s)';
+}
+
+/// One item in brief, for the debug log.
+String describeItem(PlanItem item) => switch (item) {
+      final PlannedRecording r => '${_clock(r.startMs)} +${r.durationMs ~/ 1000}s ${r.closeType.name}'
+          '${r.markers.isEmpty ? '' : ' ${r.markers.length} marker(s)'}',
+      final PlannedDiscard d => 'discard ${d.kind.reason} ${_clock(d.startMs)} +${(d.endMs - d.startMs) ~/ 1000}s',
+      final PlannedOrphans o => '${o.markers.length} orphan marker(s), ${o.closeType.name} at ${o.closedAt}',
+    };
+
+String _clock(int ms) => DateTime.fromMillisecondsSinceEpoch(ms).toIso8601String();
 
 /// Works out the plan.
 Plan plan(PlanInput input) {

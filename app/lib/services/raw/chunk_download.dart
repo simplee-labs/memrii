@@ -11,6 +11,7 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
+import 'package:omi/utils/logger.dart';
 
 /// Starts the native transfer of a part: [appendOffset] is the logical offset of the
 /// part's first byte, [overlap] the sealed bytes the Omi is asked to resend before it.
@@ -134,6 +135,13 @@ class ChunkDownloader {
       provenance: echoed ? ChunkProvenance.echoed : ChunkProvenance.uncorrelated,
       advertisedLength: advertisedLength,
     );
+    final line = 'ChunkDownloader: ${key.rel}: from $appendOffset${from < appendOffset ? ' (resent from $from)' : ''}'
+        ' to $acceptedEnd${echoed ? '' : ', uncorrelated'}${failure == null ? '' : ', stopped: $failure'}';
+    if (failure == null) {
+      Logger.debug(line);
+    } else {
+      Logger.warning(line);
+    }
     if (failure != null) Error.throwWithStackTrace(failure, failureTrace!);
     return ChunkTransfer(chunk, chunk?.end ?? appendOffset);
   }

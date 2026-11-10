@@ -1003,8 +1003,14 @@ void main() {
       final before = planOf([a.file(), c.file()], missing: [b.key]);
       expect(before.items, isEmpty);
       expect(before.stoppedAt.values.single, PlanPosition(b.key, -1));
+      expect(
+          before.describe(),
+          allOf(startsWith('0 recording(s), 0 discard(s)'), contains('open from'),
+              contains('waits for a hole at ${b.key.stem}@-1')),
+          reason: 'the debug log line');
       final after = planOf([a.file(), b.file(), c.file()], boundaries: [c.force]);
       expect(recordingsOf(after).single.pieces, [frames(a, 0, 200), frames(b, 0, 200), frames(c, 0, 200)]);
+      expect(after.describe(), startsWith('1 recording(s) ['));
     });
 
     test('given up on, a file is a wall; arriving later between published audio, it is an island', () {

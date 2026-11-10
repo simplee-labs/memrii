@@ -146,6 +146,25 @@ class PublishJob {
       for (final i in items)
         for (final s in i.spans) s.key
     });
+    Logger.debug('PublishJob: ${job.id}: ${describeItems(items)}, under generation $generation');
+    try {
+      final report = await _publish(job, items, generation, files, cards, settings);
+      final line = 'PublishJob: ${job.id}: ${report.stop.name}, ${report.published} of ${items.length} published'
+          '${report.failedItem == null ? '' : '; ${describeItem(report.failedItem!)} failed: ${report.error}'}';
+      if (report.stop == PublishStop.failed) {
+        Logger.error(line);
+      } else {
+        Logger.debug(line);
+      }
+      return report;
+    } catch (e) {
+      Logger.error('PublishJob: ${job.id}: stopped by $e');
+      rethrow;
+    }
+  }
+
+  Future<PublishReport> _publish(JobHandle job, List<PlanItem> items, int generation, Map<RawFileKey, PlanFile> files,
+      Map<RawFileKey, FileCard> cards, PublishSettings settings) async {
     final renderer = RecordingRenderer(
       source: (key) async => RenderSource(await coordinator.store.load(key), cards[key]!),
       newDecoder: newDecoder,
