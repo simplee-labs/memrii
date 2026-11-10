@@ -100,6 +100,7 @@ class _Run {
       {bool crash = false, bool reset = false}) async {
     counts[name] = (counts[name] ?? 0) + 1;
     final before = await discarded();
+    final recordedBefore = (await recorded()).keys.toSet();
     final hadTombstones = await tombstoned();
     if (crash) {
       final hook = CrashAt(1 + g.r.nextInt(6));
@@ -137,6 +138,12 @@ class _Run {
         final key = bins.firstWhere((b) => frameTag(b.key) == f.$1).key;
         if (!rec.containsKey(f) && !tombs.contains(key)) deleted.add(f);
       }
+    }
+    // A recording Delete Day deleted, in a raw file it left because something crossing
+    // midnight shares it: its frames were deleted by the user.
+    for (final f in recordedBefore) {
+      final key = bins.firstWhere((b) => frameTag(b.key) == f.$1).key;
+      if (!rec.containsKey(f) && !tombs.contains(key)) deleted.add(f);
     }
     for (final f in deleted) {
       expect(rec[f], isNull, reason: '$why: deleted frame $f came back in ${rec[f]}');

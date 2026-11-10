@@ -849,8 +849,12 @@ class OwnershipCoordinator {
             stream.boundaries.add(b);
           }
         }
-        if (cap != null && (stream.caps.isEmpty || stream.caps.last != cap) && !stream.caps.contains(cap)) {
-          stream.caps.add(cap);
+        // Kept in time order, as CapHistory reads it, whatever order the changes are
+        // recorded in (the phone's clock can step back between two of them).
+        if (cap != null && !stream.caps.contains(cap)) {
+          stream.caps
+            ..add(cap)
+            ..sort((a, b) => a.atMs.compareTo(b.atMs));
         }
         for (final k in setAside) {
           if (!stream.setAside.contains(k)) stream.setAside.add(k);

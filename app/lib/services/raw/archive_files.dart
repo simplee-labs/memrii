@@ -171,11 +171,11 @@ Map<String, Object?> edlPayload({
       'isHighPriority': marker.highPriority,
     };
 
-/// An EDL's marker time, or null when it cannot be read.
-int? edlMarkerMs(String json) {
+/// The recording an EDL names (empty for an orphan marker), or null when it cannot be read.
+String? edlSegment(String json) {
   try {
-    final ms = (jsonDecode(json) as Map)['markerTimestampMs'];
-    return ms is int ? ms : null;
+    final name = (jsonDecode(json) as Map)['segmentFilename'];
+    return name is String ? name : null;
   } catch (_) {
     return null;
   }

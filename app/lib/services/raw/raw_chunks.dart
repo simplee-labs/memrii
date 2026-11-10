@@ -308,7 +308,8 @@ class RawChunkStore {
     return RawChunk(offset: appendOffset, length: keep, provenance: provenance, path: chunk.path);
   }
 
-  /// Every logical file with a chunk or a manifest under `raw_segments/`.
+  /// Every logical file with a chunk, a manifest or a first part under `raw_segments/`:
+  /// a file whose first transfer is still running is a logical file too.
   Future<Set<RawFileKey>> listKeys() async {
     final root = Directory('$documentsPath/raw_segments');
     final keys = <RawFileKey>{};
@@ -318,7 +319,7 @@ class RawChunkStore {
       final name = folder.uri.pathSegments.lastWhere((s) => s.isNotEmpty);
       await for (final e in folder.list(followLinks: false)) {
         if (e is! File) continue;
-        final m = RegExp(r'^(\d+_\d+)(?:\.bin|\.chunks\.json)$').firstMatch(e.uri.pathSegments.last);
+        final m = RegExp(r'^(\d+_\d+)(?:\.bin|\.chunks\.json|\.bin\.partial)$').firstMatch(e.uri.pathSegments.last);
         if (m == null) continue;
         final key = RawFileKey.fromRel('$name/${m.group(1)}.bin');
         if (key != null) keys.add(key);

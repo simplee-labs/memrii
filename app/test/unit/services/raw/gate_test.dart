@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:omi/services/raw/actions.dart';
@@ -117,6 +118,33 @@ void main() {
     expect(await gate.release(), {b.key});
     expect((await ledgerOf(root.path))[b.key]!.tombstone!.reason, 'deleteFile');
     await expectNothingPublished(world, c, boundaries: [b.force]);
+  });
+
+  test('a damaged file stays for Save original file, unless it is deleted', () async {
+    final b = Bin(1789100000000)..frames(300, p: speech);
+    // A length word no record can have, with more than a record after it.
+    final damaged = (BytesBuilder()
+          ..add(b.bytes)
+          ..add((ByteData(4)..setUint32(0, 5000, Endian.little)).buffer.asUint8List())
+          ..add(Uint8List(5000)))
+        .toBytes();
+    final part = world.store.partFile(b.key, 0);
+    await part.parent.create(recursive: true);
+    await part.writeAsBytes(damaged);
+    await world.store.seal(b.key,
+        appendOffset: 0,
+        keepLength: damaged.length,
+        provenance: ChunkProvenance.echoed,
+        advertisedLength: damaged.length);
+    await world.store.setLifecycle(b.key, SourceLifecycle.complete);
+    world.bins[b.key] = b;
+    world.cards[b.key] = cardOf(b);
+    await world.drain(c, boundaries: [PlanBoundary(BoundaryKind.force, b.key, damaged.length)]);
+    expect((await Archive.read(root.path)).heard.length, 1, reason: 'what came before the damage is published');
+    expect(await blocked(b.key), startsWith('damaged'));
+    expect(await gate.release(), isEmpty);
+    await actions.deleteRawFile(b.key, nowMs: 1);
+    expect(await gate.release(), {b.key});
   });
 
   test('a crash between the receipt and the delete: recovery finishes the release', () async {

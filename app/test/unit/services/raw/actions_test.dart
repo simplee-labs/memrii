@@ -241,14 +241,15 @@ void main() {
     });
   });
 
-  test('Delete Day: the day\'s archive and stray markers go, its raw files are tombstoned and released', () async {
+  test('Delete Day: the day\'s archive goes, its raw files are tombstoned and released', () async {
     final a = await conversationThenQuiet();
     // Not processed yet, dated the same day: tombstoned too.
     final later = Bin(1789100000000 + 3600 * 1000, session: 8)..frames(200, p: speech);
     await world.arrive(later);
     final otherDay = await conversationThenQuiet(start: 1789100000000 + 3 * 86400 * 1000, session: 9);
     await world.drain(c, boundaries: [a.force, otherDay.force]);
-    // A marker of this day filed in another day's folder.
+    // A marker of this day filed beside another day's recording belongs to that recording,
+    // which runs past midnight: it stays with it.
     final day = localDateOf(1789100000000);
     final elsewhere = localDateOf(otherDay.key.timerStart * 1000);
     File('${root.path}/recordings/$elsewhere/marker_${1789100000000 + 5}.edl')
@@ -256,7 +257,7 @@ void main() {
     final deleted = await actions.deleteDay(day, nowMs: 42);
     expect(deleted, ['recordings/$day/recording_1789100000000.wav']);
     expect(Directory('${root.path}/recordings/$day').existsSync(), isFalse);
-    expect(File('${root.path}/recordings/$elsewhere/marker_${1789100000000 + 5}.edl').existsSync(), isFalse);
+    expect(File('${root.path}/recordings/$elsewhere/marker_${1789100000000 + 5}.edl').existsSync(), isTrue);
     final ledger = await ledgerOf(root.path);
     expect(ledger[a.key]!.tombstone!.reason, 'deleteDay');
     expect(ledger[later.key]!.tombstone, isNotNull);
@@ -278,12 +279,101 @@ void main() {
     File('${root.path}/$published').deleteSync();
     final day = localDateOf(start);
     expect(localDateOf(b.key.timerStart * 1000), isNot(day));
-    expect(await actions.deleteDay(day, nowMs: 42), isEmpty);
+    expect(await actions.deleteDay(day, nowMs: 42), [published.replaceAll('.wav', '.meta')],
+        reason: 'what was deleted, for the connectors: the meta passthrough left');
     expect((await ledgerOf(root.path))[b.key]!.tombstone, isNotNull);
     b.frames(200, p: speech);
     await world.arrive(b);
     await expectNothingPublished(world, c, boundaries: [b.force]);
     expect(await RawBinGate(c).release(), {b.key});
+  });
+
+  group('Delete Day and midnight: what crosses it stays exactly as it is', () {
+    final eleven59 = DateTime(2026, 9, 11, 23, 59).millisecondsSinceEpoch;
+    final day = localDateOf(eleven59), next = localDateOf(eleven59 + 120000);
+
+    /// A conversation from 23:59 to 00:02 in three one-minute files (the first dated the
+    /// day before midnight), and an earlier one wholly inside that day.
+    Future<(Bin, List<Bin>)> twoConversations({double p = speech, bool taps = false}) async {
+      final earlier = Bin(DateTime(2026, 9, 11, 10).millisecondsSinceEpoch, session: 3)..frames(150, p: speech);
+      if (taps) earlier.tap();
+      earlier.frames(150, p: speech);
+      final a = Bin(eleven59, session: 4)..frames(3000, p: p);
+      // A tap half a minute after midnight, in the conversation that crosses it.
+      final b = a.next()..frames(1500, p: p);
+      if (taps) b.tap();
+      b.frames(1500, p: p);
+      final d = b.next()..frames(3000, p: p);
+      for (final x in [earlier, a, b, d]) {
+        await world.arrive(x);
+      }
+      return (earlier, [a, b, d]);
+    }
+
+    Future<bool> tombstoned(Bin b) async => (await ledgerOf(root.path))[b.key]?.tombstone != null;
+
+    test('a recording that runs past midnight stays, with its raw files and markers; the rest of the day goes',
+        () async {
+      final (earlier, crossing) = await twoConversations(taps: true);
+      await world.drain(c, boundaries: [earlier.force, crossing.last.force]);
+      final before = await Archive.read(root.path);
+      final kept = before.heard.keys.singleWhere((k) => k.contains('$eleven59'));
+      expect(await actions.deleteDay(day, nowMs: 1), [
+        for (final k in before.heard.keys)
+          if (k != kept) k
+      ]);
+      final after = await Archive.read(root.path);
+      expect(after.heard.keys, [kept]);
+      expect(after.heard[kept]!.length, 9000, reason: 'all three minutes');
+      expect(before.edls.length, 2);
+      expect([for (final e in after.edls) e['segmentFilename']], [kept.split('/').last],
+          reason: "its marker stays; the deleted recording's goes");
+      expect(await tombstoned(earlier), isTrue);
+      for (final b in crossing) {
+        expect(await tombstoned(b), isFalse, reason: b.key.stem);
+      }
+      await expectNothingPublished(world, c, boundaries: [earlier.force, crossing.last.force]);
+    });
+
+    test('deleting the day it ends leaves it too, raw files included', () async {
+      final (earlier, crossing) = await twoConversations();
+      await world.drain(c, boundaries: [earlier.force, crossing.last.force]);
+      await actions.deleteDay(next, nowMs: 1);
+      expect((await Archive.read(root.path)).heard.length, 2);
+      for (final b in crossing) {
+        expect(await tombstoned(b), isFalse, reason: b.key.stem);
+      }
+    });
+
+    test('a conversation still in progress across midnight is left to finish, under the day it started', () async {
+      final (earlier, crossing) = await twoConversations();
+      // Only the earlier conversation is closed; the planner has the other one open, so
+      // the caller keeps its files.
+      await world.drain(c, boundaries: [earlier.force]);
+      await actions.deleteDay(day, nowMs: 1, keep: {for (final b in crossing) b.key});
+      for (final b in crossing) {
+        expect(await tombstoned(b), isFalse, reason: b.key.stem);
+      }
+      await world.drain(c, boundaries: [crossing.last.force]);
+      final after = await Archive.read(root.path);
+      expect(after.heard.keys.single, 'recordings/$day/recording_$eleven59.wav');
+      expect(after.heard.values.single.length, 9000);
+    });
+
+    test('a discard that runs past midnight stays recoverable, whichever day is deleted', () async {
+      final (earlier, crossing) = await twoConversations(p: quiet);
+      await world.drain(c, boundaries: [earlier.force, crossing.last.force]);
+      // Two minutes of quiet from 23:59 make one discard across midnight (then the third
+      // minute another, wholly on the next day).
+      final discard = (await Archive.read(root.path)).discards.singleWhere((d) => d['startMs'] == eleven59);
+      expect(discard['endMs']! as int, greaterThan(DateTime(2026, 9, 12).millisecondsSinceEpoch));
+      await actions.deleteDay(next, nowMs: 1);
+      await actions.deleteDay(day, nowMs: 1);
+      expect((await Archive.read(root.path)).discards.single['id'], discard['id']);
+      final result = await recover([discard['id']! as String]);
+      expect(result.stop, RecoverStop.recovered);
+      expect((await Archive.read(root.path)).heard[result.published]!.length, 6000);
+    });
   });
 
   test('Delete Day releases its set-aside files but keeps other days set aside', () async {
@@ -297,6 +387,28 @@ void main() {
     expect((await c.ledger.loadStream()).setAside, [other.key]);
     expect(await RawBinGate(c).release(), {b.key});
     expect((await c.store.load(other.key)).chunks, isNotEmpty);
+  });
+
+  test('Delete Day during a sync: a file still on its first transfer, and one not arrived yet, never come back',
+      () async {
+    final day = localDateOf(1789100000000);
+    final b = Bin(1789100000000)..frames(300, p: speech);
+    final notYet = Bin(1789100000000 + 600 * 1000, session: 8)..frames(300, p: speech);
+    // The first transfer is running: a part, nothing sealed.
+    final part = world.store.partFile(b.key, 0);
+    await part.parent.create(recursive: true);
+    await part.writeAsBytes(b.bytes);
+    await actions.deleteDay(day, nowMs: 1, listed: [notYet.key]);
+    final ledger = await ledgerOf(root.path);
+    expect(ledger[b.key]!.tombstone, isNotNull);
+    expect(ledger[notYet.key]!.tombstone, isNotNull);
+    // The transfer finishes and seals; the other file arrives.
+    await part.delete();
+    await world.arrive(b);
+    await world.arrive(notYet);
+    await expectNothingPublished(world, c, boundaries: [b.force, notYet.force]);
+    expect(Directory('${root.path}/recordings/$day').existsSync(), isFalse);
+    expect(await RawBinGate(c).release(), {b.key, notYet.key});
   });
 
   test('Delete for a raw or set-aside file, and Try again', () async {
@@ -321,9 +433,12 @@ void main() {
     await actions.recordCap(atMs: 1, minutes: 120);
     await actions.recordCap(atMs: 1, minutes: 120);
     await actions.recordCap(atMs: 5, minutes: 30);
+    // Recorded after, dated before: the phone's clock stepped back.
+    await actions.recordCap(atMs: 3, minutes: 60);
     final s = await c.ledger.loadStream();
     expect(s.boundaries.length, 1);
-    expect(s.caps, [(atMs: 1, minutes: 120), (atMs: 5, minutes: 30)]);
+    expect(s.caps, [(atMs: 1, minutes: 120), (atMs: 3, minutes: 60), (atMs: 5, minutes: 30)]);
+    expect(CapHistory(s.caps).capMsAt(4), CapHistory.constant(60).capMsAt(0));
   });
 
   test('Delete Phone Conversations: the archive goes, and nothing is published again', () async {

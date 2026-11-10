@@ -3,7 +3,8 @@
 // A logical file's chunks, manifest and card are deleted only when it is in a terminal
 // state (nothing more of it will come), it is not set aside, no live job reads it, and
 // either it is tombstoned or every frame and every tap and Priority Recording start in
-// it is owned by something other than a discard: a discard's audio stays recoverable
+// it is owned by something other than a discard and it is not damaged (unreadable from
+// some point on, kept for Save original file): a discard's audio stays recoverable
 // until it is deleted, recovered or expires (§7), each of which hands it to another
 // owner. Its ledger entry then keeps a receipt and its event summary, so the event layer
 // never depends on files that are gone; the receipt is written before the chunks go.
@@ -78,6 +79,11 @@ class RawBinGate {
     if (coordinator.heldByJobs.contains(key)) return ('a job reads it', file, null, entry);
     if (entry?.receipt != null || entry?.tombstone != null) return (null, file, null, entry);
     final records = (await _currentCard(file))?.records ?? parseRecords(await file.read(0, file.length));
+    // Unreadable from some point on with more than a record left: what follows the
+    // damage can be owned by nothing, and stays for Save original file (§2).
+    if (records.endFor(file.lifecycle) == FileEnd.damaged) {
+      return ('damaged at ${records.parsedEnd}', file, records, entry);
+    }
     final owned = [
       for (final r in entry?.frames ?? const <OwnedRange>[])
         if (r.owner.kind != OwnerKind.discard) r

@@ -24,6 +24,7 @@ import 'package:omi/services/raw/plan.dart';
 import 'package:omi/services/raw/publish_job.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/raw/render.dart';
+import 'package:omi/services/recording_sidecars.dart';
 
 const int _minValidEpochSeconds = 946684800;
 
@@ -259,60 +260,164 @@ class ArchiveActions {
     }
   }
 
-  /// Delete Day: the day's recordings, discards and markers go, and every raw file the
-  /// day holds is tombstoned (R5): those named by its recordings and discards, and those
-  /// the Omi dated that day, chunks still to come and copies restored later included. The
-  /// gate then releases them. Returns the audio files deleted, relative to the documents
-  /// directory.
-  Future<List<String>> deleteDay(String date, {required int nowMs}) => coordinator.transact('deleteDay', () async {
+  /// Delete Day (§7): what lies wholly inside the day goes; anything that crosses
+  /// midnight stays exactly as it is.
+  ///
+  /// The recordings and discards listed under the day go, with their markers, unless they
+  /// run past the day's end: those stay, and so do the raw files they come from, as do
+  /// those of the previous day's items that run into this one (§7). Then
+  /// every raw file holding the day's audio is tombstoned (R5) — those the Omi dated that
+  /// day, a first transfer still running and [listed] (the Omi's listing, not arrived yet)
+  /// included, and those the deleted items came from — except the files of what stays and
+  /// [keep]: files holding audio not yet saved that lies outside the day, such as a
+  /// conversation still in progress across midnight (the planner knows; step 6 passes it).
+  /// Another day's saved recordings are untouched: a tombstone never changes a published
+  /// recording. The gate then releases the tombstoned files.
+  ///
+  /// Returns what was deleted, relative to the documents directory: each recording's audio,
+  /// or its meta when passthrough left no audio.
+  Future<List<String>> deleteDay(
+    String date, {
+    required int nowMs,
+    Iterable<RawFileKey> listed = const [],
+    Set<RawFileKey> keep = const {},
+  }) =>
+      coordinator.transact('deleteDay', () async {
         final folder = Directory('$_docs/recordings/$date');
-        final audio = <String>[];
-        final keys = <RawFileKey>{};
+        final dayStart = _dayStartMs(date);
+        final dayEnd = _dayEndMs(date);
+        final deletedPaths = <String>[];
+        final deletedFiles = <String>[];
+        final deletedIds = <String>[];
+        final candidates = <RawFileKey>{};
+        final protect = <RawFileKey>{
+          ...keep,
+          // The previous day's recordings and discards that run past midnight into this one.
+          ...await _filesOfItemsEndingAfter(localDateOf(dayStart - 1), dayStart),
+        };
+        var keptAny = false;
         if (await folder.exists()) {
-          await for (final e in folder.list(followLinks: false)) {
-            if (e is! File) continue;
-            final name = e.uri.pathSegments.last;
-            if (name.endsWith('.wav') || name.endsWith('.m4a') || name.endsWith('.ogg')) {
-              audio.add('recordings/$date/$name');
+          final names = <String>{
+            await for (final e in folder.list(followLinks: false))
+              if (e is File) e.uri.pathSegments.last
+          };
+          // Recordings, by stem: audio with its meta, or a meta alone (passthrough).
+          final stems = <String, String?>{};
+          for (final n in names) {
+            final dot = n.lastIndexOf('.');
+            if (dot < 0 || n.startsWith('marker_') || n.startsWith('discards.')) continue;
+            final ext = n.substring(dot + 1);
+            final stem = n.substring(0, dot);
+            if (ext == 'wav' || ext == 'm4a' || ext == 'ogg') {
+              stems[stem] = n;
+            } else if (ext == 'meta') {
+              stems.putIfAbsent(stem, () => null);
             }
-            // Passthrough keeps metadata after its audio has been removed.
-            if (name.endsWith('.meta')) {
-              keys.addAll(Conversation.fromFile(e).relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>());
+          }
+          final deletedAudio = <String>{};
+          final keptAudio = <String>{};
+          for (final MapEntry(key: stem, value: audio) in stems.entries) {
+            final file = File('${folder.path}/${audio ?? '$stem.meta'}');
+            final conv = Conversation.fromFile(file);
+            final bins = conv.relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>();
+            if (conv.endTime.millisecondsSinceEpoch > dayEnd) {
+              keptAny = true;
+              protect.addAll(bins);
+              if (audio != null) keptAudio.add(audio);
+              continue;
+            }
+            candidates.addAll(bins);
+            final shown = audio ?? '$stem.meta';
+            deletedPaths.add('recordings/$date/$shown');
+            if (audio != null) deletedAudio.add(audio);
+            final sidecar =
+                RecordingSidecars.opusFramesPathFor('${folder.path}/${audio ?? '$stem.wav'}').split('/').last;
+            for (final n in [audio, '$stem.meta', sidecar]) {
+              if (n != null && names.contains(n)) deletedFiles.add(n);
+            }
+          }
+          for (final n in names.where((n) => n.startsWith('marker_') && n.endsWith('.edl'))) {
+            final segment = edlSegment(await File('${folder.path}/$n').readAsString());
+            // A marker of a recording that stays, stays; every other marker here is the
+            // day's (its recording deleted, or an orphan filed by its own date).
+            if (segment != null && keptAudio.contains(segment)) {
+              keptAny = true;
+            } else {
+              deletedFiles.add(n);
             }
           }
           for (final r in await coordinator.readDiscardLines(date)) {
-            if (r['id'] is String) keys.addAll(_Discard(r['id']! as String, date, r).keys);
-            keys.addAll(((r['binRanges'] as Map?) ?? const {})
-                .keys
-                .map((k) => RawFileKey.fromRel(k as String))
-                .whereType<RawFileKey>());
+            final id = r['id'];
+            final keys = <RawFileKey>{
+              if (id is String) ..._Discard(id, date, r).keys,
+              ...((r['binRanges'] as Map?) ?? const {})
+                  .keys
+                  .map((k) => RawFileKey.fromRel(k as String))
+                  .whereType<RawFileKey>(),
+            };
+            if ((r['endMs'] as int? ?? 0) > dayEnd) {
+              keptAny = true;
+              protect.addAll(keys);
+            } else {
+              candidates.addAll(keys);
+              if (id is String) deletedIds.add(id);
+            }
           }
         }
-        for (final k in await coordinator.store.listKeys()) {
-          if (k.timerStart >= _minValidEpochSeconds && localDateOf(k.timerStart * 1000) == date) keys.add(k);
+        for (final k in {...await coordinator.store.listKeys(), ...listed}) {
+          if (k.timerStart >= _minValidEpochSeconds && localDateOf(k.timerStart * 1000) == date) candidates.add(k);
         }
-        // Markers are listed by their own date, but filed beside their recording: one
-        // tapped this day may sit in another day's folder.
-        final strays = <String>[];
-        for (final other in await _dates()) {
-          if (other == date) continue;
-          await for (final e in Directory('$_docs/recordings/$other').list(followLinks: false)) {
-            final name = e.uri.pathSegments.last;
-            if (e is! File || !name.startsWith('marker_') || !name.endsWith('.edl')) continue;
-            final ms = edlMarkerMs(await e.readAsString());
-            if (ms != null && localDateOf(ms) == date) strays.add('recordings/$other/$name');
-          }
-        }
+        final tombstoned = candidates.difference(protect);
         final tombstone = Tombstone(nowMs, 'deleteDay');
         return (
           <JournalOp>[
-            for (final e in _byDay(keys).entries) TombstoneOp(e.key, e.value, tombstone),
-            StreamOp(release: keys.toList()),
-            DeletePathsOp(['recordings/$date', ...strays]),
+            for (final e in _byDay(tombstoned).entries) TombstoneOp(e.key, e.value, tombstone),
+            StreamOp(release: tombstoned.toList()),
+            if (!keptAny)
+              DeletePathsOp(['recordings/$date'])
+            else ...[
+              DeletePathsOp([for (final n in deletedFiles) 'recordings/$date/$n']),
+              if (deletedIds.isNotEmpty) RemoveDiscardsOp(date, deletedIds),
+            ],
           ],
-          audio,
+          deletedPaths,
         );
       });
+
+  /// When the local day [date] (`YYYY-MM-DD`) starts, and when it ends.
+  static int _dayStartMs(String date) {
+    final p = date.split('-').map(int.parse).toList();
+    return DateTime(p[0], p[1], p[2]).millisecondsSinceEpoch;
+  }
+
+  static int _dayEndMs(String date) {
+    final p = date.split('-').map(int.parse).toList();
+    return DateTime(p[0], p[1], p[2] + 1).millisecondsSinceEpoch;
+  }
+
+  /// The raw files of the recordings and discards listed under [date] that end after [ms].
+  Future<Set<RawFileKey>> _filesOfItemsEndingAfter(String date, int ms) async {
+    final folder = Directory('$_docs/recordings/$date');
+    final out = <RawFileKey>{};
+    if (!await folder.exists()) return out;
+    await for (final e in folder.list(followLinks: false)) {
+      if (e is! File || !e.path.endsWith('.meta')) continue;
+      final conv = Conversation.fromFile(e);
+      if (conv.endTime.millisecondsSinceEpoch > ms) {
+        out.addAll(conv.relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>());
+      }
+    }
+    for (final r in await coordinator.readDiscardLines(date)) {
+      if ((r['endMs'] as int? ?? 0) <= ms) continue;
+      final id = r['id'];
+      if (id is String) out.addAll(_Discard(id, date, r).keys);
+      out.addAll(((r['binRanges'] as Map?) ?? const {})
+          .keys
+          .map((k) => RawFileKey.fromRel(k as String))
+          .whereType<RawFileKey>());
+    }
+    return out;
+  }
 
   /// Delete, for a raw or set-aside file: tombstoned, and out of the set-aside list.
   Future<void> deleteRawFile(RawFileKey key, {required int nowMs}) => coordinator.transact(
