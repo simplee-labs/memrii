@@ -580,6 +580,13 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
     }
     try {
       await _controller.deleteDay(batch);
+      // What runs past midnight stays the first time; Delete Day again takes it too.
+      final left = _controller.batches.where((b) => b.dateString == batch.dateString).firstOrNull;
+      if (mounted && left != null && (left.finalizedRecordings.isNotEmpty || left.discards.isNotEmpty)) {
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Kept what runs past midnight. Delete Day again to delete it too.'),
+        ));
+      }
     } catch (e) {
       if (mounted) {
         messenger.showSnackBar(

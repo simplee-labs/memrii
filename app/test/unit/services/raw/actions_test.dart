@@ -335,6 +335,41 @@ void main() {
       await expectNothingPublished(world, c, boundaries: [earlier.force, crossing.last.force]);
     });
 
+    test('when only what runs past midnight is left, Delete Day again deletes it; its raw files stay', () async {
+      final (earlier, crossing) = await twoConversations(taps: true);
+      await world.drain(c, boundaries: [earlier.force, crossing.last.force]);
+      await actions.deleteDay(day, nowMs: 1);
+      final kept = (await Archive.read(root.path)).heard.keys.single;
+      expect(await actions.deleteDay(day, nowMs: 2), [kept]);
+      final after = await Archive.read(root.path);
+      expect(after.heard, isEmpty);
+      expect(after.edls, isEmpty, reason: 'its marker goes with it');
+      expect(Directory('${root.path}/recordings/$day').existsSync(), isFalse);
+      for (final b in crossing) {
+        expect(await tombstoned(b), isFalse, reason: '${b.key.stem}: not tombstoned, still owned by what was saved');
+      }
+      await expectNothingPublished(world, c, boundaries: [earlier.force, crossing.last.force]);
+    });
+
+    test('a deleted discard of the day in a file that stays is handed on, so the file can go', () async {
+      // One file: a recording and a discard inside the day, then a recording across midnight.
+      final a = Bin(DateTime(2026, 9, 11, 23, 50).millisecondsSinceEpoch, session: 5)
+        ..frames(600, p: speech)
+        ..frames(26400, p: quiet)
+        ..frames(6000, p: speech);
+      await world.arrive(a);
+      await world.drain(c, boundaries: [a.force]);
+      final before = await Archive.read(root.path);
+      expect(before.heard, hasLength(2));
+      expect(before.discards, isNotEmpty);
+      await actions.deleteDay(day, nowMs: 1);
+      final after = await Archive.read(root.path);
+      expect(after.heard.keys.single, contains('recording_'), reason: 'the one across midnight');
+      expect(after.discards, isEmpty);
+      expect(await tombstoned(a), isFalse, reason: 'it holds audio after midnight');
+      expect(await RawBinGate(c).release(), {a.key}, reason: 'everything in it is owned for good');
+    });
+
     test('deleting the day it ends leaves it too, raw files included', () async {
       final (earlier, crossing) = await twoConversations();
       await world.drain(c, boundaries: [earlier.force, crossing.last.force]);

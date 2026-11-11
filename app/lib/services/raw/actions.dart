@@ -120,10 +120,15 @@ class ArchiveActions {
     }
     return [
       for (final e in byDate.entries) RemoveDiscardsOp(e.key, e.value),
-      for (final e in _byDay({for (final d in ds) ...d.keys}).entries)
-        TransferOp(e.key, e.value, [for (final d in ds) Owner(OwnerKind.discard, d.id)], deletedDiscard),
+      ..._handOn(ds),
     ];
   }
+
+  /// [ds]' audio handed to [deletedDiscard]: owned for good, so the gate may release it.
+  List<JournalOp> _handOn(List<_Discard> ds) => [
+        for (final e in _byDay({for (final d in ds) ...d.keys}).entries)
+          TransferOp(e.key, e.value, [for (final d in ds) Owner(OwnerKind.discard, d.id)], deletedDiscard),
+      ];
 
   /// Delete Discard: the records go and their audio becomes a derived deletion, which the
   /// gate can release. Returns how many were found.
@@ -301,7 +306,8 @@ class ArchiveActions {
   }
 
   /// Delete Day (§7): what lies wholly inside the day goes; anything that crosses
-  /// midnight stays exactly as it is.
+  /// midnight stays exactly as it is, unless it is all that is left of the day: then it
+  /// goes too (Delete Day asked again), its raw files still kept.
   ///
   /// The recordings and discards listed under the day go, with their markers, unless they
   /// run past the day's end: those stay, and so do the raw files they come from, as do
@@ -337,6 +343,8 @@ class ArchiveActions {
         };
         var keptAny = false;
         final keptItems = <String>[];
+        final crossingDeleted = <String>[];
+        final droppedDiscards = <_Discard>[];
         if (await folder.exists()) {
           final names = <String>{
             await for (final e in folder.list(followLinks: false))
@@ -355,18 +363,30 @@ class ArchiveActions {
               stems.putIfAbsent(stem, () => null);
             }
           }
+          final convs = <String, (String?, Conversation)>{
+            for (final MapEntry(key: stem, value: audio) in stems.entries)
+              stem: (audio, Conversation.fromFile(File('${folder.path}/${audio ?? '$stem.meta'}'))),
+          };
+          final rows = await coordinator.readDiscardLines(date);
+          // When all that is left of the day runs past midnight (the rest deleted before, or
+          // never there), Delete Day deletes that too: the user asked again, and nothing
+          // else of the day remains to delete. Its raw files still stay, for any audio after
+          // midnight not saved yet.
+          final onlyCrossing = !convs.values.any((c) => c.$2.endTime.millisecondsSinceEpoch <= dayEnd) &&
+              !rows.any((r) => (r['endMs'] as int? ?? 0) <= dayEnd);
           final deletedAudio = <String>{};
           final keptAudio = <String>{};
-          for (final MapEntry(key: stem, value: audio) in stems.entries) {
-            final file = File('${folder.path}/${audio ?? '$stem.meta'}');
-            final conv = Conversation.fromFile(file);
+          for (final MapEntry(key: stem, value: (audio, conv)) in convs.entries) {
             final bins = conv.relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>();
             if (conv.endTime.millisecondsSinceEpoch > dayEnd) {
-              keptAny = true;
               protect.addAll(bins);
-              keptItems.add(audio ?? '$stem.meta');
-              if (audio != null) keptAudio.add(audio);
-              continue;
+              if (!onlyCrossing) {
+                keptAny = true;
+                keptItems.add(audio ?? '$stem.meta');
+                if (audio != null) keptAudio.add(audio);
+                continue;
+              }
+              crossingDeleted.add(audio ?? '$stem.meta');
             }
             candidates.addAll(bins);
             final shown = audio ?? '$stem.meta';
@@ -388,7 +408,7 @@ class ArchiveActions {
               deletedFiles.add(n);
             }
           }
-          for (final r in await coordinator.readDiscardLines(date)) {
+          for (final r in rows) {
             final id = r['id'];
             final keys = <RawFileKey>{
               if (id is String) ..._Discard(id, date, r).keys,
@@ -398,12 +418,18 @@ class ArchiveActions {
                   .whereType<RawFileKey>(),
             };
             if ((r['endMs'] as int? ?? 0) > dayEnd) {
-              keptAny = true;
               protect.addAll(keys);
-              keptItems.add('discard $id');
-            } else {
-              candidates.addAll(keys);
-              if (id is String) deletedIds.add(id);
+              if (!onlyCrossing) {
+                keptAny = true;
+                keptItems.add('discard $id');
+                continue;
+              }
+              crossingDeleted.add('discard $id');
+            }
+            candidates.addAll(keys);
+            if (id is String) {
+              deletedIds.add(id);
+              droppedDiscards.add(_Discard(id, date, r));
             }
           }
         }
@@ -413,7 +439,8 @@ class ArchiveActions {
         final tombstoned = candidates.difference(protect);
         Logger.debug('ArchiveActions: Delete Day $date: ${deletedPaths.length} recording(s), ${deletedIds.length} '
             'discard(s) and ${deletedFiles.where((n) => n.startsWith('marker_')).length} marker(s) go; '
-            '${keptItems.isEmpty ? 'nothing crosses midnight' : 'kept across midnight: ${keptItems.join(', ')}'}; '
+            '${keptItems.isEmpty ? 'nothing crosses midnight' : 'kept across midnight: ${keptItems.join(', ')}'}'
+            '${crossingDeleted.isEmpty ? '' : '; all that was left ran past midnight, deleted too: ${crossingDeleted.join(', ')}'}; '
             'raw files: ${tombstoned.length} tombstoned, ${candidates.intersection(protect).length} kept'
             '${keep.isEmpty ? '' : ' (${keep.length} held for audio not saved yet)'}');
         final tombstone = Tombstone(nowMs, 'deleteDay');
@@ -421,6 +448,10 @@ class ArchiveActions {
           <JournalOp>[
             for (final e in _byDay(tombstoned).entries) TombstoneOp(e.key, e.value, tombstone),
             StreamOp(release: tombstoned.toList()),
+            // A deleted discard's audio is owned for good, as Delete Discard leaves it: in a
+            // file that stays (it holds audio after midnight) it must not wait for an expiry
+            // its record, gone, will never have.
+            ..._handOn(droppedDiscards),
             if (!keptAny)
               DeletePathsOp(['recordings/$date'])
             else ...[

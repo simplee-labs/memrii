@@ -4,12 +4,13 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## App
 
-### memrii 0.2.8 (build 19)
+### memrii 0.2.8 (build 20)
 
 - **Update with a Force Sync first.** Before installing this version, open memrii and tap Force Sync, so nothing is left half-processed. On its first start, memrii takes over the audio already on the phone: saved recordings stay as they are, discarded clips stay recoverable until they expire, set-aside files stay set aside (Try again still saves the part never saved), and an unfinished draft is kept as a recording.
 - **Recordings are made a new way, so stopping partway never loses, repeats or splits audio.** Each audio file is kept exactly as it downloaded, and leaves the phone only once all of it is saved as a recording or a discarded clip, or you delete it. Processing can stop at any point (memrii closed, Stop, the phone restarting, a failure) and the next run carries on from the same place. Before, a conversation could be split where processing stopped.
 - **A conversation still going shows as in progress, and is saved once it ends.** It ends at a long enough silence, at the length limit, when Priority Recording stops, when the Omi restarts, or at Force Sync. Before, the part processed so far was saved as a draft and the rest joined onto it later.
-- **Delete Day keeps what runs past midnight.** It deletes what lies wholly inside the day. A recording, discarded clip or conversation in progress that runs past midnight stays whole, and so does a recording still on the Omi or still downloading that starts in the day's last 15 minutes, since it may run past midnight too. Before, Delete Day deleted every audio file that started that day, with any audio after midnight in it.
+- **Delete Day keeps what runs past midnight.** It deletes what lies wholly inside the day. A recording, discarded clip or conversation in progress that runs past midnight stays whole, and so does a recording still on the Omi or still downloading that starts in the day's last 15 minutes, since it may run past midnight too. The page says so, and Delete Day again on a day where only such recordings or clips are left deletes them too, keeping only audio after midnight not saved yet. Before, Delete Day deleted every audio file that started that day, with any audio after midnight in it.
+- **The recordings list no longer blanks out while it updates.** After a delete, during processing, or whenever recordings change, the list stays on screen until the updated one is ready. Before, each change replaced it with a loading circle, several times in a row for Delete Day.
 - **A damaged audio file is saved up to the damage.** Everything readable in it is processed; the file is then set aside, so you can share or delete the original.
 - **Firmware unchanged:** memrii-fw-3.2.0.
 

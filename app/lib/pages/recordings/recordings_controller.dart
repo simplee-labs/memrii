@@ -1763,9 +1763,38 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     unawaited(reloadBatchesSilently());
   }
 
-  Future<void> _loadBatches() async {
-    _isLoading = true;
-    notifyListeners();
+  /// Reloads the list. One load at a time: a request while one runs makes one more load
+  /// after it, which the caller's future waits for too. Every archive change notifies, and
+  /// Delete Day makes several in a row; each used to start its own load.
+  Future<void> _loadBatches() {
+    _reloadWanted = true;
+    return _loading ??= _runLoads();
+  }
+
+  Future<void>? _loading;
+  bool _reloadWanted = false;
+  bool _loadedOnce = false;
+
+  Future<void> _runLoads() async {
+    // Nothing runs before [_loading] is set: a listener [_loadOnce] notifies may ask again.
+    await Future<void>.value();
+    try {
+      while (_reloadWanted && !_isDisposed) {
+        _reloadWanted = false;
+        await _loadOnce();
+      }
+    } finally {
+      _loading = null;
+    }
+  }
+
+  Future<void> _loadOnce() async {
+    // The spinner only until the first list: a reload keeps the list on screen until the
+    // new one is ready, so a change does not blank the page and bring it back.
+    if (!_loadedOnce) {
+      _isLoading = true;
+      notifyListeners();
+    }
     try {
       await _integrations.recordingsChanged();
       final results = await Future.wait([
@@ -1777,6 +1806,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
         _markerConversations = results[1] as List<MarkerConversation>;
 
         _isLoading = false;
+        _loadedOnce = true;
         final rawSegments = _batches.expand((b) => b.rawSegments).toList();
         final acc = _computeAccumulated(
           _batches,
@@ -1799,32 +1829,10 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     }
   }
 
-  Future<void> reloadBatchesSilently() async {
-    try {
-      await _integrations.recordingsChanged();
-      final results = await Future.wait([
-        _manager.getBatches(),
-        _manager.getMarkerConversations(),
-      ]);
-      if (!_isDisposed) {
-        _batches = results[0] as List<Batch>;
-        _markerConversations = results[1] as List<MarkerConversation>;
-
-        final rawSegments = _batches.expand((b) => b.rawSegments).toList();
-        final acc = _computeAccumulated(
-          _batches,
-          await RecordingsManager.discardedRelBinPaths(),
-          await RecordingsManager.coveredBinPaths(rawSegments),
-          {...await _incompleteBins(), ...await _heldBins()},
-        );
-        _toProcessMinutes = acc.toProcessMinutes;
-        _draftMinutes = acc.draftMinutes;
-        _unprocessedBinCount = acc.unprocessedBins;
-        _draftEndTime = acc.draftEndTime;
-        notifyListeners();
-      }
-    } catch (_) {}
-  }
+  /// The same single load as [_loadBatches]: reloads never show the spinner, and loads
+  /// started one after another while processing commits no longer race (an older list
+  /// could land after a newer one and bring back what was just deleted, then drop it again).
+  Future<void> reloadBatchesSilently() => _loadBatches();
 
   /// Every connector forgets the day's recordings inside [RecordingsManager.deleteDay],
   /// as every deletion path does — see [RecordingsManager.deleteConversations].
@@ -1960,8 +1968,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     }
     RecordingsManager.notifyRecordingsChanged();
     if (result.stop == RecoverStop.failed || result.stop == RecoverStop.storageFull) {
-      _transitionToError(
-          'processing', 'Recover ${result.stop.name}${result.error == null ? '' : ': ${result.error}'}');
+      _transitionToError('processing', 'Recover ${result.stop.name}${result.error == null ? '' : ': ${result.error}'}');
       return false;
     }
     if (result.stop != RecoverStop.recovered) _transitionTo(SyncProcessState.idle);
