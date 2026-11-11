@@ -49,6 +49,19 @@ abstract class DeviceConnection {
   BtDevice get device => _device;
   DeviceConnectionState get status => _connectionState;
 
+  /// Every link to the Omi gets a number of its own, counted across connections in this
+  /// run of the app, so two answers can be told apart as given on one link or on two. The
+  /// Omi changes session only by restarting, which ends the link: two answers on one link
+  /// come from one session. A caller reads [link] before and after its request and trusts
+  /// the answer to that link only when the number did not change.
+  int get link => _link;
+  int _link = 0;
+  static int _links = 0;
+
+  /// The session the Omi said it was in (the diagnostics read), and the [link] it said it
+  /// on. The recordings pipeline matches it with the link a file list was taken on.
+  static ({int link, int sessionId})? liveSession;
+
   Future<void> connect({
     void Function(String deviceId, DeviceConnectionState state, {bool isManual})? onConnectionStateChanged,
     bool requiresBond = false,
@@ -64,6 +77,7 @@ abstract class DeviceConnection {
       final deviceState = _mapTransportStateToDeviceState(transportState);
       if (_connectionState != deviceState) {
         _connectionState = deviceState;
+        if (deviceState == DeviceConnectionState.connected) _link = ++_links;
         _connectionStateChangedCallback?.call(device.id, _connectionState, isManual: false);
       }
     });

@@ -10,6 +10,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:omi/backend/preferences.dart';
 import 'package:path/path.dart' as p;
 
+/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
+/// pipeline redesign; test/unit/services/raw covers what replaced it.
+const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
+
 class MockPathProviderPlatform extends Fake with MockPlatformInterfaceMixin implements PathProviderPlatform {
   late String tempPath;
   MockPathProviderPlatform(this.tempPath);
@@ -62,7 +66,7 @@ void main() {
   });
 
   group('RecordingsManager.coveredBinPaths', () {
-    test('identifies fully covered bin files', () async {
+    test('identifies fully covered bin files', skip: _replacedByPipeline, () async {
       const dateStr = '2026-06-02';
       final recordingsDir = Directory(p.join(tempDir.path, 'recordings', dateStr))..createSync(recursive: true);
       final rawDir = Directory(p.join(tempDir.path, 'raw_segments', '1780358400'))..createSync(recursive: true);

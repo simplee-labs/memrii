@@ -31,6 +31,8 @@ void main() {
     expect(writers, {
       'lib/services/raw/raw_chunks.dart', // parts, sealing, recovery, deleteLogicalFile
       'lib/services/raw/actions.dart', // Delete Phone Segments; Save original file writes elsewhere
+      'lib/services/raw/legacy_update.dart', // the update: discarded_segments back to raw_segments, once
+      'lib/services/raw/app_pipeline.dart', // Reprocess all: Adjustment Mode copies of released files back
       // Today's pipeline; step 6 removes these writers or routes them through the new one.
       'lib/services/recordings_manager.dart',
       'lib/services/discard_store.dart',

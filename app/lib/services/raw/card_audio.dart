@@ -139,8 +139,13 @@ Future<FrameAudio> analyzeAudio(
   return FrameAudio(decoded: decoded, speech: speech);
 }
 
+/// A file's card, built when missing or stale.
+abstract class CardSource {
+  Future<FileCard> current(RawFileKey key);
+}
+
 /// Builds and keeps the cards of a store's files.
-class CardBuilder {
+class CardBuilder implements CardSource {
   final RawChunkStore store;
   final String decoderId;
   final FrameDecoder Function() newDecoder;
@@ -164,6 +169,7 @@ class CardBuilder {
   String get vadModelId => model?.id ?? FileCard.noVad;
 
   /// The file's card: the saved one if it still describes the file, else a new one.
+  @override
   Future<FileCard> current(RawFileKey key) async {
     final file = await store.load(key);
     final saved = await loadCard(store, key);

@@ -17,6 +17,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../recordings_manager_test.dart' show MockPathProvider;
 import 'recording_crop_test.dart' show pcmRecording;
 
+/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
+/// pipeline redesign; test/unit/services/raw covers what replaced it.
+const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late Directory docs;
@@ -137,7 +141,7 @@ void main() {
   }
 
   for (final entryPoint in ['player', 'list', 'bulk']) {
-    test('deleting the original through $entryPoint cannot resurrect it while a crop remains', () async {
+    test('deleting the original through $entryPoint cannot resurrect it while a crop remains', skip: _replacedByPipeline, () async {
       final raw = writeBin(start);
       final original = oldRecording(bins: [relativeBin(start)]);
       final crop =
@@ -157,7 +161,7 @@ void main() {
     });
   }
 
-  test('source bins survive while a remaining draft names them', () async {
+  test('source bins survive while a remaining draft names them', skip: _replacedByPipeline, () async {
     final raw = writeBin(start);
     final original = oldRecording(bins: [relativeBin(start)]);
     final draft = oldRecording(time: start.add(const Duration(minutes: 1)), draft: true, bins: [relativeBin(start)]);
@@ -171,7 +175,7 @@ void main() {
     expect(raw.existsSync(), isFalse);
   });
 
-  test('deleting a recording leaves audio of the same boot that is still waiting to be processed', () async {
+  test('deleting a recording leaves audio of the same boot that is still waiting to be processed', skip: _replacedByPipeline, () async {
     final consumed = writeBin(start);
     final waiting = writeBin(start.add(const Duration(minutes: 10)));
     final original = oldRecording(bins: [relativeBin(start)]);
@@ -186,7 +190,7 @@ void main() {
         reason: 'the waiting audio becomes its recording, and the deleted one is not rebuilt');
   });
 
-  test('full reprocessing removes every old edit and rebuilds all consumed bins from the beginning', () async {
+  test('full reprocessing removes every old edit and rebuilds all consumed bins from the beginning', skip: _replacedByPipeline, () async {
     final bins = [writeBin(start), writeBin(start.add(const Duration(minutes: 5)))];
     final sourceBytes = bins.map((b) => b.readAsBytesSync()).toList();
     final original = oldRecording(bins: [relativeBin(start)]);
@@ -258,7 +262,7 @@ void main() {
     expect(RecordingsManager.recordingsUnsettled, isFalse);
   });
 
-  test('reprocessing restores missing adjustment and discard data without overwriting live bins', () async {
+  test('reprocessing restores missing adjustment and discard data without overwriting live bins', skip: _replacedByPipeline, () async {
     final live = writeBin(start);
     final originalBytes = live.readAsBytesSync();
     final stale = writeBin(start, root: 'adjustment_mode_segments')..writeAsBytesSync([1]);
@@ -281,7 +285,7 @@ void main() {
     expect(docs.listSync(recursive: true).any((f) => f.path.endsWith('.reprocess.tmp')), isFalse);
   });
 
-  test('a second rebuild uses current settings instead of the old recording metadata', () async {
+  test('a second rebuild uses current settings instead of the old recording metadata', skip: _replacedByPipeline, () async {
     writeBin(start);
     prefs.manualMode = true;
     await RecordingsManager.forceProcessAll(reprocessCovered: true);
@@ -295,7 +299,7 @@ void main() {
     expect(await manager.getMarkerConversations(), hasLength(1));
   });
 
-  test('an empty raw placeholder is restored from available archived data', () async {
+  test('an empty raw placeholder is restored from available archived data', skip: _replacedByPipeline, () async {
     final archive = writeBin(start, root: 'adjustment_mode_segments');
     final raw = File(p.join(docs.path, 'raw_segments', relativeBin(start)));
     raw.parent.createSync(recursive: true);
@@ -315,7 +319,7 @@ void main() {
     expect(RecordingsManager.recordingsUnsettled, isFalse);
   });
 
-  test('no available source data leaves existing recordings and crops intact', () async {
+  test('no available source data leaves existing recordings and crops intact', skip: _replacedByPipeline, () async {
     final original = oldRecording();
     final copy = await manager.saveCroppedConversation(original, Duration.zero, const Duration(seconds: 5));
     await expectLater(RecordingsManager.forceProcessAll(reprocessCovered: true), throwsStateError);
@@ -325,7 +329,7 @@ void main() {
     expect(RecordingsManager.recordingsUnsettled, isFalse);
   });
 
-  test('source restoration failure leaves the current library intact', () async {
+  test('source restoration failure leaves the current library intact', skip: _replacedByPipeline, () async {
     final original = oldRecording();
     final archive = writeBin(start, root: 'adjustment_mode_segments');
     final blocker = File(p.join(docs.path, 'raw_segments', p.basename(archive.parent.path)));
@@ -337,7 +341,7 @@ void main() {
     expect(RecordingsManager.recordingsUnsettled, isFalse);
   });
 
-  test('reset waits for uploads and rejects another processing run', () async {
+  test('reset waits for uploads and rejects another processing run', skip: _replacedByPipeline, () async {
     final original = oldRecording();
     writeBin(start);
     RecordingsManager.noteUploadStarted(original.file);
@@ -352,7 +356,7 @@ void main() {
     expect(await recordings(), hasLength(1));
   });
 
-  test('cancelling during preparation keeps the old library', () async {
+  test('cancelling during preparation keeps the old library', skip: _replacedByPipeline, () async {
     final original = oldRecording();
     writeBin(start);
     final rebuild = RecordingsManager.forceProcessAll(reprocessCovered: true);

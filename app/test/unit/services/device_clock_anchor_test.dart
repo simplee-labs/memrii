@@ -23,6 +23,13 @@ void main() {
     test('a recording at the anchor instant lands on the anchor', () {
       expect(anchor.startMsFor(upMs ~/ 1000), wall);
     });
+
+    test("a recording's full uptime meets the anchor's 32-bit one across the wrap", () {
+      const wrap = 1 << 32;
+      const a = DeviceClockAnchor(sessionId: 42, deviceUptimeMs: 1000000, wallClockMs: wall);
+      // Ten minutes before the anchor, past the wrap: its full uptime is 2^32 + 400 000 ms.
+      expect(a.startMsFor((wrap + 400000) ~/ 1000), closeTo(wall - 600000, 1000));
+    });
   });
 
   group('clockVerdict', () {

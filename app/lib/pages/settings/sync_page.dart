@@ -11,6 +11,7 @@ import 'package:omi/integrations/connector_registry.dart';
 import 'package:omi/providers/device_provider.dart';
 import 'package:omi/services/devices/device_connection.dart';
 import 'package:omi/services/devices/device_drop_stats.dart';
+import 'package:omi/services/raw/app_pipeline.dart';
 import 'package:omi/services/recordings_manager.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/services/wals.dart';
@@ -594,15 +595,11 @@ class _SyncPageState extends State<SyncPage> implements IWalSyncProgressListener
       _statusMessage = 'Deleting phone segments...';
     });
     try {
-      Logger.debug('DebugTools: Deleting raw_segments + discarded_segments directories');
-      final directory = await getApplicationDocumentsDirectory();
-      for (final base in ['raw_segments', RecordingsManager.discardedSegmentsDirName]) {
-        final segmentsDir = Directory('${directory.path}/$base');
-        if (await segmentsDir.exists()) {
-          await segmentsDir.delete(recursive: true);
-        }
-      }
-      Logger.debug('DebugTools: raw_segments + discarded_segments deleted');
+      // Every raw file is tombstoned (a copy restored later is never processed again)
+      // and keeps a receipt of its markers; the raw roots go, in one transaction.
+      Logger.debug('DebugTools: deleting every raw file on the phone');
+      await AppPipeline.instance.deletePhoneSegments();
+      Logger.debug('DebugTools: raw files deleted');
 
       // Reset sync/processing progress state in preferences
       final prefs = SharedPreferencesUtil();
@@ -659,21 +656,11 @@ class _SyncPageState extends State<SyncPage> implements IWalSyncProgressListener
       _statusMessage = 'Deleting phone conversations...';
     });
     try {
-      final directory = await getApplicationDocumentsDirectory();
-
-      final recordingsDir = Directory('${directory.path}/recordings');
-      if (await recordingsDir.exists()) {
-        Logger.debug('DebugTools: Deleting recordings directory');
-        await recordingsDir.delete(recursive: true);
-        Logger.debug('DebugTools: recordings directory deleted');
-      }
-
-      final tempDir = Directory('${directory.path}/processing_temp');
-      if (await tempDir.exists()) {
-        Logger.debug('DebugTools: Deleting processing_temp directory');
-        await tempDir.delete(recursive: true);
-        Logger.debug('DebugTools: processing_temp directory deleted');
-      }
+      // The archive goes; everything not yet owned, and every discard's audio, becomes a
+      // derived deletion, so nothing is rebuilt from what is still on the phone.
+      Logger.debug('DebugTools: deleting the recordings archive');
+      await AppPipeline.instance.deletePhoneConversations();
+      Logger.debug('DebugTools: recordings archive deleted');
 
       // Reset sync/processing progress state in preferences
       final prefs = SharedPreferencesUtil();

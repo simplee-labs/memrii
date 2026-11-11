@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'package:omi/utils/logger.dart';
+import 'package:omi/services/raw/actions.dart';
+import 'package:omi/services/raw/app_pipeline.dart';
+import 'package:omi/services/raw/pipeline.dart';
 import 'package:omi/services/recordings_manager.dart';
 import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/vad_audio_processor.dart';
@@ -1298,6 +1300,7 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// recording in two. Draft finalization belongs to the LAST pass of a run; the
   /// boundary here is left to the firmware's own 0xFFFFFFFC, which it writes at
   /// the switch whenever it was mid-recording — i.e. exactly when a draft is open.
+  // ignore: unused_element
   Future<List<Batch>> _drainModeSwitchBacklog(List<Batch> batches, int gen) async {
     final raw = _prefs.processingModeSwitchHistory;
     if (raw.isEmpty) return batches;
@@ -1430,139 +1433,20 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     _acquireWake('pipeline');
     await SyncNotification.preparingProcessing();
 
-    // The retry a newer build owes each set-aside bin, before the regular run.
-    if (SetAsideBins.list().any((e) => e.retryPending)) {
-      await RecordingsManager.retryPendingSetAsideBins();
-      if (gen != _pipelineGeneration) return; // watchdog already recovered
-      await reloadBatchesSilently();
-    }
-
-    final allBins = _batches.expand((b) => b.rawSegments).toList();
-    // Always-on idempotency guard: skip bins already covered by a recording so we
-    // don't re-decode audio that already has an output file (and can't duplicate
-    // it).
-    final Set<String> coveredBins = await RecordingsManager.coveredBinPaths(allBins);
-    final discardedBins = await RecordingsManager.discardedRelBinPaths();
-    final Set<String> incompleteBins;
-    try {
-      // Fail closed: this pass PRUNES the bins it decodes, so an unreadable WAL
-      // state must abort the run rather than let a mid-download bin be pruned.
-      // wals.json is rewritten by every sync, so the next cycle self-heals.
-      incompleteBins = await _incompleteBins(failClosed: true);
-    } catch (e) {
-      if (gen != _pipelineGeneration) return; // watchdog already recovered
-      Logger.error('RecordingsController: skipping processing — incomplete-bin set unavailable: $e');
-      // Clear force mode before settling. _runForcePipeline sets _isForcePipeline
-      // but clears it only via a settle path inside _runProcessing (there is no
-      // finally), so this early return must do it too — otherwise a Force Sync that
-      // bails here leaves force mode latched, and the NEXT ordinary run processes
-      // with finalizeDrafts:true, prematurely promoting a draft and pruning its
-      // source bins. Matches every other settle path in this file.
-      _isForcePipeline = false;
-      _releaseWakelock();
-      if (_isAppForeground()) _settleNotification();
-      _transitionTo(SyncProcessState.idle);
-      unawaited(reloadBatchesSilently());
-      return;
-    }
-
-    // Read afresh: the sync that just ended may have changed which files still wait.
-    final heldBack = _isForcePipeline ? null : await _heldBack(fresh: true);
-    final heldBins = {...SetAsideBins.relBins(), ...?heldBack};
-    final notYet = {...incompleteBins, ...heldBins};
-    var processableBatches = _batches.map((b) {
-      final filtered = b.rawSegments.where((f) => isProcessableBin(f, discardedBins, coveredBins, notYet)).toList();
-      if (filtered.length == b.rawSegments.length) return b;
-      return Batch(
-        dateString: b.dateString,
-        date: b.date,
-        rawSegments: filtered,
-        draftRecordings: b.draftRecordings,
-        finalizedRecordings: b.finalizedRecordings,
-        markerTimestamps: b.markerTimestamps,
-        discards: b.discards,
-      );
-    }).toList();
-
-    // Log bins this run excludes and the reason. A wrongly excluded bin produces neither a recording nor a
-    // discard and can be skipped on every later run. Repeated exclusion of an undecoded bin needs
-    // investigation.
-    {
-      final excluded = <String>[];
-      for (final f in allBins) {
-        final rel = f.path.split('/raw_segments/').last;
-        if (incompleteBins.contains(rel)) {
-          excluded.add('$rel (mid-transfer)');
-        } else if (heldBins.contains(rel)) {
-          excluded.add('$rel (held)');
-        } else if (discardedBins.contains(rel)) {
-          excluded.add('$rel (discarded)');
-        } else if (coveredBins.contains(f.path)) {
-          excluded.add('$rel (already decoded by a recording)');
-        }
-      }
-      if (excluded.isNotEmpty) {
-        final shown = excluded.take(20).join(', ');
-        final more = excluded.length > 20 ? ' … and ${excluded.length - 20} more' : '';
-        Logger.debug('RecordingsController: ${excluded.length} of ${allBins.length} bin(s) excluded from this '
-            'run — $shown$more');
-      }
-    }
-
-    // Drain any pre-mode-switch backlogs with the settings that were live when
-    // they were recorded, and take those bins out of this run so only
-    // current-mode audio is processed below. Returns the batches unchanged when
-    // no switch is pending, which is every ordinary run.
-    processableBatches = await _drainModeSwitchBacklog(processableBatches, gen);
-    if (gen != _pipelineGeneration) return; // watchdog recovered mid-drain
-
-    final activeBatches = processableBatches.where((b) => b.rawSegments.isNotEmpty).toList();
-    final hasDrafts = processableBatches.any((b) => b.draftRecordings.isNotEmpty);
-    final hasMarkers = processableBatches.any((b) => b.markerTimestamps.isNotEmpty);
-
-    if (activeBatches.isEmpty && !(_isForcePipeline && hasDrafts) && !hasMarkers) {
-      await _finishPipelineRun();
-      return;
-    }
-
-    final bool backgroundMode = !_isForcePipeline;
-
-    final allRaw = activeBatches.expand((b) => b.rawSegments).toList();
-    final totalBytes = allRaw.fold(0, (sum, f) {
-      try {
-        return sum + f.lengthSync();
-      } catch (_) {
-        return sum;
-      }
-    });
-    final totalMin = totalBytes / 252000.0;
-
-    _totalMinutes = totalMin;
-    _minutesRemaining = totalMin;
-    // Keep the static in lockstep with the instance: the notification text
-    // (processingNotificationText) reads RecordingsManager.minutesRemaining,
-    // while the card reads the instance _minutesRemaining. _runProcessing's
-    // estimate filters out covered/discarded bins, so without this the
-    // notification would keep showing the earlier inflated (_poll-set) value
-    // until the first progress tick — card and notification visibly disagree.
-    RecordingsManager.minutesRemaining = totalMin;
+    // The new pipeline's pass (RECORDINGS_PIPELINE_REDESIGN.md §5): index, plan, publish
+    // what closed, release raw files. Force closes what is open first.
+    _totalMinutes = _toProcessMinutes;
+    _minutesRemaining = _toProcessMinutes;
+    RecordingsManager.minutesRemaining = _toProcessMinutes;
     _processingProgress = 0.0;
     notifyListeners();
     _persistProgress();
-
-    _updateForegroundProgress(
-        force: true); // overwrite "preparing..." with the actual minutes now that totalMinutes is known
+    _updateForegroundProgress(force: true);
     try {
-      await _manager.processAll(
-        processableBatches,
-        (_, __) {}, // global progress listener handles this
-        backgroundMode: backgroundMode,
-        finalizeDrafts: _isForcePipeline,
-        onRecordingFinalized: () {
-          unawaited(reloadBatchesSilently());
-        },
-        heldBackRelBins: heldBack,
-      );
+      final report = await RecordingsManager.runPipelinePass(force: _isForcePipeline);
+      if (report != null && report.stop == PassStop.failed) {
+        Logger.error('RecordingsController: the pass stopped on a failure: ${report.error}');
+      }
     } catch (e) {
       if (gen != _pipelineGeneration) return; // watchdog already recovered
       _releaseWakelock();
@@ -1596,28 +1480,6 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     notifyListeners();
 
     _persistProgress();
-    // Protect still-mid-transfer bins from the exact-membership sweep too: it
-    // deletes any bin a finalized recording lists, which on a Force run can be a
-    // partially-transferred one (Force decodes the newest bin deliberately). That
-    // bin is the next sync's resume target. Re-read rather than reuse the set from
-    // the top of this method — a long processing pass can outlast the transfer
-    // state it was computed from. If it can't be read, skip the prune; reclaiming
-    // bins can always wait for the next run.
-    Set<String>? incompleteForPrune;
-    try {
-      incompleteForPrune = await _incompleteBins(failClosed: true);
-    } catch (_) {
-      // _incompleteBins already logged the cause.
-    }
-    if (incompleteForPrune != null) {
-      try {
-        await RecordingsManager.pruneConsumedBins(protectedRelBins: incompleteForPrune);
-      } catch (e) {
-        // Reclaiming bins can wait for the next run; settling this one cannot. A throw
-        // here used to skip _finishPipelineRun and leave the pipeline in processing.
-        Logger.error('RecordingsController: post-run prune failed, retried next run: $e');
-      }
-    }
     await reloadBatchesSilently();
     await _finishPipelineRun();
   }
@@ -2077,139 +1939,35 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// Pass [reload] = false to skip the per-item list reload when recovering a
   /// batch — the caller reloads once at the end (avoids a flash per item).
   Future<bool> _recoverDiscardCore(DiscardRecord d, {bool reload = true}) async {
-    final durMs = d.endTime.difference(d.startTime).inMilliseconds;
     Logger.debug('RecoverDiscard: requested — start=${d.startTime.toUtc()} reason=${d.reason} '
-        'dur=${durMs}ms refBins=${d.relativeBins} ranges=${d.binRanges} spState=${_spState.name}');
-    final directory = await getApplicationDocumentsDirectory();
-    final bins = <File>[];
-    // Maps each resolved absolute bin path back to its `<session>/<file>.bin`
-    // tail, so binRanges/sibling lookups work regardless of whether the bin was
-    // relocated to discarded_segments/ or is still in raw_segments/.
-    final binRel = <String, String>{};
-    final missing = <String>[];
-    for (final rel in d.relativeBins) {
-      final f = await RecordingsManager.resolveDiscardBin(directory.path, rel);
-      if (await f.exists()) {
-        bins.add(f);
-        binRel[f.path] = rel;
-      } else {
-        missing.add(rel);
-      }
-    }
-    if (missing.isNotEmpty) {
-      Logger.debug('RecoverDiscard: WARNING — ${missing.length}/${d.relativeBins.length} '
-          'referenced bin(s) missing on disk: $missing');
-    }
-    if (bins.isEmpty) {
-      // Bins were already swept or deleted — drop the orphan record and reload.
-      Logger.debug('RecoverDiscard: NO bins on disk — dropping ghost WITHOUT recovering audio '
-          '(bins already deleted/swept; nothing to re-derive).');
-      await RecordingsManager.removeDiscardRecord(d, deleteBins: false);
+        'ids=${d.pipelineIds} spState=${_spState.name}');
+    if (d.pipelineIds.isEmpty) {
+      // A record nothing can name holds nothing to recover: it goes, as today.
+      await RecordingsManager.removeDiscardRecord(d, deleteBins: true);
       if (reload) await _loadBatches();
       return false;
     }
-    bins.sort((a, b) => a.path.split('/').last.compareTo(b.path.split('/').last));
-
-    final dateStr = _dateString(d.startTime);
-    final syntheticBatch = Batch(
-      dateString: dateStr,
-      date: DateTime(d.startTime.year, d.startTime.month, d.startTime.day),
-      rawSegments: bins,
-      draftRecordings: const [],
-      finalizedRecordings: const [],
-    );
-
-    final override = ProcessingSettings(
-      vadEnabled: false,
-      speechThreshold: 0.0,
-      silenceDurationToSplitMs: 0x7FFFFFFF,
-      minDurationMs: 0,
-      minSpeechMs: 0,
-      maxChunkMs: 0x7FFFFFFFFFFFFFFF,
-      deviceId: _prefs.btDevice.id,
-      audioSaveFormat: _prefs.audioSaveFormat,
-      writeOpusFrameSidecar: false,
-      priorityRecordCapMinutes: _prefs.priorityRecordMaxMinutes,
-      // Deliberately NOT set: this is a synthetic config for re-deriving one
-      // discarded span, not a mode. The discard record carries no mode, and the
-      // live one is only a guess — a discard can sit for 48 h
-      // (DiscardRecord.discardRetentionWindow), which is ample room for a switch
-      // in between. Null leaves the .meta mode bits unwritten, so the recovered
-      // row falls back to the pre-feature label rather than asserting a mode
-      // nobody verified.
-      manual: null,
-    );
-
-    // Re-derive ONLY the discarded span, so recovery can't pull in the neighbor
-    // recording sharing a ~5-min bin (the overlap bug). Slice every bin the
-    // discard touches: the earliest bin's slice starts mid-bin so it anchors at
-    // the discard's true start; later bins keep their bin-head time and stitch
-    // onto the same recording. Requires every referenced bin present with a
-    // recorded range — otherwise (a pruned bin, or a legacy record with no
-    // ranges) fall back to the old whole-bin reprocess.
-    final recoverSlices = <String, RecoverSlice>{};
-    final allSliceable =
-        bins.length == d.relativeBins.length && bins.every((f) => (d.binRanges[binRel[f.path]]?.isNotEmpty ?? false));
-    if (allSliceable) {
-      for (var i = 0; i < bins.length; i++) {
-        final ranges = d.binRanges[binRel[bins[i].path]]!;
-        recoverSlices[bins[i].path] = RecoverSlice(
-          ranges: ranges,
-          anchorMs: i == 0 ? d.startTime.millisecondsSinceEpoch : null,
-        );
-      }
-      Logger.debug('RecoverDiscard: byte-slicing ${bins.length} bin(s), anchorMs='
-          '${d.startTime.millisecondsSinceEpoch} — '
-          '${recoverSlices.map((k, v) => MapEntry(k.split('/').last, v.ranges))}');
-    } else {
-      Logger.debug('RecoverDiscard: WHOLE-BIN fallback (a bin is missing or has no recorded '
-          'byte range) — recovery decodes the entire bin(s) and MAY pull in neighbor audio. '
-          'binsOnDisk=${bins.length} refBins=${d.relativeBins.length} ranges=${d.binRanges}');
-    }
-
-    // Protect bins that OTHER (sibling) discards still reference: two ghosts
-    // routinely share one ~5-min bin (a head slice and a tail slice), and this
-    // run consumes+deletes the bins it touches. Without this, recovering one
-    // ghost deletes the shared bin and the sibling recovers as "NO bins on disk".
-    final siblingRel = await RecordingsManager.discardedRelBinPathsExcludingSpan(
-      d.startTime.millisecondsSinceEpoch,
-      d.endTime.millisecondsSinceEpoch,
-    );
-    final protectedAbs = <String>{};
-    for (final rel in siblingRel) {
-      protectedAbs.add((await RecordingsManager.resolveDiscardBin(directory.path, rel)).path);
-    }
-    if (protectedAbs.isNotEmpty) {
-      Logger.debug('RecoverDiscard: protecting ${protectedAbs.length} bin(s) referenced by sibling '
-          'discard(s) from this run\'s delete sweep: ${siblingRel.toList()}');
-    }
-
     _lastActiveStage = 'processing';
     _transitionTo(SyncProcessState.processing);
+    final RecoverResult result;
     try {
-      await _manager.processAll(
-        [syntheticBatch],
-        (_, __) {},
-        backgroundMode: false,
-        settingsOverride: override,
-        recoverSlices: recoverSlices,
-        seedProtectedBinPaths: protectedAbs,
-        // Finalize the recovered clip standalone — never as a draft that the
-        // stitch pass would merge into an abutting recording.
-        finalizeRemainingDirectly: true,
-      );
+      // Recover (§7): its audio rendered as one recording, VAD off, in its place.
+      result = await AppPipeline.instance.recoverDiscards(d.pipelineIds);
     } catch (e) {
-      Logger.debug('RecoverDiscard: processAll FAILED: $e');
+      Logger.debug('RecoverDiscard: FAILED: $e');
       _transitionToError('processing', e.toString());
       return false;
     }
-    // Bins are deleted by processAll's safe-to-delete pass; remove the stale
-    // jsonl entry so the ghost disappears.
-    await RecordingsManager.removeDiscardRecord(d, deleteBins: false);
+    RecordingsManager.notifyRecordingsChanged();
+    if (result.stop == RecoverStop.failed || result.stop == RecoverStop.storageFull) {
+      _transitionToError(
+          'processing', 'Recover ${result.stop.name}${result.error == null ? '' : ': ${result.error}'}');
+      return false;
+    }
+    if (result.stop != RecoverStop.recovered) _transitionTo(SyncProcessState.idle);
     if (reload) await _loadBatches();
-    Logger.debug('RecoverDiscard: DONE — processed ${bins.length} bin(s), ghost removed '
-        '(start=${d.startTime.toUtc()}). Look for a recording near this time.');
-    return true;
+    Logger.debug('RecoverDiscard: ${result.stop.name}${result.published == null ? '' : ' as ${result.published}'}');
+    return result.stop == RecoverStop.recovered;
   }
 
   /// Try again on a set-aside bin, from the recordings page: its unsaved audio is saved as
@@ -2247,9 +2005,6 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
     await RecordingsManager.removeDiscardRecord(d, deleteBins: true);
     await _loadBatches();
   }
-
-  String _dateString(DateTime t) =>
-      '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
 
   // --- Upload subsystem (delegated to IntegrationUploadManager) -------------
 
@@ -2345,6 +2100,15 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
       if (latestDraftEnd == null || c.endTime.isAfter(latestDraftEnd)) {
         latestDraftEnd = c.endTime;
       }
+    }
+    // The new pipeline keeps no drafts: what is in progress is the last pass's open
+    // conversations.
+    for (final o in AppPipeline.instance.status.open) {
+      draftMs += o.durationMs;
+      final start = o.startMs;
+      if (start == null) continue;
+      final end = DateTime.fromMillisecondsSinceEpoch(start + o.durationMs);
+      if (latestDraftEnd == null || end.isAfter(latestDraftEnd)) latestDraftEnd = end;
     }
 
     // "Captured through" is the draft's own end (startTime + decoded duration) —

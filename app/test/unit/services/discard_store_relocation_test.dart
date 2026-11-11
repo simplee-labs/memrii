@@ -10,6 +10,10 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
+/// pipeline redesign; test/unit/services/raw covers what replaced it.
+const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
+
 class MockPathProvider extends Fake with MockPlatformInterfaceMixin implements PathProviderPlatform {
   String? tempPath;
   @override
@@ -97,7 +101,7 @@ void main() {
     expect(await r3.exists(), isFalse);
   });
 
-  test('removeDiscardRecord(deleteBins) deletes a bin relocated to discarded_segments', () async {
+  test('removeDiscardRecord(deleteBins) deletes a bin relocated to discarded_segments', skip: _replacedByPipeline, () async {
     final base = DateTime.now().millisecondsSinceEpoch;
     final dateStr = dateOf(base);
     final bin = await writeBin('discarded_segments', 's/a.bin');
@@ -114,7 +118,7 @@ void main() {
         reason: 'emptied relocated session folder cleaned up');
   });
 
-  test('recovery sweep reclaims an EXPIRED discard\'s relocated bin and keeps an in-window one', () async {
+  test('recovery sweep reclaims an EXPIRED discard\'s relocated bin and keeps an in-window one', skip: _replacedByPipeline, () async {
     final windowMs = DiscardRecord.discardRetentionWindow.inMilliseconds;
     final now = DateTime.now().millisecondsSinceEpoch;
     final expiredEnd = now - windowMs - 60000;
@@ -290,7 +294,7 @@ void main() {
     });
   });
 
-  group('retireFoldedGhosts (record + solely-owned bin cleanup after a fold)', () {
+  group('retireFoldedGhosts (record + solely-owned bin cleanup after a fold)', skip: _replacedByPipeline, () {
     String jsonlPath(String dateStr) => p.join(tempDir.path, 'recordings', dateStr, 'discards.jsonl');
 
     test('removes the record and deletes a relocated bin the ghost solely owns', () async {
@@ -362,7 +366,7 @@ void main() {
     });
   });
 
-  group('orphan-twin deletion across both roots (a bin duplicated in raw + discarded)', () {
+  group('orphan-twin deletion across both roots (a bin duplicated in raw + discarded)', skip: _replacedByPipeline, () {
     test('removeDiscardRecord(deleteBins) deletes BOTH the raw and discarded copies', () async {
       final now = DateTime.now().millisecondsSinceEpoch;
       final dateStr = dateOf(now);

@@ -20,6 +20,9 @@ import 'package:omi/backend/schema/bt_device/bt_device.dart';
 import 'package:omi/services/devices/device_connection.dart';
 import 'package:omi/services/devices/errors.dart';
 import 'package:omi/services/devices/storage_file.dart';
+import 'package:omi/services/raw/chunk_download.dart';
+import 'package:omi/services/raw/ledger.dart';
+import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/services/wals/wal.dart';
 import 'package:omi/services/wals/wal_interfaces.dart';
@@ -27,6 +30,12 @@ import 'package:omi/services/wals/wal_sync_exceptions.dart';
 
 class SDCardWalSyncImpl implements SDCardWalSync {
   List<Wal> _wals = <Wal>[];
+
+  /// When and on which link ([DeviceConnection.link]) the sync took the complete listing
+  /// [_wals] came from. Null when they came from anywhere else (saved state, a listing
+  /// another caller took, a partial one): the pipeline then finds no session newly ended
+  /// from them ([rawFileState]).
+  ({int atMs, int link})? _listedOn;
   BtDevice? _device;
 
   final Future<DeviceConnection?> Function(String deviceId)? _connectionProvider;
@@ -66,6 +75,26 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   // between transfers. Exposed (statted fresh) via [activeTransferBytesOnDisk] so
   // the stall watchdog sees real intra-file progress under background throttling.
   String? _activeDownloadPath;
+
+  /// The Omi resent bytes that differ from what the phone sealed for a file: the app sets
+  /// it aside ("differs from the Omi's copy"). Set by the new pipeline's wiring.
+  static Future<void> Function(RawFileKey key)? onSourceMismatch;
+
+  /// Parts a crash left are sealed once per process, before the first download: by the
+  /// app's startup (AppPipeline, from the saved progress, before any listing replaces it),
+  /// or here when that did not run.
+  static bool partsRecovered = false;
+
+  /// Awaited before a listing is applied: the app's startup work (the update from an
+  /// earlier build) comes before any download.
+  static Future<void> Function()? beforeSealedSync;
+
+  RawChunkStore? _rawStoreCache;
+
+  Future<RawChunkStore> _rawStore() async =>
+      _rawStoreCache ??= RawChunkStore((await getApplicationDocumentsDirectory()).path);
+
+  static RawFileKey _keyOf(Wal w) => RawFileKey(w.timerStart, w.sessionId);
   Completer<void>? _activeTransferCompleter;
   Completer<void>? _cancelCompleter;
   IWalSyncProgressListener? _globalProgressListener;
@@ -282,6 +311,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   @override
   Future stop() async {
     _wals = [];
+    _listedOn = null;
     final dev = _device;
     if (dev != null) {
       final connFuture = _connectionProvider != null
@@ -315,6 +345,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         try {
           final persisted = await WalFileManager.loadWals();
           _wals = persisted.where((w) => w.device == _device!.id).toList();
+          _listedOn = null;
           Logger.debug('SDCardWalSync: Loaded ${_wals.length} persisted WALs from disk');
         } catch (e) {
           Logger.debug('SDCardWalSync: Failed to load persisted WALs: $e');
@@ -348,7 +379,10 @@ class SDCardWalSyncImpl implements SDCardWalSync {
             // no answer must not erase the persisted WALs restored a few lines up.
             // Those carry the resume offsets, and dropping them is what makes a
             // half-downloaded bin restart from 0 and duplicate its audio.
-            if (built != null) _wals = built.wals;
+            if (built != null) {
+              _wals = built.wals;
+              _listedOn = built.complete ? built.on : null;
+            }
           }
         } finally {
           if (prefetchedFiles == null) {
@@ -412,6 +446,40 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         })
         .map((w) => w.relativeBinPath)
         .toSet();
+  }
+
+  /// What the new pipeline's planner needs from the sync: the files the Omi lists that
+  /// are not all here yet ([listed]), those of them with nothing on the phone (holes,
+  /// [missing]), and those given up on ([waived]: see [givenUpOn]). From the last listing,
+  /// or the persisted one before any this process. [listedOn] is when and on which link
+  /// the sync took that listing complete ([_listedOn]), or null.
+  Future<
+      ({
+        List<RawFileKey> missing,
+        Set<RawFileKey> waived,
+        Set<RawFileKey> listed,
+        ({int atMs, int link})? listedOn
+      })> rawFileState() async {
+    final deviceId = _device?.id ?? SharedPreferencesUtil().btDevice.id;
+    final listedOn = _listedOn;
+    // A copy: the loop below waits, and a sync may change the list meanwhile.
+    final wals = List.of(_wals.isNotEmpty || listedOn != null ? _wals : await WalFileManager.loadWals());
+    final store = await _rawStore();
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final missing = <RawFileKey>[];
+    final waived = <RawFileKey>{};
+    final listed = <RawFileKey>{};
+    for (final w in wals) {
+      if (w.device != deviceId || w.storage != WalStorage.sdcard || w.status == WalStatus.synced) continue;
+      final key = _keyOf(w);
+      listed.add(key);
+      if (givenUpOn(w, nowMs)) {
+        waived.add(key);
+      } else if ((await store.load(key)).chunks.isEmpty) {
+        missing.add(key);
+      }
+    }
+    return (missing: missing, waived: waived, listed: listed, listedOn: listedOn);
   }
 
   @override
@@ -500,7 +568,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   }
 
   /// null = the device never answered the listing. See [_buildWalsFromFilesLocked].
-  Future<({List<Wal> wals, bool complete})?> _getMissingWalsLocked(DeviceConnection connection, String deviceId) async {
+  Future<({List<Wal> wals, bool complete, ({int atMs, int link})? on})?> _getMissingWalsLocked(
+      DeviceConnection connection, String deviceId) async {
     final built = await _buildWalsFromFilesLocked(connection, deviceId);
     Logger.debug('SDCardWalSync: getMissingWals returned '
         '${built == null ? 'NO ANSWER (listing failed)' : '${built.wals.length} WALs'
@@ -636,21 +705,35 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   /// `complete` carries [StorageListing.complete] through: false means the device
   /// named more files than it delivered, so the WALs built here are a prefix of
   /// the card and the run that syncs them is a partial sync.
-  Future<({List<Wal> wals, bool complete})?> _buildWalsFromFilesLocked(
+  ///
+  /// `on` is when and on which link this listing was taken ([_listedOn]): null for
+  /// prefetched files, and for a listing during which the link changed.
+  Future<({List<Wal> wals, bool complete, ({int atMs, int link})? on})?> _buildWalsFromFilesLocked(
     DeviceConnection connection,
     String deviceId, {
     List<StorageFile>? prefetchedFiles,
   }) async {
     // The prefetch path is used only by setDevice, which reads `.wals` and never
     // this flag — so `true` here is not a claim about the caller's listing, which
-    // refreshStorageStats in fact discards the completeness of. If a future caller
+    // refreshStorageStats in fact discards the completeness of. (Its `on` is null, so
+    // the pipeline concludes nothing from it.) If a future caller
     // ever routes prefetched files into a SYNC, thread the real StorageListing
     // through instead of trusting this: a short listing reported complete is
     // exactly the wrong answer the rest of this change exists to prevent.
+    final link = connection.link;
+    final atMs = DateTime.now().millisecondsSinceEpoch;
     final listing = prefetchedFiles != null ? (files: prefetchedFiles, complete: true) : await connection.listFiles();
     if (listing == null) return null;
+    ({int atMs, int link})? on;
+    if (prefetchedFiles == null) {
+      if (connection.link == link) {
+        on = (atMs: atMs, link: link);
+      } else {
+        Logger.debug('SDCardWalSync: the link changed during the listing; it says nothing of ended sessions');
+      }
+    }
     final files = listing.files;
-    if (files.isEmpty) return (wals: <Wal>[], complete: listing.complete);
+    if (files.isEmpty) return (wals: <Wal>[], complete: listing.complete, on: on);
 
     final wals = <Wal>[];
 
@@ -726,7 +809,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       }
       wals.add(wal);
     }
-    return (wals: wals, complete: listing.complete);
+    return (wals: wals, complete: listing.complete, on: on);
   }
 
   @override
@@ -899,6 +982,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   /// snapshot honest, and also sizes the disk-space reservation for what will
   /// really be fetched. No-op when nothing was downloaded yet.
   Future<void> _reconcileWalOffsetToDisk(Wal wal) async {
+    // Sealed chunks are never cut: _applySealedState set the resume point.
+    if (RawChunkStore.enabled) return;
     if (_usesNativeDownload && wal.nativeIntegrityVersion != 1) {
       // A legacy pending prefix can have the right length and still contain holes.
       // Re-fetch it once. The version is set only AFTER truncation in the reader.
@@ -1187,6 +1272,9 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     Function(int offset)? onProgress,
     int? overrideFileNum,
   }) async {
+    if (RawChunkStore.enabled) {
+      return _readSealedLocked(connection, wal, callback, onProgress: onProgress, overrideFileNum: overrideFileNum);
+    }
     final fileNum = overrideFileNum ?? wal.fileNum;
     int offset = wal.walOffset;
     final timerStart = wal.timerStart;
@@ -1308,6 +1396,196 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     await _completePacketGapCapture(directory, wal, outputFile, finalSize);
 
     await callback(outputFile, finalSize, timerStart, subFolder: subFolderPrefix);
+  }
+
+  /// Where each listed file stands on the phone, from its sealed chunks (§1 of the
+  /// pipeline design), before anything is read or deleted: a file deleted on the phone
+  /// (tombstoned) is not read again and its copy on the Omi is deleted; one the phone
+  /// holds in full, or longer than the Omi now lists it, is complete or shortened at
+  /// source and its copy deleted; any other resumes at its sealed end, or a resend
+  /// before it after a repeated integrity gap. With a complete listing, a file the phone
+  /// was still receiving that the Omi no longer lists is gone at its source.
+  Future<void> _applySealedState({required bool listingComplete}) async {
+    await beforeSealedSync?.call();
+    final store = await _rawStore();
+    if (!partsRecovered) {
+      final ends = <RawFileKey, int>{};
+      for (final w in [...await WalFileManager.loadWals(), ..._wals]) {
+        if (w.walOffset > (ends[_keyOf(w)] ?? 0)) ends[_keyOf(w)] = w.walOffset;
+      }
+      final changed = await store.recover(persistedEnd: (key) => ends[key]);
+      partsRecovered = true;
+      if (changed.isNotEmpty) Logger.debug('SDCardWalSync: sealed the parts a crash left in ${changed.length} file(s)');
+    }
+    final sd = _wals.where((w) => w.storage == WalStorage.sdcard).toList();
+    final entries = await Ledger(store.documentsPath).entriesFor(sd.map(_keyOf));
+    final listed = <RawFileKey>{};
+    for (final w in sd) {
+      final key = _keyOf(w);
+      listed.add(key);
+      final file = await store.load(key);
+      final sealed = file.length;
+      if (entries[key]?.tombstone != null) {
+        if (file.chunks.isNotEmpty && !file.lifecycle.isTerminal) {
+          await store.setLifecycle(key, SourceLifecycle.sourceGone);
+        }
+        if (w.status != WalStatus.synced) {
+          Logger.debug('SDCardWalSync: ts=${w.timerStart} was deleted on the phone; deleting it on the Omi, unread');
+        }
+        w.status = WalStatus.synced;
+        continue;
+      }
+      if (sealed > 0 && sealed >= w.storageTotalBytes) {
+        if (!file.lifecycle.isTerminal) {
+          await store.setLifecycle(
+              key, sealed == w.storageTotalBytes ? SourceLifecycle.complete : SourceLifecycle.shortenedAtSource,
+              advertisedLength: w.storageTotalBytes);
+        }
+        w.walOffset = w.storageTotalBytes;
+        w.status = WalStatus.synced;
+        continue;
+      }
+      // A realignment asked for bytes before the sealed end: they are resent and compared.
+      final resend = sealed - w.walOffset;
+      if (resend <= 0 || resend > ChunkDownloader.maxResend) w.walOffset = sealed;
+      w.nativeIntegrityVersion = 1;
+    }
+    if (!listingComplete) return;
+    for (final key in await store.listKeys()) {
+      if (listed.contains(key)) continue;
+      final file = await store.load(key);
+      if (file.chunks.isEmpty || file.lifecycle.isTerminal) continue;
+      Logger.warning('SDCardWalSync: ${key.rel} left the Omi before it was all received (${file.length} B); '
+          'what arrived is all there is');
+      await store.setLifecycle(key, SourceLifecycle.sourceGone);
+    }
+  }
+
+  /// The native read of [wal] into a part that is sealed however the transfer ends
+  /// (ChunkDownloader): nothing already sealed is cut or written again.
+  Future _readSealedLocked(
+    DeviceConnection connection,
+    Wal wal,
+    Function(File f, int offset, int timerStart, {String? subFolder}) callback, {
+    Function(int offset)? onProgress,
+    int? overrideFileNum,
+  }) async {
+    final fileNum = overrideFileNum ?? wal.fileNum;
+    final timerStart = wal.timerStart;
+    if (_isCancelled) throw Exception("Cancelled");
+    final store = await _rawStore();
+    final key = _keyOf(wal);
+    final directory = Directory(store.documentsPath);
+    final sealed = (await store.load(key)).length;
+    final resend = wal.walOffset < sealed ? sealed - wal.walOffset : 0;
+    wal.nativeIntegrityVersion = 1;
+    _activeTransferCompleter = null;
+
+    final hostApi = BleHostApi();
+    final part = store.partFile(key, sealed);
+    int lastPolled = sealed;
+    final pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_isCancelled) {
+        connection.stopStorageSync().catchError((_) => false);
+        return;
+      }
+      try {
+        final now = part.existsSync() ? sealed + part.lengthSync() : lastPolled;
+        if (now > lastPolled) {
+          lastPolled = now;
+          _lastSegmentBoundaryOffset = now;
+          onProgress?.call(now);
+        }
+      } catch (_) {}
+    });
+
+    _activeDownloadPath = part.path;
+    _stopFailedAfterIntegrityGap = false;
+    _integrityGapRepeated = false;
+    var integrityFailed = false;
+    int? realignTo;
+    try {
+      await ChunkDownloader(store).download(
+        key,
+        resend: resend > ChunkDownloader.maxResend ? 0 : resend,
+        // An empty file on the Omi seals nothing and needs no manifest.
+        advertisedLength: wal.storageTotalBytes > 0 ? wal.storageTotalBytes : null,
+        transfer: (appendOffset, partPath, overlap) =>
+            hostApi.downloadStorageChunk(_device!.id, fileNum, appendOffset, timerStart, partPath, overlap),
+      );
+    } on SourceMismatch catch (e) {
+      Logger.error('SDCardWalSync: $e — the file is set aside; the phone keeps its copy');
+      try {
+        await onSourceMismatch?.call(key);
+      } catch (err) {
+        Logger.error('SDCardWalSync: could not set ${key.rel} aside: $err');
+      }
+      rethrow;
+    } on PlatformException catch (e) {
+      if (_isStorageIntegrityError(e)) {
+        integrityFailed = true;
+        final details = e.details;
+        final incoming = details is Map ? details['incomingOffset'] : null;
+        final gapOffset = (await store.load(key)).length;
+        final realign = _realignRepeatedIntegrityGap(wal, gapOffset);
+        _integrityGapRepeated = realign.repeated;
+        realignTo = realign.resume;
+        await _recordPacketGap(directory, wal,
+            expected: gapOffset,
+            incoming: incoming is int ? incoming : null,
+            resume: realign.resume,
+            repeated: realign.repeated);
+      }
+      rethrow;
+    } finally {
+      _activeDownloadPath = null;
+      pollTimer.cancel();
+      // What was accepted is sealed now: resume there, or, after a repeated gap, from
+      // the resend before it.
+      try {
+        final sealedNow = (await store.load(key)).length;
+        _lastSegmentBoundaryOffset = realignTo ?? sealedNow;
+        onProgress?.call(sealedNow);
+        if (realignTo != null) wal.walOffset = realignTo;
+      } catch (_) {}
+      try {
+        await connection.stopStorageSync();
+      } catch (e) {
+        if (!integrityFailed) rethrow;
+        _stopFailedAfterIntegrityGap = true;
+        Logger.warning('SDCardWalSync: STOP after native transfer failed: $e');
+      }
+    }
+
+    final file = await store.load(key);
+    final finalSize = file.length;
+    _lastSegmentBoundaryOffset = finalSize;
+    if (wal.storageTotalBytes > 0 && finalSize >= wal.storageTotalBytes && !file.lifecycle.isTerminal) {
+      await store.setLifecycle(key,
+          finalSize == wal.storageTotalBytes ? SourceLifecycle.complete : SourceLifecycle.shortenedAtSource,
+          advertisedLength: wal.storageTotalBytes);
+    }
+    final subFolderPrefix = key.folder;
+    final first = File('${store.folderOf(key).path}/${key.chunkName(0)}');
+    if (SharedPreferencesUtil().adjustmentMode && file.chunks.isNotEmpty) {
+      try {
+        final adjFolder = Directory('${directory.path}/adjustment_mode_segments/$subFolderPrefix');
+        if (!await adjFolder.exists()) await adjFolder.create(recursive: true);
+        final out = File('${adjFolder.path}/${key.chunkName(0)}').openWrite();
+        try {
+          for (final c in file.chunks) {
+            await out.addStream(File(c.path).openRead());
+          }
+          await out.flush();
+        } finally {
+          await out.close();
+        }
+      } catch (e) {
+        Logger.error('SDCardWalSync: failed to copy ${key.rel} to adjustment_mode_segments: $e');
+      }
+    }
+    await _completePacketGapCapture(directory, wal, first, finalSize);
+    await callback(first, finalSize, timerStart, subFolder: subFolderPrefix);
   }
 
   /// Returns the offset to resume [wal] from after a native integrity gap whose
@@ -1585,7 +1863,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   Future<SyncLocalFilesResponse?> _syncAllLocked(
     DeviceConnection connection,
     String deviceId, {
-    ({List<Wal> wals, bool complete})? prefetchedWals,
+    ({List<Wal> wals, bool complete, ({int atMs, int link})? on})? prefetchedWals,
     IWalSyncProgressListener? progress,
   }) async {
     _lastStorageStats = null;
@@ -1610,7 +1888,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   Future<SyncLocalFilesResponse?> _syncAllFilesLocked(
     DeviceConnection connection,
     String deviceId, {
-    ({List<Wal> wals, bool complete})? prefetchedWals,
+    ({List<Wal> wals, bool complete, ({int atMs, int link})? on})? prefetchedWals,
     IWalSyncProgressListener? progress,
   }) async {
     final listed = prefetchedWals ?? await _getMissingWalsLocked(connection, deviceId);
@@ -1629,6 +1907,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     }
     _noteStorageReplyHeard();
     _wals = listed.wals;
+    _listedOn = listed.complete ? listed.on : null;
+    if (RawChunkStore.enabled) await _applySealedState(listingComplete: listed.complete);
     // A listing the device could not deliver in full names only a prefix of the
     // card, so whatever this run fetches, it did not fetch everything. That is the
     // definition of a partial sync — and it carries the consequence that matters:
@@ -1664,6 +1944,8 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         return SyncLocalFilesResponse(newConversationIds: [], updatedConversationIds: [], isPartial: true);
       }
       _wals = relisted.wals;
+      _listedOn = relisted.complete ? relisted.on : null;
+      if (RawChunkStore.enabled) await _applySealedState(listingComplete: relisted.complete);
       listingIncomplete = !relisted.complete;
       deletedListIndices.clear();
       receivedAllDeleted = !_wals.any((w) => w.storage == WalStorage.sdcard && w.status == WalStatus.synced);
@@ -2381,6 +2663,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       final success = await connection.performClearStorage();
       if (success) {
         _wals = [];
+        _listedOn = null;
         listener.onWalUpdated();
       } else {
         Logger.error('SDCardWalSync: CMD_CLEAR_STORAGE failed, falling back to per-file deletion');

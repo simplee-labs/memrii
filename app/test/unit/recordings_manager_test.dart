@@ -14,6 +14,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
+/// pipeline redesign; test/unit/services/raw covers what replaced it.
+const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
+
 class MockPathProvider extends Fake with MockPlatformInterfaceMixin implements PathProviderPlatform {
   String? tempPath;
   @override
@@ -319,7 +323,7 @@ void main() {
       return f;
     }
 
-    test('expired record drops its bins and the jsonl', () async {
+    test('expired record drops its bins and the jsonl', skip: _replacedByPipeline, () async {
       final expiredStart = DateTime.now().subtract(const Duration(hours: 49)).millisecondsSinceEpoch;
       final bin = await writeBin('session_a/old.bin');
       final dateStr = dateOf(expiredStart);
@@ -429,7 +433,7 @@ void main() {
       expect(loaded, isEmpty);
     });
 
-    test('removeDiscardRecord deletes bins when deleteBins=true', () async {
+    test('removeDiscardRecord deletes bins when deleteBins=true', skip: _replacedByPipeline, () async {
       final startMs = DateTime.now().subtract(const Duration(hours: 2)).millisecondsSinceEpoch;
       final dateStr = dateOf(startMs);
       final bin = await writeBin('session_y/keep.bin');
@@ -470,7 +474,7 @@ void main() {
       expect(bin.existsSync(), true, reason: 'deleteBins=false must leave the bin alone');
     });
 
-    test('removeDiscardRecord keeps sibling records in same jsonl', () async {
+    test('removeDiscardRecord keeps sibling records in same jsonl', skip: _replacedByPipeline, () async {
       final startA = DateTime.now().subtract(const Duration(hours: 3)).millisecondsSinceEpoch;
       final startB = DateTime.now().subtract(const Duration(hours: 2)).millisecondsSinceEpoch;
       final dateStr = dateOf(startA);
@@ -605,7 +609,7 @@ void main() {
       expect(loaded.length, 2);
     });
 
-    test('removeDiscardRecord on a coalesced span clears every constituent line', () async {
+    test('removeDiscardRecord on a coalesced span clears every constituent line', skip: _replacedByPipeline, () async {
       final base = DateTime(2026, 3, 15, 12, 0, 0).millisecondsSinceEpoch;
       final dateStr = dateOf(base);
       await writeJsonl(dateStr, [
@@ -767,7 +771,7 @@ void main() {
   // "already decoded?" is answered from that list rather than inferred from
   // timestamps. The geometric window below is the fallback for recordings that
   // cannot answer — see coveredBinPaths' doc comment.
-  group('coveredBinPaths (exact membership)', () {
+  group('coveredBinPaths (exact membership)', skip: _replacedByPipeline, () {
     test('a bin a recording NAMES is covered, however far away in time', () async {
       // Deliberately 6 hours apart, so no geometric window could reach it. The
       // list is authoritative on its own.
@@ -892,7 +896,7 @@ void main() {
     });
   });
 
-  group('coveredBinPaths (geometric coverage)', () {
+  group('coveredBinPaths (geometric coverage)', skip: _replacedByPipeline, () {
     test('silence-ended recording covers bin inside its window', () async {
       // Recording at 10:00:00, 4 minutes long, silence-ended.
       // Bin covers 10:00:00-10:04:30 (slightly past rec_end, within +2min slack).
@@ -1050,7 +1054,7 @@ void main() {
   // pruneConsumedBins: the EXACT-MEMBERSHIP delete path. A bin is deleted iff a
   // finalized recording lists it in its .meta relativeBins, AND no draft lists
   // it, AND no discard references it. Geometry / capEnded play no part here.
-  group('pruneConsumedBins (exact membership)', () {
+  group('pruneConsumedBins (exact membership)', skip: _replacedByPipeline, () {
     test('finalized recording prunes the bins it lists', () async {
       final recStartMs = DateTime.utc(2026, 5, 27, 10, 0, 0).millisecondsSinceEpoch;
       final tsSec = recStartMs ~/ 1000;
@@ -1677,7 +1681,7 @@ void main() {
     });
   });
 
-  group('deleteDay marker sweep', () {
+  group('deleteDay marker sweep', skip: _replacedByPipeline, () {
     Batch batchFor(String dateStr) => Batch(
           dateString: dateStr,
           date: DateTime.parse(dateStr),
@@ -3252,7 +3256,7 @@ void main() {
   // The processor reads its segment list as ONE continuous stream, so the resume
   // index decides both what gets decoded and in what order. Skipping a bin no run
   // has touched strands its audio and splits the stream in two.
-  group('raw audio is released only when accounted for', () {
+  group('raw audio is released only when accounted for', skip: _replacedByPipeline, () {
     tearDown(() {
       RecordingsManager.freeDiskBytes = () async => null;
     });

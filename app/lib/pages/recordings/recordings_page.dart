@@ -678,7 +678,7 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
           final outcome = await _controller.retrySetAsideBin(relBin);
           final message = switch (outcome) {
             null => 'Processing is busy. Try again when it finishes.',
-            SetAsideRetry.recovered => 'Saved as a new recording.',
+            SetAsideRetry.recovered => 'Processed again, in its place.',
             SetAsideRetry.nothingLeft => 'Nothing in this file was left to save.',
             SetAsideRetry.cannotRetry => 'This file can\'t be processed again without duplicating a saved recording. '
                 'Share it for a bug report, or delete it.',
@@ -686,10 +686,11 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
           };
           if (message != null) messenger.showSnackBar(SnackBar(content: Text(message)));
         case 'skip':
-          await SetAsideBins.skip(relBin);
+          await RecordingsManager.skipSetAsideBin(relBin);
           unawaited(_controller.startProcessingWithoutSync());
         case 'share':
-          final file = await SetAsideBins.fileFor(relBin);
+          // Save original file: the whole file as the Omi sent it, every chunk in order.
+          final file = await RecordingsManager.exportRawFile(relBin);
           await SharePlus.instance.share(ShareParams(files: [XFile(file.path)], subject: file.uri.pathSegments.last));
         case 'delete':
           if (!mounted) return;

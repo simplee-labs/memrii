@@ -70,6 +70,8 @@ sealed class JournalOp {
         'deletePaths' => DeletePathsOp((j['paths']! as List).cast<String>()),
         'removeDiscards' => RemoveDiscardsOp(j['date']! as String, (j['ids']! as List).cast<String>()),
         'clearOwnership' => ClearOwnershipOp(j['day']! as String),
+        'forgetReceipts' => ForgetReceiptsOp(j['day']! as String,
+            [for (final k in (j['keys']! as List).cast<List>()) RawFileKey(k[0]! as int, k[1] as int?)]),
         'stream' => StreamOp(
             boundaries: [
               for (final b in (j['boundaries']! as List).cast<Map<String, Object?>>())
@@ -174,6 +176,22 @@ class ClearOwnershipOp extends JournalOp {
   const ClearOwnershipOp(this.day);
   @override
   Map<String, Object?> toJson() => {'op': 'clearOwnership', 'day': day};
+}
+
+/// Forgets the receipts of [keys], released files whose copies Reprocess all brought back
+/// from Adjustment Mode: they are planned from their chunks again. Their summaries stay.
+class ForgetReceiptsOp extends JournalOp {
+  final String day;
+  final List<RawFileKey> keys;
+  const ForgetReceiptsOp(this.day, this.keys);
+  @override
+  Map<String, Object?> toJson() => {
+        'op': 'forgetReceipts',
+        'day': day,
+        'keys': [
+          for (final k in keys) [k.timerStart, k.sessionId]
+        ],
+      };
 }
 
 /// Changes the stream file: boundaries added (Force, a rebuild's end), the cap setting
@@ -846,6 +864,12 @@ class OwnershipCoordinator {
         } else {
           await AtomicFile.writeString(file, '${keep.join('\n')}\n');
         }
+      case ForgetReceiptsOp(:final day, :final keys):
+        final loaded = await ledger.loadDay(day);
+        for (final k in keys) {
+          loaded.entries[k.rel]?.receipt = null;
+        }
+        await ledger.saveDay(loaded);
       case ClearOwnershipOp(:final day):
         final loaded = await ledger.loadDay(day);
         for (final e in loaded.entries.values) {
@@ -920,6 +944,7 @@ String describeOp(JournalOp op) {
     DeletePathsOp(:final paths) => 'delete $paths',
     RemoveDiscardsOp(:final date, :final ids) => 'remove discards $date $ids',
     ClearOwnershipOp(:final day) => 'clear owners $day',
+    ForgetReceiptsOp(:final keys) => 'forget receipts ${stems(keys)}',
     StreamOp(:final boundaries, :final cap, :final setAside, :final release) => [
         'stream',
         if (boundaries.isNotEmpty)

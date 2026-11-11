@@ -21,6 +21,9 @@ import 'package:uuid/uuid.dart';
 import 'package:omi/services/device_clock_anchor.dart';
 import 'package:omi/services/discard_store.dart';
 import 'package:omi/services/recording_sidecars.dart';
+import 'package:omi/services/raw/app_pipeline.dart';
+import 'package:omi/services/raw/pipeline.dart';
+import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/recordings_isolate_worker.dart';
 import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/services.dart';
@@ -348,6 +351,7 @@ class RecordingsManager {
   static void cancelProcessing() {
     _cancelRequested = true;
     _activeIsolateControlPort?.send('cancel');
+    AppPipeline.instance.cancel();
   }
 
   /// Last-resort recovery for a wedged processing run. A hung isolate never
@@ -381,6 +385,7 @@ class RecordingsManager {
   static void forceResetProcessing() {
     _cancelRequested = true;
     _activeIsolateControlPort?.send('cancel'); // best-effort, in case it's only slow
+    AppPipeline.instance.cancel();
     final isolate = _activeIsolate;
     if (isolate != null) {
       Logger.warning('RecordingsManager: force-killing wedged processing isolate');
@@ -486,7 +491,14 @@ class RecordingsManager {
 
         // Process segments
         final folderEntities = await folder.list().toList();
-        final files = folderEntities.whereType<File>().where((f) => f.path.endsWith('.bin')).toList();
+        // A logical file is listed once, by its first chunk, and only while its audio is
+        // still to process (the pipeline's last pass says which).
+        final status = AppPipeline.instance.status;
+        final files = folderEntities.whereType<File>().where((f) {
+          final name = f.uri.pathSegments.last;
+          if (!name.endsWith('.bin') || name.contains('@')) return false;
+          return status.isPending('$deviceSessionIdStr/$name');
+        }).toList();
 
         await Future.wait(
           files.map((file) async {
@@ -618,6 +630,9 @@ class RecordingsManager {
   /// Room a run needs beyond the audio it writes: the stitch pass rewrites a draft
   /// with its continuation appended, and M4A conversion holds both files at once.
   static const int _storageHeadroomBytes = 200 * 1024 * 1024;
+
+  /// Free space on the app's storage, or null when the platform can't say.
+  static Future<int?> freeBytes() => freeDiskBytes();
 
   /// Free space on the app's storage, or null when the platform can't say.
   @visibleForTesting
@@ -3096,6 +3111,49 @@ class RecordingsManager {
   /// recording. Safe to call from a background timer; no-op if a marker process is
   /// running.
   static Future<void> processAllCompletedSessions() async {
+    await runPipelinePass();
+  }
+
+  /// One pass of the new pipeline (RECORDINGS_PIPELINE_REDESIGN.md §5), then the clock
+  /// pass over what it published (§8). [force] first closes what is open (Force Sync).
+  /// Null when a pass was already running.
+  static Future<PassReport?> runPipelinePass({bool force = false, bool reserved = false}) async {
+    if (_isProcessingAny && !reserved) return null;
+    _isProcessingAny = true;
+    _cancelRequested = false;
+    processingProgress.value = 0.0;
+    try {
+      final report = await AppPipeline.instance.runPass(
+          force: force,
+          onLiveness: () => processingLiveness.value++,
+          onProgress: (done) => processingProgress.value = done);
+      if (report != null) {
+        // The storage pause shows what waits for space: the files of what the pass could
+        // not render, until a pass gets through.
+        final waiting = <String, int>{};
+        if (report.stop == PassStop.storageFull) {
+          for (final k in report.waiting) {
+            waiting[k.rel] = (await AppPipeline.instance.coordinator.store.load(k)).length;
+          }
+        }
+        _saveStorageWaitingBins(waiting);
+      }
+      await _applyClockAnchorsLogged();
+      return report;
+    } catch (e, st) {
+      Logger.handle(e, st, message: 'RecordingsManager: the processing pass failed');
+      return null;
+    } finally {
+      _isProcessingAny = false;
+      processingProgress.value = 1.0;
+      minutesRemaining = 0;
+      await refreshStoragePause();
+      notifyRecordingsChanged();
+    }
+  }
+
+  // ignore: unused_element
+  static Future<void> _oldProcessAllCompletedSessions() async {
     if (_isProcessingAny) return;
     await retryPendingSetAsideBins();
     if (_isProcessingAny) return;
@@ -3175,6 +3233,11 @@ class RecordingsManager {
       await _resetAndReprocessAll();
       return;
     }
+    await runPipelinePass(force: true);
+  }
+
+  // ignore: unused_element
+  static Future<void> _oldForceProcessAll({bool reprocessCovered = false}) async {
     if (_isProcessingAny) return;
     // Same idempotency guard as processAllCompletedSessions — see that method.
     // Force DOES decode a mid-transfer bin on purpose (that is the point of the
@@ -3234,7 +3297,50 @@ class RecordingsManager {
     }
   }
 
+  /// Reprocess all (Adjustment Mode): the derived state today's reset clears, then the
+  /// pipeline's reset (§7: generation advanced, the archive deleted, ownership cleared but
+  /// for tombstones, a rebuild end) and a pass over what is on the phone. Raw files the
+  /// gate has released are not restored from Adjustment Mode's copies.
   static Future<void> _resetAndReprocessAll() async {
+    if (_isProcessingAny) throw StateError('Wait for the current processing run to finish.');
+    _checkReprocessSyncIdle();
+    _isProcessingAny = true;
+    _cancelRequested = false;
+    try {
+      if (_uploadsInFlight.isNotEmpty) throw StateError('Wait for recording uploads to finish before reprocessing.');
+      // Refused here, before anything is reset, when nothing would be rebuilt.
+      final restored = await AppPipeline.instance.prepareReprocess();
+      await _editArchive(() async {
+        _checkReprocessSyncIdle();
+        if (_uploadsInFlight.isNotEmpty) throw StateError('Wait for recording uploads to finish before reprocessing.');
+        final prefs = SharedPreferencesUtil();
+        prefs.pendingRefiles = '';
+        prefs.clockCorrectionLedger = '';
+        prefs.lateMergeNotices = [];
+        for (final key in const [
+          'sp_state',
+          'sp_synced_count',
+          'sp_total_count',
+          'sp_minutes_remaining',
+          'sp_marker_count',
+          'sp_last_completed_stage',
+          'sp_last_active_stage',
+        ]) {
+          await prefs.remove(key);
+        }
+        await ConnectorRegistry.forgetDeliveryHistory(prefs);
+      });
+      await AppPipeline.instance.reprocessAll(restored);
+      await runPipelinePass(reserved: true);
+      if (_cancelRequested) throw StateError('Reprocessing cancelled. Source segments have been kept.');
+    } finally {
+      _isProcessingAny = false;
+      if (!recordingsUnsettled) notifyRecordingsChanged();
+    }
+  }
+
+  // ignore: unused_element
+  static Future<void> _oldResetAndReprocessAll() async {
     if (_isProcessingAny) throw StateError('Wait for the current processing run to finish.');
     _checkReprocessSyncIdle();
     // Reserve processing before any awaits so a scheduled run cannot start
@@ -3497,10 +3603,8 @@ class RecordingsManager {
       // The recordings' own bins are recorded as deleted (see [deletedRelBins]), and
       // nothing else is touched: audio of the same boot that is still waiting to be
       // processed or still downloading is not theirs to delete.
+      // The ledger keeps their audio owned (§7): nothing else changes.
       await _deleteConversationFiles(conversations);
-      // During a run the bins wait for the prune before the next one; coverage
-      // already counts them as decoded, so the run cannot rebuild the recording.
-      if (!_isProcessingAny) await _pruneAfterDelete();
     });
   }
 
@@ -3530,12 +3634,38 @@ class RecordingsManager {
   /// [pruneConsumedBins], the one raw-bin deleter outside a run, once nothing protects it —
   /// the checkpoint a failed run kept may still name it, and a run going now prunes it when
   /// it ends. Its set-aside entry and failure count go with it.
+  /// Skip, for a file processing keeps failing inside: set aside, so processing goes on
+  /// around it (§7).
+  static Future<void> skipSetAsideBin(String relBin) async {
+    final key = RawFileKey.fromRel(relBin);
+    if (key == null) {
+      await SetAsideBins.skip(relBin);
+      return;
+    }
+    await AppPipeline.instance.setAside(key);
+    notifyRecordingsChanged();
+  }
+
+  /// Save original file: [relBin]'s logical file, its chunks in order, in a temporary file
+  /// to share.
+  static Future<File> exportRawFile(String relBin) async {
+    final key = RawFileKey.fromRel(relBin);
+    final first = await SetAsideBins.fileFor(relBin);
+    if (key == null) return first;
+    final out = File('${(await getTemporaryDirectory()).path}/original/${first.uri.pathSegments.last}');
+    await out.parent.create(recursive: true);
+    await AppPipeline.instance.exportRaw(key, out);
+    return out;
+  }
+
   static Future<void> deleteSetAsideBin(String relBin) async {
-    await _editArchive(() async {
-      await _addDeletedRelBins({relBin});
+    final key = RawFileKey.fromRel(relBin);
+    if (key == null) {
       SetAsideBins.release(relBin);
-      if (!_isProcessingAny) await _pruneAfterDelete();
-    });
+      return;
+    }
+    await AppPipeline.instance.deleteRawFile(key);
+    notifyRecordingsChanged();
   }
 
   /// Try again, for a bin processing set aside: decodes it from where its unsaved audio
@@ -3552,6 +3682,20 @@ class RecordingsManager {
   /// A failure keeps it that way, on this build's account ([SetAsideBins.retryFailed]),
   /// and is rethrown. Throws [ProcessingBusy], with nothing changed, if a run is going.
   static Future<SetAsideRetry> retrySetAsideBin(String relBin) async {
+    final key = RawFileKey.fromRel(relBin);
+    if (key == null || (await AppPipeline.instance.coordinator.store.load(key)).chunks.isEmpty) {
+      SetAsideBins.release(relBin);
+      return SetAsideRetry.gone;
+    }
+    if (_isProcessingAny) throw const ProcessingBusy();
+    // Try again (§7): off the set-aside list, its card made again, back in its place.
+    await AppPipeline.instance.tryAgain(key);
+    await runPipelinePass();
+    return SetAsideRetry.recovered;
+  }
+
+  // ignore: unused_element
+  static Future<SetAsideRetry> _oldRetrySetAsideBin(String relBin) async {
     final entry = SetAsideBins.entryFor(relBin);
     if (entry == null) return SetAsideRetry.gone;
     final file = await SetAsideBins.fileFor(relBin);
@@ -3618,6 +3762,11 @@ class RecordingsManager {
   /// ([SetAsideBins.releaseAfterUpdate]), before a regular run. A failure leaves the bin
   /// set aside and is logged; the regular run goes ahead either way.
   static Future<void> retryPendingSetAsideBins() async {
+    // The pipeline's pass gives each set-aside file the retry a newer build owes it.
+  }
+
+  // ignore: unused_element
+  static Future<void> _oldRetryPendingSetAsideBins() async {
     for (final e in SetAsideBins.list().where((e) => e.retryPending)) {
       if (_isProcessingAny) return;
       try {
@@ -3698,9 +3847,7 @@ class RecordingsManager {
 
     // On disk before any file goes: a kill mid-delete must not leave bins that
     // nothing names, or the next run decodes the recording straight back.
-    final selected = conversations.where((c) => shouldDelete == null || shouldDelete(c)).toList();
-    final released = {...selected.expand(_ownBinsOnDisk), ...await _legacyWindowBinsOnDisk(selected)};
-    await _addDeletedRelBins(released);
+    // The ledger keeps their audio owned (§7): no deleted list, and nothing to prune.
 
     // Group conversations by directory to minimize directory listings for EDL cleanup
     final Map<String, List<Conversation>> byDir = {};
@@ -3959,7 +4106,27 @@ class RecordingsManager {
   /// Deletes processed recordings (.m4a/.wav/.meta/.bin) for a day.
 
   /// Safe to call while nothing is playing.
+  /// Delete Day (§7): what lies wholly inside the day goes; anything that crosses midnight
+  /// stays. The connectors forget the recordings it deleted.
   Future<void> deleteDay(Batch batch) async {
+    Batch current = batch;
+    for (final b in await getBatches()) {
+      if (b.dateString == batch.dateString) current = b;
+    }
+    final before = [...current.finalizedRecordings, ...current.draftRecordings];
+    final docs = (await getApplicationDocumentsDirectory()).path.replaceAll('\\', '/');
+    final deleted = (await AppPipeline.instance.deleteDay(batch.dateString)).toSet();
+    String rel(String path) => path.replaceAll('\\', '/').substring(docs.length + 1);
+    final gone = [
+      for (final c in before)
+        if (deleted.contains(rel(c.file.path)) || deleted.contains(rel(p.setExtension(c.file.path, '.meta')))) c
+    ];
+    if (gone.isNotEmpty) await ConnectorRegistry.recordingsDeleted(gone);
+    notifyRecordingsChanged();
+  }
+
+  // ignore: unused_element
+  Future<void> _oldDeleteDay(Batch batch) async {
     // A run decodes from a list it took at its start, so the day's audio could come
     // back as recordings while it runs. Wait for it, then work from a fresh listing.
     // Checked again inside the queue slot, since a run can claim processing after the
@@ -4540,16 +4707,22 @@ class RecordingsManager {
   static Future<void> _persistDiscardRecord(String docsPath, Map<String, dynamic> rec) =>
       DiscardStore.persistDiscardRecord(docsPath, rec);
 
-  static Future<Set<String>> discardedRelBinPaths() => DiscardStore.discardedRelBinPaths();
+  /// Today's pipeline excluded discarded bins from processing; the new one plans from the
+  /// ledger, so nothing is excluded this way.
+  static Future<Set<String>> discardedRelBinPaths() async => const {};
 
-  static Future<Set<String>> discardedRelBinPathsExcludingSpan(int spanStartMs, int spanEndMs) =>
-      DiscardStore.discardedRelBinPathsExcludingSpan(spanStartMs, spanEndMs);
+  static Future<Set<String>> discardedRelBinPathsExcludingSpan(int spanStartMs, int spanEndMs) async => const {};
 
   static Future<List<DiscardRecord>> getDiscardsForDate(String dateString) =>
       DiscardStore.getDiscardsForDate(dateString);
 
-  static Future<void> removeDiscardRecord(DiscardRecord d, {required bool deleteBins}) =>
-      DiscardStore.removeDiscardRecord(d, deleteBins: deleteBins);
+  /// Delete Discard (§7): the records go, their audio becomes a derived deletion. Without
+  /// [deleteBins] (the old Recover's cleanup) nothing is left to do: Recover replaces them.
+  static Future<void> removeDiscardRecord(DiscardRecord d, {required bool deleteBins}) async {
+    if (!deleteBins) return;
+    await AppPipeline.instance.deleteDiscards(d.pipelineIds);
+    notifyRecordingsChanged();
+  }
 
   /// Recover/fold byte-slice gating: given disjoint, ascending `[start,end]`
   /// [ranges] and a read head at [offset], returns where decoding should resume —
@@ -4683,8 +4856,7 @@ class RecordingsManager {
   /// processing run is already in flight (to avoid racing the per-segment delete
   /// handler).
   static Future<void> runRecoverySweep() async {
-    if (_isProcessingAny) return;
-    await DiscardStore.reclaimExpired();
+    // Discards expire in every processing pass (the pipeline's expiry).
   }
 
   // ---------------------------------------------------------------------------
@@ -4959,7 +5131,12 @@ class RecordingsManager {
   /// for old or truncated metadata without a bin list: merging windows of [rec_start - 10min, rec_end +
   /// vadSplit] around clustered recordings can otherwise hide a nearby undecoded bin permanently. A bin's
   /// span is estimated generously from its size ([_legacyBinSpanMs]).
-  static Future<Set<String>> coveredBinPaths(List<File> candidates) async {
+  /// Today's coverage: the new pipeline knows what is owned from the ledger, so no file is
+  /// excluded as covered.
+  static Future<Set<String>> coveredBinPaths(List<File> candidates) async => const {};
+
+  // ignore: unused_element
+  static Future<Set<String>> _oldCoveredBinPaths(List<File> candidates) async {
     if (candidates.isEmpty) return const {};
     final sources = await _buildCoverageSources();
     final merged = sources.legacyIntervals;
@@ -5038,13 +5215,15 @@ class RecordingsManager {
   /// Returns the number of bins deleted. Refreshes the storage pause after, since a bin
   /// that waited for space may be gone ([refreshStoragePause]).
   static Future<int> pruneConsumedBins({Set<String> protectedRelBins = const {}}) async {
+    // Raw files leave only through the pipeline's gate (§6).
     try {
-      return await _pruneConsumedBins(protectedRelBins);
+      return 0;
     } finally {
       await refreshStoragePause();
     }
   }
 
+  // ignore: unused_element
   static Future<int> _pruneConsumedBins(Set<String> protectedRelBins) async {
     final directory = await getApplicationDocumentsDirectory();
     final rawDir = Directory('${directory.path}/raw_segments');

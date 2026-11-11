@@ -346,6 +346,32 @@ class RawChunkStore {
         if (await folder.list().isEmpty) await folder.delete();
       });
 
+  /// The update from an earlier build (§13): the first manifest of a bin that predates this
+  /// format, its one chunk imported, with where the device file stands and when the phone
+  /// first had it (the bin's modification time, the anchor today's code used for a file
+  /// the Omi could not date). False, with nothing changed, for a file with a manifest or
+  /// none on the phone.
+  Future<bool> adoptLegacy(
+    RawFileKey key, {
+    required SourceLifecycle lifecycle,
+    int? advertisedLength,
+    int? firstSealedAtMs,
+  }) =>
+      _locked(key, () async {
+        if (await _readManifest(key) != null) return false;
+        final m = await _firstManifest(key);
+        if (m.chunks.isEmpty) return false;
+        m
+          ..lifecycle = lifecycle
+          ..advertisedLength = advertisedLength
+          ..firstSealedAtMs = firstSealedAtMs;
+        await folderOf(key).create(recursive: true);
+        await AtomicFile.writeString(_manifestFile(key), jsonEncode(m.toJson()));
+        Logger.debug('RawChunkStore: ${key.rel}: adopted from an earlier build, ${m.chunks.first.length} bytes, '
+            '${lifecycle.name}');
+        return true;
+      });
+
   /// Records where the device file stands. A terminal state is final; the advertised
   /// length is set once. [SourceLifecycle.complete] needs every advertised byte sealed:
   /// a clean end of transfer alone is not completion.

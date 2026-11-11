@@ -1,6 +1,8 @@
 import 'package:omi/gen/pigeon_communicator.g.dart';
 import 'dart:async';
 
+import 'package:omi/services/raw/app_pipeline.dart';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -365,6 +367,7 @@ class _DeviceSettingsState extends State<DeviceSettings> {
           // set by a previous one: the pref falls back to its 120 default while the
           // device still holds, say, 480. Every other write path sets both.
           SharedPreferencesUtil().priorityRecordMaxMinutes = cap;
+          unawaited(AppPipeline.instance.recordCap(cap));
         }, _Setting.priorityCap);
       }
     }
@@ -501,6 +504,7 @@ class _DeviceSettingsState extends State<DeviceSettings> {
 
   void _updatePriorityCap(int minutes) async {
     SharedPreferencesUtil().priorityRecordMaxMinutes = minutes;
+    unawaited(AppPipeline.instance.recordCap(minutes));
     _applyUserChange(_Setting.priorityCap, () => _priorityRecordCap = minutes);
     // Capture the messenger + provider before the async gap. The cap is armed
     // device-side at the start of a Priority Recording, so changing it never

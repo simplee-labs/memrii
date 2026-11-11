@@ -2336,6 +2336,20 @@ class DeviceProvider extends ChangeNotifier
   ///
   /// Fire-and-forget on purpose: this sits on the connect path, and persisting an
   /// anchor must never delay bringing the link up or block the sync behind it.
+  /// Notes which session the Omi is in on this link, for the recordings pipeline: a file
+  /// list taken on the same link was taken in that session, so every other session it
+  /// names had ended and all their files are on it ([DeviceConnection.liveSession]). A read
+  /// that spanned a reconnect is not noted: it cannot say which link it was answered on.
+  void _noteLiveSession(DeviceDropStats stats, int link, DeviceConnection conn) {
+    if (stats.deviceSessionId == 0) return;
+    if (conn.link != link) {
+      Logger.debug('Live session: the link changed during the diagnostics read; not noted');
+      return;
+    }
+    DeviceConnection.liveSession = (link: link, sessionId: stats.deviceSessionId);
+    Logger.debug('Live session: ${stats.deviceSessionId} on link $link');
+  }
+
   void _captureClockAnchor(DeviceDropStats stats) {
     // 0 = firmware older than the 100-byte payload. The firmware never issues 0 as a
     // real id, so this is "cannot tell me which session it is in", not a session.
@@ -2505,8 +2519,10 @@ class DeviceProvider extends ChangeNotifier
       // an outage and reboot. getDropStats skips internally while the storage mutex is held, avoiding a GATT
       // read racing the download. Flat counters are useful evidence but do not identify fault side or prove
       // request reception.
+      final link = conn.link;
       final dropStats = await conn.getDropStats();
       if (dropStats != null) {
+        _noteLiveSession(dropStats, link, conn);
         // Opportunistic, and that word is load-bearing: getDropStats() returns null
         // while a sync holds the storage mutex, so this is NOT "on connect" — it is
         // "whenever a diagnostics read happens to get through". That is enough. An

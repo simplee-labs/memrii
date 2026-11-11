@@ -8,7 +8,10 @@ import 'package:omi/pages/recordings/recordings_page.dart';
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/services/services.dart';
 import 'package:omi/services/ui_lifecycle.dart';
+import 'package:omi/services/raw/app_pipeline.dart';
+import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/recordings_manager.dart';
+import 'package:omi/services/wals/sdcard_wal_sync.dart';
 import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/bridges/ble_bridge.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
@@ -26,6 +29,10 @@ void main() async {
   BleFlutterApi.setUp(BleBridge.instance);
 
   initOpus(await opus_flutter.load());
+  // The new recordings pipeline: downloads seal chunks, and none starts before the
+  // pipeline's startup (the update from an earlier build) has run.
+  RawChunkStore.enabled = true;
+  SDCardWalSyncImpl.beforeSealedSync = AppPipeline.instance.start;
   await SharedPreferencesUtil.init();
   // Bring the flat processing prefs into line with the recording mode.
   //
@@ -160,6 +167,7 @@ Future<void> _launchHousekeeping() async {
     await RecordingsManager.cleanupOrphanedTempFiles();
     await RecordingsManager.logMisdatedArchive();
     await SetAsideBins.releaseAfterUpdate();
+    await AppPipeline.instance.start();
   } catch (e) {
     Logger.error('main: startup cleanup failed: $e');
   }

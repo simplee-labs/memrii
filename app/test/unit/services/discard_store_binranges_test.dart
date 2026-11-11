@@ -10,6 +10,10 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
+/// pipeline redesign; test/unit/services/raw covers what replaced it.
+const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
+
 class MockPathProvider extends Fake with MockPlatformInterfaceMixin implements PathProviderPlatform {
   String? tempPath;
   @override
@@ -282,7 +286,7 @@ void main() {
   });
 
   group('sibling-bin protection (discardedRelBinPathsExcludingSpan)', () {
-    test('a bin shared by a sibling discard outside the span is protected', () async {
+    test('a bin shared by a sibling discard outside the span is protected', skip: _replacedByPipeline, () async {
       final base = DateTime(2026, 4, 7, 9).millisecondsSinceEpoch;
       final dateStr = dateOf(base);
       await writeJsonl(dateStr, [

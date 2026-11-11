@@ -693,6 +693,9 @@ class OpenConversation {
   final int markerCount;
   final bool inPriority;
 
+  /// The file it starts in (its first frame's or marker's), when it holds either.
+  final RawFileKey? firstKey;
+
   const OpenConversation({
     required this.sessionId,
     required this.startMs,
@@ -700,6 +703,7 @@ class OpenConversation {
     required this.frameCount,
     required this.markerCount,
     required this.inPriority,
+    this.firstKey,
   });
 }
 
@@ -842,6 +846,22 @@ class _Conversation {
   _Conversation(this.policy, this.aad, this.derived, this.forced);
 
   bool get hasFrames => frames > 0;
+
+  /// The file it starts in: the earlier of its first frame's and its first marker's.
+  RawFileKey? get firstKey {
+    RawFileKey? frame;
+    for (final p in pieces) {
+      if (p is FramesPiece) {
+        frame = p.span.key;
+        break;
+      }
+    }
+    frame ??= _spanKey;
+    final marker = markers.isEmpty ? null : markers.first.id.key;
+    if (frame == null) return marker;
+    if (marker == null) return frame;
+    return compareKeys(marker, frame) < 0 ? marker : frame;
+  }
 
   void addFrame(RawFileKey key, int index, int timeMs, int? uptimeMs) {
     if (frames == 0) {
@@ -1611,6 +1631,7 @@ class _SessionWalker {
       frameCount: c.frames,
       markerCount: c.markers.length,
       inPriority: _inPriority,
+      firstKey: c.firstKey,
     );
   }
 }

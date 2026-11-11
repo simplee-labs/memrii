@@ -194,9 +194,16 @@ class MockDeviceConnection implements DeviceConnection {
   bool lastListingHeardDevice = false;
 
   @override
+  int link = 1;
+
+  /// The link drops and comes back while a listing is answered.
+  bool relinkWhileListing = false;
+
+  @override
   Future<StorageListing?> listFiles() async {
     lastListingHeardDevice = false;
     if (!await isConnected()) return null;
+    if (relinkWhileListing) link++;
     lastListingHeardDevice = !listFilesUnanswered || listFilesRefused;
     return listFilesUnanswered ? null : (files: files, complete: !listFilesTruncated);
   }
@@ -553,6 +560,47 @@ void main() {
       SharedPreferencesUtil().btDevice = BtDevice(id: device, name: 'Omi', type: DeviceType.omi, rssi: 0);
       await File('${tempDir.path}/wals.json').writeAsString('{ "wals": [ {');
       await expectLater(SDCardWalSyncImpl(MockWalSyncListener()).heldBackBinRelPaths(), throwsA(anything));
+    });
+  });
+
+  // The recordings pipeline finds a session ended only by a list of the Omi's files taken
+  // after it ended: complete, and on one link (the session read on that link is the one
+  // the list was taken in).
+  group('the listing the pipeline finds ended sessions by', () {
+    late MockDeviceConnection connection;
+    late SDCardWalSyncImpl sync;
+
+    setUp(() async {
+      connection = MockDeviceConnection()..link = 4;
+      sync = SDCardWalSyncImpl(MockWalSyncListener(), connectionProvider: (_) async => connection);
+      await sync.setDevice(BtDevice(id: 'omi-1', name: 'Omi', type: DeviceType.omi, rssi: 0));
+      connection.link = 5;
+    });
+
+    test("a sync's complete listing on one link is when and on which link it was taken", () async {
+      final before = DateTime.now().millisecondsSinceEpoch;
+      await sync.syncAll();
+      final on = (await sync.rawFileState()).listedOn;
+      expect(on?.link, 5);
+      expect(on!.atMs, greaterThanOrEqualTo(before));
+    });
+
+    test('a partial listing says nothing', () async {
+      connection.listFilesTruncated = true;
+      await sync.syncAll();
+      expect((await sync.rawFileState()).listedOn, isNull);
+    });
+
+    test('nor does a listing during which the link changed', () async {
+      connection.relinkWhileListing = true;
+      await sync.syncAll();
+      expect((await sync.rawFileState()).listedOn, isNull);
+    });
+
+    test('nor the saved list a new run of the app starts from', () async {
+      await sync.syncAll();
+      final fresh = SDCardWalSyncImpl(MockWalSyncListener(), connectionProvider: (_) async => null);
+      expect((await fresh.rawFileState()).listedOn, isNull);
     });
   });
 

@@ -133,13 +133,15 @@ class PublishJob {
 
   /// Publishes [items] (a plan's closed items, in its order) under [generation], the
   /// ledger generation the plan was made under. [files] and [cards] are what the plan was
-  /// made from.
+  /// made from. [onItem] is told the index of each item once it is rendered (for the
+  /// progress shown; its commit may come later).
   Future<PublishReport> publish({
     required List<PlanItem> items,
     required int generation,
     required Map<RawFileKey, PlanFile> files,
     required Map<RawFileKey, FileCard> cards,
     required PublishSettings settings,
+    void Function(int index)? onItem,
   }) async {
     if (items.isEmpty) return const PublishReport(PublishStop.done, 0);
     final job = await coordinator.startJob(holds: {
@@ -148,7 +150,7 @@ class PublishJob {
     });
     Logger.debug('PublishJob: ${job.id}: ${describeItems(items)}, under generation $generation');
     try {
-      final report = await _publish(job, items, generation, files, cards, settings);
+      final report = await _publish(job, items, generation, files, cards, settings, onItem);
       final line = 'PublishJob: ${job.id}: ${report.stop.name}, ${report.published} of ${items.length} published'
           '${report.failedItem == null ? '' : '; ${describeItem(report.failedItem!)} failed: ${report.error}'}';
       if (report.stop == PublishStop.failed) {
@@ -164,7 +166,7 @@ class PublishJob {
   }
 
   Future<PublishReport> _publish(JobHandle job, List<PlanItem> items, int generation, Map<RawFileKey, PlanFile> files,
-      Map<RawFileKey, FileCard> cards, PublishSettings settings) async {
+      Map<RawFileKey, FileCard> cards, PublishSettings settings, void Function(int index)? onItem) async {
     final renderer = RecordingRenderer(
       source: (key) async => RenderSource(await coordinator.store.load(key), cards[key]!),
       newDecoder: newDecoder,
@@ -206,7 +208,8 @@ class PublishJob {
     }
 
     try {
-      for (final item in items) {
+      for (var index = 0; index < items.length; index++) {
+        final item = items[index];
         if (isCancelled?.call() == true) return PublishReport(PublishStop.cancelled, published);
         final bytes = bytesOf(item, cards);
         RenderedRecording? rendered;
@@ -233,6 +236,7 @@ class PublishJob {
           batchMs += rendered.durationMs;
         }
         batch.add(StagedItem(item, bytes, rendered));
+        onItem?.call(index);
         if (batch.length >= settings.maxItemsPerCommit || batchMs >= settings.maxAudioMsPerCommit) {
           if (!await flush()) return PublishReport(PublishStop.stale, published);
         }

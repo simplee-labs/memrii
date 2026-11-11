@@ -613,7 +613,10 @@ class ArchiveActions {
   /// (the I4 exception); and a rebuild end closes each session at the end of what is
   /// here, so the rebuild finishes without waiting for missing audio. Returns the new
   /// generation.
-  Future<int> reprocessAll() => coordinator.transact('reprocessAll', () async {
+  ///
+  /// [restored]: released files whose copies were put back on the phone (Adjustment
+  /// Mode's): their receipts go, so they are planned from their chunks like the rest.
+  Future<int> reprocessAll({Set<RawFileKey> restored = const {}}) => coordinator.transact('reprocessAll', () async {
         final generation = (await coordinator.ledger.loadStream()).generation + 1;
         final last = <int?, RawFileKey>{};
         for (final k in await coordinator.store.listKeys()) {
@@ -637,6 +640,7 @@ class ArchiveActions {
           <JournalOp>[
             SetGenerationOp(generation),
             const DeletePathsOp(['recordings']),
+            for (final e in _byDay(restored).entries) ForgetReceiptsOp(e.key, e.value),
             for (final d in days) ClearOwnershipOp(d),
             StreamOp(boundaries: ends),
           ],

@@ -466,6 +466,27 @@ void main() {
     await expectNothingPublished(world, c, boundaries: [a.force]);
   });
 
+  test('Reprocess all: a released file whose copy is put back is planned from it again', () async {
+    final a = Bin(1789100000000)..frames(300, p: speech);
+    await world.arrive(a);
+    await world.drain(c, boundaries: [a.force]);
+    expect(await RawBinGate(c).release(), {a.key});
+    final receipt = (await ledgerOf(root.path))[a.key]!.receipt!;
+    // Adjustment Mode's copy, back on the phone as the update adopts a bin.
+    File('${root.path}/raw_segments/${a.key.rel}')
+      ..createSync(recursive: true)
+      ..writeAsBytesSync(a.bytes);
+    await world.store.adoptLegacy(a.key,
+        lifecycle: receipt.lifecycle,
+        advertisedLength: receipt.advertisedLength,
+        firstSealedAtMs: receipt.firstSealedAtMs);
+    await actions.reprocessAll(restored: {a.key});
+    expect((await ledgerOf(root.path))[a.key]!.receipt, isNull);
+    await world.drain(c);
+    final heard = (await Archive.read(root.path)).heard.values.single;
+    expect([for (final h in heard) h.$1], [for (var i = 0; i < 300; i++) (frameTag(a.key), i)]);
+  });
+
   test('Reprocess all: everything but tombstones is published again; old jobs are dropped', () async {
     final a = await conversationThenQuiet();
     final gone = await conversationThenQuiet(start: 1789100000000 + 86400 * 1000, session: 8);

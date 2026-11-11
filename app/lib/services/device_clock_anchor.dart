@@ -47,7 +47,17 @@ class DeviceClockAnchor {
 
   /// The wall-clock start for a recording that began at [startUptimeSec] of this
   /// session's uptime (`.meta` stores it in whole seconds).
-  int startMsFor(int startUptimeSec) => (startUptimeSec * 1000) + (wallClockMs - deviceUptimeMs);
+  ///
+  /// The anchor's uptime is the Omi's 32-bit millisecond counter, which wraps every
+  /// ~49.7 days, while a recording's start uptime is in full: the two are matched modulo
+  /// 2^32, the difference taken as the nearer one (a recording and the anchor that dates
+  /// it are days apart at most). Within ~24.8 days this is the plain difference.
+  int startMsFor(int startUptimeSec) {
+    const wrap = 1 << 32;
+    var d = (startUptimeSec * 1000 - deviceUptimeMs) % wrap;
+    if (d >= wrap ~/ 2) d -= wrap;
+    return wallClockMs + d;
+  }
 
   /// The most the Omi's own clock could plausibly have drifted over this session.
   ///

@@ -247,6 +247,7 @@ class DiscardStore {
           binRanges: _parseBinRanges(m['binRanges']),
           audioMs: (m['audioMs'] as num?)?.toInt() ?? 0,
           sourceJsonl: jsonl,
+          pipelineIds: [if (m['id'] is String) m['id'] as String],
         );
         if (rec.reason == 'silence_trimmed') continue;
         if (seen.add(rec.id)) out.add(rec);
@@ -280,6 +281,7 @@ class DiscardStore {
     String reason = sorted.first.reason;
     bool noise = sorted.first.isNoise;
     File src = sorted.first.sourceJsonl;
+    final ids = <String>[...sorted.first.pipelineIds];
 
     DiscardRecord build() => DiscardRecord(
           startTime: start,
@@ -290,6 +292,7 @@ class DiscardStore {
           binRanges: ranges,
           audioMs: audioMs,
           sourceJsonl: src,
+          pipelineIds: [...ids],
         );
 
     for (var i = 1; i < sorted.length; i++) {
@@ -304,6 +307,7 @@ class DiscardStore {
         bins.addAll(r.relativeBins);
         ranges = _unionBinRanges(ranges, r.binRanges);
         audioMs += r.audioMs;
+        ids.addAll(r.pipelineIds);
         if (!noise && r.isNoise) {
           noise = true;
           reason = r.reason;
@@ -318,6 +322,9 @@ class DiscardStore {
           ..addAll(r.relativeBins);
         ranges = r.binRanges;
         audioMs = r.audioMs;
+        ids
+          ..clear()
+          ..addAll(r.pipelineIds);
         reason = r.reason;
         noise = r.isNoise;
         src = r.sourceJsonl;

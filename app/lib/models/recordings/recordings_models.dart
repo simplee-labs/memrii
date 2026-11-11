@@ -608,6 +608,10 @@ class DiscardRecord {
   final int audioMs;
   final File sourceJsonl;
 
+  /// The pipeline's ids of the records this row shows (several when coalesced): what
+  /// Delete and Recover name.
+  final List<String> pipelineIds;
+
   const DiscardRecord({
     required this.startTime,
     required this.endTime,
@@ -617,6 +621,7 @@ class DiscardRecord {
     required this.sourceJsonl,
     this.binRanges = const {},
     this.audioMs = 0,
+    this.pipelineIds = const [],
   });
 
   Duration get duration => endTime.difference(startTime);
