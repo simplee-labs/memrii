@@ -71,6 +71,10 @@ class PassInputs {
   /// Every file here arrived on that list's link or before it.
   final ({int atMs, int? liveSession})? listing;
 
+  /// What the connect that list was taken on showed the Omi held ([QuietMark]): where the
+  /// last conversation of a session still running may close. Null without such a list.
+  final QuietMark? quiet;
+
   final int nowMs;
 
   const PassInputs({
@@ -83,6 +87,7 @@ class PassInputs {
     this.anchors = const [],
     this.knownEnded = const {},
     this.listing,
+    this.quiet,
   });
 }
 
@@ -279,6 +284,7 @@ class RawPipeline {
     final all = [...files.values, ...await _receipts(files.keys.toSet())];
     final missing = inputs.missing.where((k) => !files.containsKey(k)).toList()..sort(compareKeys);
     final ended = _endedSessions(all, missing, inputs.anchors, inputs.knownEnded, inputs.listing);
+    _logQuiet(inputs.quiet, all, ended);
 
     // ---- plan and publish ----
     Plan? last;
@@ -300,6 +306,7 @@ class RawPipeline {
         policies: inputs.policies,
         caps: snap.stream.caps.isEmpty ? CapHistory.constant(inputs.capMinutesNow) : CapHistory(snap.stream.caps),
         endedSessions: ended,
+        quiet: inputs.quiet,
       ));
       last = p;
       Logger.debug('RawPipeline: plan ${p.describe()}');
@@ -483,6 +490,20 @@ class RawPipeline {
   }
 
   static String _time(int ms) => DateTime.fromMillisecondsSinceEpoch(ms).toIso8601String();
+
+  /// For the debug log: the sessions still running here that the quiet mark cannot close,
+  /// having no clock anchor to measure the silence by. The mark itself, or why there is
+  /// none, the app logs (AppPipeline.quietOf).
+  static void _logQuiet(QuietMark? quiet, List<PlanFile> files, Map<int?, int?> ended) {
+    if (quiet == null) return;
+    final unmeasured = {
+      for (final f in files)
+        if (!ended.containsKey(f.key.sessionId) && !quiet.uptimeAt.containsKey(f.key.sessionId)) f.key.sessionId
+    };
+    if (unmeasured.isEmpty) return;
+    Logger.debug('RawPipeline: no clock anchor for session(s) ${unmeasured.toList()}: the quiet mark '
+        '${_time(quiet.atMs)} leaves their last conversation open');
+  }
 
   /// A damaged file (unreadable from some point on) is set aside once everything readable
   /// in it is owned, so the recordings page offers Save original file and Delete; the gate

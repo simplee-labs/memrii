@@ -560,6 +560,11 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
   /// (Partial deletes go through multi-select or the "Delete Discards" action.)
   Future<void> _deleteDayConversations(Batch batch) async {
     final messenger = ScaffoldMessenger.of(context);
+    void stillDeleting(String day) => messenger.showSnackBar(SnackBar(content: Text('Still deleting $day')));
+    if (_controller.deletingDay case final day?) {
+      stillDeleting(day);
+      return;
+    }
     bool? confirm = await showDialog<bool>(
       context: context,
       builder: (c) => getDialog(
@@ -573,13 +578,23 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
       ),
     );
     if (confirm != true) return;
-    if (RecordingsManager.isProcessingAny) {
-      // The delete waits for the run, which could otherwise turn the day's waiting
-      // audio back into recordings as it goes.
-      messenger.showSnackBar(const SnackBar(content: Text('Deleting after processing finishes')));
-    }
+    // Shown until it is done: it first works out what crosses midnight, which takes a
+    // while when audio has just arrived. It also waits for a run going now, which could
+    // otherwise turn the day's waiting audio back into recordings as it goes.
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(SnackBar(
+      content: Text(RecordingsManager.isProcessingAny
+          ? 'Deleting ${batch.dateString} after processing finishes…'
+          : 'Deleting ${batch.dateString}…'),
+      duration: const Duration(minutes: 10),
+    ));
     try {
-      await _controller.deleteDay(batch);
+      final done = await _controller.deleteDay(batch);
+      messenger.hideCurrentSnackBar();
+      if (!done) {
+        if (_controller.deletingDay case final day?) stillDeleting(day);
+        return;
+      }
       // What runs past midnight stays the first time; Delete Day again takes it too.
       final left = _controller.batches.where((b) => b.dateString == batch.dateString).firstOrNull;
       if (mounted && left != null && (left.finalizedRecordings.isNotEmpty || left.discards.isNotEmpty)) {
@@ -588,6 +603,7 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
         ));
       }
     } catch (e) {
+      messenger.hideCurrentSnackBar();
       if (mounted) {
         messenger.showSnackBar(
           SnackBar(content: Text('Error deleting day: $e')),

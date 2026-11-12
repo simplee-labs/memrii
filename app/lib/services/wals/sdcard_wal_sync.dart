@@ -34,8 +34,9 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   /// When and on which link ([DeviceConnection.link]) the sync took the complete listing
   /// [_wals] came from. Null when they came from anywhere else (saved state, a listing
   /// another caller took, a partial one): the pipeline then finds no session newly ended
-  /// from them ([rawFileState]).
-  ({int atMs, int link})? _listedOn;
+  /// from them ([rawFileState]). [linkSinceMs] is when that link came up
+  /// ([DeviceConnection.linkSinceMs]): what the list shows the Omi held then.
+  ({int atMs, int link, int linkSinceMs})? _listedOn;
   BtDevice? _device;
 
   final Future<DeviceConnection?> Function(String deviceId)? _connectionProvider;
@@ -458,7 +459,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         List<RawFileKey> missing,
         Set<RawFileKey> waived,
         Set<RawFileKey> listed,
-        ({int atMs, int link})? listedOn
+        ({int atMs, int link, int linkSinceMs})? listedOn
       })> rawFileState() async {
     final deviceId = _device?.id ?? SharedPreferencesUtil().btDevice.id;
     final listedOn = _listedOn;
@@ -568,7 +569,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   }
 
   /// null = the device never answered the listing. See [_buildWalsFromFilesLocked].
-  Future<({List<Wal> wals, bool complete, ({int atMs, int link})? on})?> _getMissingWalsLocked(
+  Future<({List<Wal> wals, bool complete, ({int atMs, int link, int linkSinceMs})? on})?> _getMissingWalsLocked(
       DeviceConnection connection, String deviceId) async {
     final built = await _buildWalsFromFilesLocked(connection, deviceId);
     Logger.debug('SDCardWalSync: getMissingWals returned '
@@ -708,7 +709,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   ///
   /// `on` is when and on which link this listing was taken ([_listedOn]): null for
   /// prefetched files, and for a listing during which the link changed.
-  Future<({List<Wal> wals, bool complete, ({int atMs, int link})? on})?> _buildWalsFromFilesLocked(
+  Future<({List<Wal> wals, bool complete, ({int atMs, int link, int linkSinceMs})? on})?> _buildWalsFromFilesLocked(
     DeviceConnection connection,
     String deviceId, {
     List<StorageFile>? prefetchedFiles,
@@ -721,13 +722,14 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     // through instead of trusting this: a short listing reported complete is
     // exactly the wrong answer the rest of this change exists to prevent.
     final link = connection.link;
+    final linkSinceMs = connection.linkSinceMs;
     final atMs = DateTime.now().millisecondsSinceEpoch;
     final listing = prefetchedFiles != null ? (files: prefetchedFiles, complete: true) : await connection.listFiles();
     if (listing == null) return null;
-    ({int atMs, int link})? on;
+    ({int atMs, int link, int linkSinceMs})? on;
     if (prefetchedFiles == null) {
       if (connection.link == link) {
-        on = (atMs: atMs, link: link);
+        on = (atMs: atMs, link: link, linkSinceMs: linkSinceMs);
       } else {
         Logger.debug('SDCardWalSync: the link changed during the listing; it says nothing of ended sessions');
       }
@@ -1863,7 +1865,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   Future<SyncLocalFilesResponse?> _syncAllLocked(
     DeviceConnection connection,
     String deviceId, {
-    ({List<Wal> wals, bool complete, ({int atMs, int link})? on})? prefetchedWals,
+    ({List<Wal> wals, bool complete, ({int atMs, int link, int linkSinceMs})? on})? prefetchedWals,
     IWalSyncProgressListener? progress,
   }) async {
     _lastStorageStats = null;
@@ -1888,7 +1890,7 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   Future<SyncLocalFilesResponse?> _syncAllFilesLocked(
     DeviceConnection connection,
     String deviceId, {
-    ({List<Wal> wals, bool complete, ({int atMs, int link})? on})? prefetchedWals,
+    ({List<Wal> wals, bool complete, ({int atMs, int link, int linkSinceMs})? on})? prefetchedWals,
     IWalSyncProgressListener? progress,
   }) async {
     final listed = prefetchedWals ?? await _getMissingWalsLocked(connection, deviceId);

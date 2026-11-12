@@ -196,6 +196,9 @@ class MockDeviceConnection implements DeviceConnection {
   @override
   int link = 1;
 
+  @override
+  int linkSinceMs = 1794392565000;
+
   /// The link drops and comes back while a listing is answered.
   bool relinkWhileListing = false;
 
@@ -583,6 +586,7 @@ void main() {
       final on = (await sync.rawFileState()).listedOn;
       expect(on?.link, 5);
       expect(on!.atMs, greaterThanOrEqualTo(before));
+      expect(on.linkSinceMs, 1794392565000, reason: 'when that link came up: what the list shows the Omi held then');
     });
 
     test('a partial listing says nothing', () async {

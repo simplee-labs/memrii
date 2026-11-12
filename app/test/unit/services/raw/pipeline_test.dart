@@ -116,6 +116,7 @@ void main() {
           {List<({int sessionId, int atMs})> anchors = const [],
           Set<int> knownEnded = const {},
           ({int atMs, int? liveSession})? listing,
+          QuietMark? quiet,
           int? nowMs,
           List<RawFileKey> missing = const [],
           bool planOnly = false}) =>
@@ -128,6 +129,7 @@ void main() {
             anchors: anchors,
             knownEnded: knownEnded,
             listing: listing,
+            quiet: quiet,
             missing: missing,
           ),
           planOnly: planOnly);
@@ -362,6 +364,17 @@ void main() {
     expect(r.published, 1);
     expect(r.ended, {7});
     expect(r.released, {a.key});
+  });
+
+  test('the quiet mark closes the conversation still open, and its files go', () async {
+    final a = Bin(t0)..frames(300, p: speech);
+    await world.arrive(a);
+    expect((await pass(quiet: quietAfter(a, 100000))).published, 0, reason: 'no split yet');
+    final r = await pass(quiet: quietAfter(a, 200000));
+    expect(r.published, 1);
+    expect(r.open, isEmpty);
+    expect(r.released, {a.key});
+    expect(recordingsOf(r.plan!), isEmpty, reason: 'the last plan, after publishing, has nothing left');
   });
 
   test("an ended session's last conversation waits for its files still on the Omi", () async {

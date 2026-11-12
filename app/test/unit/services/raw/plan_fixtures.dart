@@ -201,6 +201,7 @@ Plan planOf(
   int capMinutes = 120,
   CapHistory? caps,
   Map<int?, int?>? endedSessions,
+  QuietMark? quiet,
 }) =>
     plan(PlanInput(
       files: files,
@@ -211,7 +212,15 @@ Plan planOf(
       boundaries: boundaries,
       owned: owned,
       endedSessions: endedSessions ?? endedSessionsOf(startsOf(files, missing)),
+      quiet: quiet,
     ));
+
+/// The quiet mark [afterMs] past where [b] has got to, by its clock and its uptime alike
+/// ([clockMs] and [uptimeMs] move it on either alone), for [b]'s session.
+QuietMark quietAfter(Bin b, int afterMs, {int? clockMs, int? uptimeMs}) => QuietMark(
+      b.clockMs + (clockMs ?? afterMs),
+      {b.key.sessionId!: (b.uptimeMs + (uptimeMs ?? afterMs)) & 0xFFFFFFFF},
+    );
 
 /// What is left of [f] once the gate released it: its receipt, from its card.
 PlanFile receiptOf(PlanFile f) => PlanFile.released(

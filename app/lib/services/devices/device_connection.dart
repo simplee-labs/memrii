@@ -58,6 +58,12 @@ abstract class DeviceConnection {
   int _link = 0;
   static int _links = 0;
 
+  /// When [link] came up (phone time): when the phone saw it ready, a little after the
+  /// Omi's own connect. The recordings pipeline dates from it what a list taken on the
+  /// link shows the Omi held (QuietMark).
+  int get linkSinceMs => _linkSinceMs;
+  int _linkSinceMs = 0;
+
   /// The session the Omi said it was in (the diagnostics read), and the [link] it said it
   /// on. The recordings pipeline matches it with the link a file list was taken on.
   static ({int link, int sessionId})? liveSession;
@@ -77,7 +83,10 @@ abstract class DeviceConnection {
       final deviceState = _mapTransportStateToDeviceState(transportState);
       if (_connectionState != deviceState) {
         _connectionState = deviceState;
-        if (deviceState == DeviceConnectionState.connected) _link = ++_links;
+        if (deviceState == DeviceConnectionState.connected) {
+          _link = ++_links;
+          _linkSinceMs = DateTime.now().millisecondsSinceEpoch;
+        }
         _connectionStateChangedCallback?.call(device.id, _connectionState, isManual: false);
       }
     });

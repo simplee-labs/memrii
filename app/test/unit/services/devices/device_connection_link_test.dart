@@ -58,4 +58,28 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(other.link, greaterThan(c.link), reason: 'counted across connections');
   });
+
+  // What a list taken on a link shows the Omi held is dated from when that link came up.
+  test('each link notes when it came up; one link keeps its time', () async {
+    final t = _Transport();
+    final c = _Connection(t);
+    await c.connect();
+    Future<void> say(DeviceTransportState s) async {
+      t.states.add(s);
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    expect(c.linkSinceMs, 0, reason: 'no link yet');
+    final before = DateTime.now().millisecondsSinceEpoch;
+    await say(DeviceTransportState.connected);
+    final first = c.linkSinceMs;
+    expect(first, inInclusiveRange(before, DateTime.now().millisecondsSinceEpoch));
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    await say(DeviceTransportState.connected);
+    expect(c.linkSinceMs, first, reason: 'the same link');
+    await say(DeviceTransportState.disconnected);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    await say(DeviceTransportState.connected);
+    expect(c.linkSinceMs, greaterThan(first), reason: 'a new link, a new time');
+  });
 }

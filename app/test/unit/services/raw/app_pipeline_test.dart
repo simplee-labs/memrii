@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/gen/pigeon_communicator.g.dart';
+import 'package:omi/services/device_clock_anchor.dart';
 import 'package:omi/services/raw/app_pipeline.dart';
 import 'package:omi/services/raw/chunk_download.dart';
 import 'package:omi/services/raw/coordinator.dart';
@@ -213,12 +214,54 @@ void main() {
     });
 
     test('the session read on the link the list was taken on is the one it was taken in', () {
-      expect(AppPipeline.listingOf((atMs: 5, link: 3), (link: 3, sessionId: 8)), (atMs: 5, liveSession: 8));
+      expect(AppPipeline.listingOf((atMs: 5, link: 3, linkSinceMs: 1), (link: 3, sessionId: 8)),
+          (atMs: 5, liveSession: 8));
     });
 
     test('a session read on another link is not: the Omi may have restarted between', () {
-      expect(AppPipeline.listingOf((atMs: 5, link: 3), (link: 2, sessionId: 8)), (atMs: 5, liveSession: null));
-      expect(AppPipeline.listingOf((atMs: 5, link: 3), null), (atMs: 5, liveSession: null));
+      expect(AppPipeline.listingOf((atMs: 5, link: 3, linkSinceMs: 1), (link: 2, sessionId: 8)),
+          (atMs: 5, liveSession: null));
+      expect(AppPipeline.listingOf((atMs: 5, link: 3, linkSinceMs: 1), null), (atMs: 5, liveSession: null));
+    });
+  });
+
+  group('the quiet mark', () {
+    const linkUp = 1794392565000;
+    const listed = (atMs: linkUp + 9000, link: 4, linkSinceMs: linkUp);
+
+    test('none without a complete list the sync took, nor for a link with no start', () {
+      expect(AppPipeline.quietOf(null, const []).$1, isNull);
+      expect(AppPipeline.quietOf((atMs: 5, link: 4, linkSinceMs: 0), const []).$1, isNull);
+    });
+
+    test('is three minutes before the link the list was taken on came up, not when the list was taken', () {
+      final (q, why) = AppPipeline.quietOf(listed, const []);
+      expect(q!.atMs, linkUp - 3 * 60 * 1000);
+      expect(why, contains('link 4'));
+      expect(q.uptimeAt, isEmpty, reason: 'no anchor: nothing to measure a silence by');
+      expect(AppPipeline.connectQuietMarginMs, 3 * 60 * 1000,
+          reason: 'two minutes the Omi may leave a young file open, and one for the phone to see the link');
+    });
+
+    test("each session's uptime then comes from its newest clock anchor", () {
+      final anchors = [
+        const DeviceClockAnchor(sessionId: 8, deviceUptimeMs: 1000000, wallClockMs: linkUp - 600000),
+        const DeviceClockAnchor(sessionId: 9, deviceUptimeMs: 50000, wallClockMs: linkUp - 3600000),
+        // The newest of session 8: it wins.
+        const DeviceClockAnchor(sessionId: 8, deviceUptimeMs: 2000000, wallClockMs: linkUp + 5000),
+      ];
+      final q = AppPipeline.quietOf(listed, anchors).$1!;
+      expect(q.uptimeAt[8], 2000000 - 5000 - 3 * 60 * 1000);
+      expect(q.uptimeAt[9], 50000 + 3600000 - 3 * 60 * 1000);
+      expect(q.uptimeAt.keys, unorderedEquals([8, 9]));
+    });
+
+    test('an uptime past the 32-bit wrap, or before the session began, stays in 32 bits', () {
+      final q = AppPipeline.quietOf(listed, [
+        const DeviceClockAnchor(sessionId: 8, deviceUptimeMs: 10000, wallClockMs: linkUp),
+      ]).$1!;
+      expect(q.uptimeAt[8], (10000 - 3 * 60 * 1000) & 0xFFFFFFFF,
+          reason: 'the Omi had not started three minutes before: the planner reads it as after the audio');
     });
   });
 }

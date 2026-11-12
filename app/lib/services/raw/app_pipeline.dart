@@ -224,6 +224,8 @@ class AppPipeline {
   Future<PassReport> _pass(
       {void Function()? onLiveness, void Function(double done)? onProgress, bool planOnly = false}) async {
     final holes = await _holes();
+    final (quiet, quietWhy) = quietOf(holes.listedOn, _clockAnchors());
+    Logger.debug('AppPipeline: ${quiet == null ? 'no quiet mark' : 'quiet mark'} ($quietWhy)');
     final live = ProcessingSettings.fromPrefs();
     final cards = CardBuilder(
       store: coordinator.store,
@@ -262,6 +264,7 @@ class AppPipeline {
         anchors: _anchors(),
         knownEnded: {..._ended},
         listing: listingOf(holes.listedOn, DeviceConnection.liveSession),
+        quiet: quiet,
       ),
       isCancelled: () => _cancelRequested,
       planOnly: planOnly,
@@ -626,8 +629,13 @@ class AppPipeline {
     ];
   }
 
-  Future<({List<RawFileKey> missing, Set<RawFileKey> waived, Set<RawFileKey> listed, ({int atMs, int link})? listedOn})>
-      _holes() async {
+  Future<
+      ({
+        List<RawFileKey> missing,
+        Set<RawFileKey> waived,
+        Set<RawFileKey> listed,
+        ({int atMs, int link, int linkSinceMs})? listedOn
+      })> _holes() async {
     try {
       final sync = ServiceManager.instance().wal.getSyncs();
       if (sync is SDCardWalSyncImpl) return await sync.rawFileState();
@@ -647,23 +655,57 @@ class AppPipeline {
   /// when it said so on the same link ([live]). A session read on another link may not be
   /// the one the list was taken in.
   static ({int atMs, int? liveSession})? listingOf(
-      ({int atMs, int link})? listedOn, ({int link, int sessionId})? live) {
+      ({int atMs, int link, int linkSinceMs})? listedOn, ({int link, int sessionId})? live) {
     if (listedOn == null) return null;
     final same = live != null && live.link == listedOn.link;
     return (atMs: listedOn.atMs, liveSession: same ? live.sessionId : null);
   }
 
-  /// The sessions the phone saw live, from the clock anchors (the newest last).
-  static List<({int sessionId, int atMs})> _anchors() {
+  /// How long before the phone saw a link come up the Omi had listed everything it
+  /// recorded. On a connect the Omi closes the file it is writing (so the list taken next
+  /// names it) unless the file holds no audio or is under two minutes old
+  /// (BLE_CONNECT_MIN_ROTATE_AGE_MS, sd_card.c; since oo-3.0.4); and the phone sees the
+  /// link ready within seconds of the Omi's connect (native allows 15 s to discover the
+  /// services after it): a minute more covers that.
+  static const int connectQuietMarginMs = 3 * 60 * 1000;
+
+  /// The quiet mark a pass plans with ([QuietMark]): [connectQuietMarginMs] before the
+  /// link the sync took its complete list on ([listedOn]) came up, with each session's
+  /// uptime then, from its newest clock anchor ([anchors], the newest last). A session's
+  /// anchor also shows it ran firmware that reports its session (oo-3.1.0 on), which closes
+  /// its file on a connect. Null, with why, without such a list.
+  @visibleForTesting
+  static (QuietMark?, String) quietOf(
+      ({int atMs, int link, int linkSinceMs})? listedOn, List<DeviceClockAnchor> anchors) {
+    if (listedOn == null) return (null, 'no complete list of the Omi\'s files taken since the app started');
+    if (listedOn.linkSinceMs <= 0) return (null, 'the link the list was taken on has no start time');
+    final atMs = listedOn.linkSinceMs - connectQuietMarginMs;
+    final newest = <int, DeviceClockAnchor>{for (final a in anchors) a.sessionId: a};
+    final uptimeAt = {
+      for (final a in newest.values) a.sessionId: (a.deviceUptimeMs + atMs - a.wallClockMs) & 0xFFFFFFFF,
+    };
+    return (
+      QuietMark(atMs, uptimeAt),
+      '${_clock(atMs)}: the list from ${_clock(listedOn.atMs)} was taken on link ${listedOn.link}, '
+          'up at ${_clock(listedOn.linkSinceMs)}; uptime then known for session(s) ${uptimeAt.keys.toList()}',
+    );
+  }
+
+  static String _clock(int ms) => DateTime.fromMillisecondsSinceEpoch(ms).toIso8601String();
+
+  /// The clock anchors (the newest last), or none when they cannot be read.
+  static List<DeviceClockAnchor> _clockAnchors() {
     try {
-      return [
-        for (final a in DeviceClockAnchorSet.decode(SharedPreferencesUtil().deviceClockAnchors).anchors)
-          (sessionId: a.sessionId, atMs: a.wallClockMs)
-      ];
+      return DeviceClockAnchorSet.decode(SharedPreferencesUtil().deviceClockAnchors).anchors;
     } catch (_) {
       return const [];
     }
   }
+
+  /// The sessions the phone saw live, from the clock anchors (the newest last).
+  static List<({int sessionId, int atMs})> _anchors() => [
+        for (final a in _clockAnchors()) (sessionId: a.sessionId, atMs: a.wallClockMs),
+      ];
 
   static PlanPolicy _policyOf(ModeSettings m) => PlanPolicy(
         vadEnabled: m.vadEnabled,

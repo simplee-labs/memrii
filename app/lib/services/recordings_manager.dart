@@ -456,6 +456,17 @@ class RecordingsManager {
     }
   }
 
+  /// [folder]'s entries, or none once it is gone. Delete Day and the release of raw files
+  /// remove the folders they empty, so a folder listed a moment before may be gone when it
+  /// is read: that is one folder fewer, never a list that fails to load.
+  static Future<List<FileSystemEntity>> _entriesOf(Directory folder) async {
+    try {
+      return await folder.list().toList();
+    } on FileSystemException {
+      return const [];
+    }
+  }
+
   Future<List<Batch>> getBatches() async {
     final directory = await getApplicationDocumentsDirectory();
     final rawSegmentsDir = Directory('${directory.path}/raw_segments');
@@ -490,7 +501,7 @@ class RecordingsManager {
         if (deviceSessionIdStr.startsWith('.')) continue;
 
         // Process segments
-        final folderEntities = await folder.list().toList();
+        final folderEntities = await _entriesOf(folder);
         // A logical file is listed once, by its first chunk, and only while its audio is
         // still to process (the pipeline's last pass says which).
         final status = AppPipeline.instance.status;
@@ -520,7 +531,11 @@ class RecordingsManager {
                 dateStr = _dateStringFromMillis((await file.lastModified()).millisecondsSinceEpoch);
               }
             } catch (_) {
-              dateStr = _dateStringFromMillis((await file.lastModified()).millisecondsSinceEpoch);
+              try {
+                dateStr = _dateStringFromMillis((await file.lastModified()).millisecondsSinceEpoch);
+              } on FileSystemException {
+                return; // released since its folder was listed: nothing left to show
+              }
             }
             rawSegmentsByDate.putIfAbsent(dateStr, () => []).add(file);
           }),
@@ -534,7 +549,7 @@ class RecordingsManager {
       final dateFolders = dateFolderEntities.whereType<Directory>();
       for (var folder in dateFolders) {
         final dateString = p.basename(folder.path);
-        final folderEntities = await folder.list().toList();
+        final folderEntities = await _entriesOf(folder);
         final files = folderEntities
             .whereType<File>()
             .where(
@@ -2952,8 +2967,7 @@ class RecordingsManager {
     // Step 1: Rapidly scan all date folders for EDL files
     final List<MarkerConversation> allConversations = [];
     for (final dateFolder in dateFolders) {
-      final edlFiles = await dateFolder
-          .list()
+      final edlFiles = (await _entriesOf(dateFolder))
           .where((e) => e is File && e.uri.pathSegments.last.startsWith('marker_') && e.path.endsWith('.edl'))
           .cast<File>()
           .toList();
@@ -3605,6 +3619,9 @@ class RecordingsManager {
       // processed or still downloading is not theirs to delete.
       // The ledger keeps their audio owned (§7): nothing else changes.
       await _deleteConversationFiles(conversations);
+      Logger.debug('RecordingsManager: deleted ${conversations.length} recording(s): '
+          '${conversations.take(10).map((c) => p.relative(c.file.path, from: c.file.parent.parent.path)).join(', ')}'
+          '${conversations.length > 10 ? ', +${conversations.length - 10} more' : ''}');
     });
   }
 

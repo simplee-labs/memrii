@@ -16,7 +16,9 @@
 // Owned audio (a published item or a deletion) is a wall: a conversation closes before
 // it and the next one starts after it. So is audio set aside or given up on, so that
 // when it comes back it fits between the walls, in its place. A session is read only up
-// to its first hole, audio known to exist that is not here (R2).
+// to its first hole, audio known to exist that is not here (R2). Past its last audio, a
+// session still running is silent up to the quiet mark (what a connect showed the Omi
+// held: [QuietMark]), so its last conversation closes there once that silence is a split.
 //
 // Not switched on yet (see raw_chunks.dart).
 
@@ -332,6 +334,29 @@ class PlanBoundary {
   const PlanBoundary(this.kind, this.key, this.offset);
 }
 
+/// What the Omi held when the phone connected, as the list taken on that link shows it:
+/// everything it had recorded before [atMs]. On a connect the Omi closes the file it is
+/// writing, and so lists it, unless that file holds no audio or is under two minutes old;
+/// so audio it had not listed is all from at most two minutes before the connect on.
+/// [atMs] is earlier still, by the time the phone may take to see the link come up. A
+/// session that had ended by then has nothing unlisted at all.
+///
+/// Past a session's last audio here, up to [atMs], nothing was recorded: its last
+/// conversation closes when that is a split, exactly as a file starting at [atMs] would
+/// close it. Should the Omi have failed to close its file, the audio in it comes later
+/// and becomes a recording of its own: a split, never a loss.
+class QuietMark {
+  /// Phone time; the Omi's clock is set from the phone's.
+  final int atMs;
+
+  /// Per session, the Omi's uptime at [atMs] (low 32 bits), from that session's clock
+  /// anchor. A session without one is not closed here: its uptime is what measures the
+  /// silence, and its clock alone may be off.
+  final Map<int, int> uptimeAt;
+
+  const QuietMark(this.atMs, this.uptimeAt);
+}
+
 class PlanInput {
   /// The files here.
   final List<PlanFile> files;
@@ -354,6 +379,10 @@ class PlanInput {
   /// correction can reorder.
   final Map<int?, int?> endedSessions;
 
+  /// Up to when nothing unlisted was recorded, for a session still running: where its
+  /// last conversation may close. Null: no complete list of the Omi's files to say so.
+  final QuietMark? quiet;
+
   const PlanInput({
     required this.files,
     required this.policies,
@@ -363,6 +392,7 @@ class PlanInput {
     this.boundaries = const [],
     this.owned = const PlanOwnership(),
     this.endedSessions = const {},
+    this.quiet,
   });
 }
 
@@ -376,6 +406,9 @@ enum CloseType {
 
   /// A gap between files over the split.
   fileGap,
+
+  /// Silence over the split up to the quiet mark: nothing more was recorded ([QuietMark]).
+  quiet,
 
   /// The policy's length cap.
   cap,
@@ -1056,7 +1089,35 @@ class _SessionWalker {
       // Unknown, the end is bounded by where the stream was.
       _endMute(input.endedSessions[sessionId] ?? _prevPositionMs ?? 0, at, CloseType.sessionEnd);
       _closeLatched(CloseType.sessionEnd, at);
+    } else if (input.quiet case final q?) {
+      _passQuiet(q);
     }
+  }
+
+  /// The quiet mark after everything here: the silence from the last audio up to it, as
+  /// [_walkFile] measures a gap to the next file, closes what is open when it is a split.
+  /// Measured by the clock and by the uptime both, the shorter taken: a clock behind
+  /// would lengthen it. Nothing closes without the session's uptime there.
+  void _passQuiet(QuietMark q) {
+    final conv = _conv;
+    final upAt = q.uptimeAt[sessionId];
+    final prevUptime = _prevPairUptimeMs;
+    final prevSilence = _prevSilenceMs;
+    if (conv == null || !conv.hasFrames || upAt == null || prevUptime == null || prevSilence == null) return;
+    final elapsedMs = min(q.atMs - _prevPairMs, _signedUptimeDelta(prevUptime, upAt));
+    if (elapsedMs <= 0) return;
+    final within = _protectedUntil != null && q.atMs <= _protectedUntil!;
+    final splits =
+        !within && !_inPriority && prevSilence + elapsedMs > max(0, conv.policy.silenceSplitMs - firmwareHoldMs);
+    if (!splits) return;
+    _closeConversation(CloseType.quiet, DiscardKind.flushNoise, PlanPosition(files.last.key, 1 << 40));
+  }
+
+  /// How far uptime moved from [from] (in full) to [to] (its low 32 bits), signed: exact
+  /// within 2^31 ms (24.8 days) either way. A longer move reads shorter, never longer.
+  static int _signedUptimeDelta(int from, int to) {
+    final forward = (to - from) & 0xFFFFFFFF;
+    return forward >= 0x80000000 ? forward - 0x100000000 : forward;
   }
 
   /// A file the Omi lists that is not here: a hole, unless waived. Waived, it is a wall.

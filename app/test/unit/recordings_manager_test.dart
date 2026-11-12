@@ -26,6 +26,128 @@ class MockPathProvider extends Fake with MockPlatformInterfaceMixin implements P
   Future<String?> getTemporaryPath() async => tempPath;
 }
 
+/// Folders named in [names] are gone by the time they are read: listed by their parent
+/// (`raw_segments`, `recordings`), then failing to list as a folder removed in between
+/// does, and so does reading the discards file in one. Files named in [files] are listed,
+/// then gone when their date is read. Notes each one read.
+final class _VanishingFolders extends IOOverrides {
+  final Set<String> names;
+  final Set<String> files;
+  final listed = <String>[];
+
+  _VanishingFolders(this.names, {this.files = const {}});
+
+  @override
+  Directory createDirectory(String path) {
+    final real = super.createDirectory(path);
+    return const {'raw_segments', 'recordings'}.contains(p.basename(path)) ? _Parent(real, this) : real;
+  }
+
+  @override
+  File createFile(String path) {
+    final real = super.createFile(path);
+    return p.basename(path) == 'discards.jsonl' && names.contains(p.basename(p.dirname(path)))
+        ? _GoneFile(real, listed)
+        : real;
+  }
+}
+
+/// A discards file there when checked, gone when read.
+class _GoneFile extends Fake implements File {
+  final File _real;
+  final List<String> _listed;
+
+  _GoneFile(this._real, this._listed);
+
+  @override
+  String get path => _real.path;
+
+  @override
+  Future<bool> exists() => _real.exists();
+
+  @override
+  Future<String> readAsString({Encoding encoding = utf8}) {
+    _listed.add(p.basename(path));
+    return Future.error(PathNotFoundException(path, const OSError('No such file or directory', 2), 'Cannot open file'));
+  }
+}
+
+/// The list checks a parent folder is there and lists it; nothing else.
+class _Parent extends Fake implements Directory {
+  final Directory _real;
+  final _VanishingFolders _owner;
+
+  _Parent(this._real, this._owner);
+
+  @override
+  String get path => _real.path;
+
+  @override
+  Future<bool> exists() => _real.exists();
+
+  @override
+  Stream<FileSystemEntity> list({bool recursive = false, bool followLinks = true}) =>
+      _real.list(recursive: recursive, followLinks: followLinks).map((e) => e is! Directory
+          ? e
+          : _owner.names.contains(p.basename(e.path))
+              ? _Vanished(e, _owner.listed)
+              : _Thinned(e, _owner));
+}
+
+/// A folder there, whose files named in [_VanishingFolders.files] are gone once listed.
+class _Thinned extends Fake implements Directory {
+  final Directory _real;
+  final _VanishingFolders _owner;
+
+  _Thinned(this._real, this._owner);
+
+  @override
+  String get path => _real.path;
+
+  @override
+  Stream<FileSystemEntity> list({bool recursive = false, bool followLinks = true}) => _real
+      .list(recursive: recursive, followLinks: followLinks)
+      .map((e) => e is File && _owner.files.contains(p.basename(e.path)) ? _GoneRawFile(e, _owner.listed) : e);
+}
+
+/// A raw file listed, then released before its date is read.
+class _GoneRawFile extends Fake implements File {
+  final File _real;
+  final List<String> _listed;
+
+  _GoneRawFile(this._real, this._listed);
+
+  @override
+  String get path => _real.path;
+
+  @override
+  Uri get uri => _real.uri;
+
+  @override
+  Future<DateTime> lastModified() {
+    _listed.add(p.basename(path));
+    return Future.error(PathNotFoundException(path, const OSError('No such file or directory', 2), 'Cannot stat'));
+  }
+}
+
+/// The list reads a folder's path and lists it; nothing else.
+class _Vanished extends Fake implements Directory {
+  final Directory _real;
+  final List<String> _listed;
+
+  _Vanished(this._real, this._listed);
+
+  @override
+  String get path => _real.path;
+
+  @override
+  Stream<FileSystemEntity> list({bool recursive = false, bool followLinks = true}) {
+    _listed.add(p.basename(path));
+    return Stream.error(
+        PathNotFoundException(path, const OSError('No such file or directory', 2), 'Directory listing failed'));
+  }
+}
+
 void main() {
   late Directory tempDir;
   late MockPathProvider mockPathProvider;
@@ -122,6 +244,30 @@ void main() {
 
     expect(batches[0].rawSegments[0].path.endsWith('100_0.bin'), true);
     expect(batches[0].rawSegments[1].path.endsWith('100_1.bin'), true);
+  });
+
+  // Delete Day and the release of raw files remove the folders they empty, so a folder
+  // listed a moment before may be gone when the list reads it: one folder fewer, never a
+  // list that fails to load (seen on a device: Delete Day removed the day mid-load).
+  test('getBatches and the marker list skip a folder gone by the time it is read', () async {
+    final kept = Directory(p.join(tempDir.path, 'raw_segments', '1780358400'))..createSync(recursive: true);
+    File(p.join(kept.path, '1780358400_2867336594.bin')).writeAsBytesSync([0]);
+    final rawGone = Directory(p.join(tempDir.path, 'raw_segments', '1780444800'))..createSync(recursive: true);
+    File(p.join(rawGone.path, '1780444800_2867336594.bin')).writeAsBytesSync([0]);
+    final day = Directory(p.join(tempDir.path, 'recordings', '2026-06-03'))..createSync(recursive: true);
+    File(p.join(day.path, 'discards.jsonl')).writeAsStringSync('');
+    // Named before the Omi had the time: dated by when it was written, so read once more.
+    File(p.join(tempDir.path, 'raw_segments', 'session_7', '100_7.bin'))
+      ..createSync(recursive: true)
+      ..writeAsBytesSync([0]);
+    final overrides = _VanishingFolders({'1780444800', '2026-06-03'}, files: {'100_7.bin'});
+
+    final batches = await IOOverrides.runWithIOOverrides(() => RecordingsManager().getBatches(), overrides);
+    expect([for (final b in batches) ...b.rawSegments.map((f) => p.basename(f.path))], ['1780358400_2867336594.bin']);
+    expect(overrides.listed, containsAll(['1780444800', '2026-06-03', 'discards.jsonl', '100_7.bin']),
+        reason: 'each was read, and was gone');
+    expect(
+        await IOOverrides.runWithIOOverrides(() => RecordingsManager().getMarkerConversations(), overrides), isEmpty);
   });
 
   group('Conversation.fromFile tests', () {

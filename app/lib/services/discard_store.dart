@@ -226,15 +226,21 @@ class DiscardStore {
   }
 
   /// Parses `recordings/<dateString>/discards.jsonl` into [DiscardRecord]s.
-  /// Returns an empty list if the file does not exist. Malformed lines are
-  /// skipped with a warning.
+  /// Returns an empty list if the file does not exist (or is deleted while it is
+  /// read, as Delete Day does). Malformed lines are skipped with a warning.
   static Future<List<DiscardRecord>> getDiscardsForDate(String dateString) async {
     final directory = await getApplicationDocumentsDirectory();
     final jsonl = File('${directory.path}/recordings/$dateString/discards.jsonl');
     if (!await jsonl.exists()) return const [];
+    final String text;
+    try {
+      text = await jsonl.readAsString();
+    } on FileSystemException {
+      return const [];
+    }
     final out = <DiscardRecord>[];
     final seen = <String>{};
-    for (final line in (await jsonl.readAsString()).split('\n')) {
+    for (final line in text.split('\n')) {
       if (line.isEmpty) continue;
       try {
         final m = jsonDecode(line) as Map<String, dynamic>;

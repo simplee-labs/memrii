@@ -28,12 +28,13 @@ import 'package:omi/integrations/upload_types.dart';
 export 'package:omi/integrations/upload_types.dart';
 
 class RecordingsController extends ChangeNotifier implements IWalSyncProgressListener {
-  final RecordingsManager _manager = RecordingsManager();
+  final RecordingsManager _manager;
   final _prefs = SharedPreferencesUtil();
 
-  RecordingsController({IntegrationCoordinator? integrations, SDCardWalSync? walSync})
+  RecordingsController({IntegrationCoordinator? integrations, SDCardWalSync? walSync, RecordingsManager? manager})
       : _injectedIntegrations = integrations,
-        _injectedWalSync = walSync;
+        _injectedWalSync = walSync,
+        _manager = manager ?? RecordingsManager();
 
   final IntegrationCoordinator? _injectedIntegrations;
   final SDCardWalSync? _injectedWalSync;
@@ -1834,11 +1835,30 @@ class RecordingsController extends ChangeNotifier implements IWalSyncProgressLis
   /// could land after a newer one and bring back what was just deleted, then drop it again).
   Future<void> reloadBatchesSilently() => _loadBatches();
 
+  /// The day Delete Day is deleting, while it runs. It first works out what crosses
+  /// midnight, which takes a while when audio has just arrived: the page says so meanwhile,
+  /// and turns a second Delete Day away rather than queue it behind the first.
+  String? get deletingDay => _deletingDay;
+  String? _deletingDay;
+
   /// Every connector forgets the day's recordings inside [RecordingsManager.deleteDay],
-  /// as every deletion path does — see [RecordingsManager.deleteConversations].
-  Future<void> deleteDay(Batch batch) async {
-    await _manager.deleteDay(batch);
-    await _loadBatches();
+  /// as every deletion path does — see [RecordingsManager.deleteConversations]. False,
+  /// with nothing done, while another Delete Day runs ([deletingDay]).
+  Future<bool> deleteDay(Batch batch) async {
+    if (_deletingDay != null) {
+      Logger.debug('RecordingsController: Delete Day ${batch.dateString} turned away: $_deletingDay is still deleting');
+      return false;
+    }
+    _deletingDay = batch.dateString;
+    notifyListeners();
+    try {
+      await _manager.deleteDay(batch);
+      await _loadBatches();
+    } finally {
+      _deletingDay = null;
+      if (!_isDisposed) notifyListeners();
+    }
+    return true;
   }
 
   Future<void> deleteConversation(Conversation conversation) async {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -24,8 +25,29 @@ class _IdleSync implements SDCardWalSync {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
+/// Delete Day held until [release] completes, so a second one can be tried meanwhile.
+class _SlowDeleteManager implements RecordingsManager {
+  final release = Completer<void>();
+  final deleted = <String>[];
+
+  @override
+  Future<void> deleteDay(Batch batch) async {
+    deleted.add(batch.dateString);
+    await release.future;
+  }
+
+  @override
+  Future<List<Batch>> getBatches() async => const [];
+
+  @override
+  Future<List<MarkerConversation>> getMarkerConversations() async => const [];
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
 void main() {
-  test('a reload keeps the list on screen, and a burst of changes ends on the last one', () async {
+  setUpAll(() async {
     TestWidgetsFlutterBinding.ensureInitialized();
     SharedPreferences.setMockInitialValues({});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
@@ -37,13 +59,15 @@ void main() {
       (_) async => const StandardMessageCodec().encodeMessage([null]),
     );
     await SharedPreferencesUtil.init();
+    await ServiceManager.init();
+  });
+  tearDownAll(() => ServiceManager.instance().integrations.dispose());
+
+  /// A controller on an empty archive, its first list loaded.
+  Future<RecordingsController> controllerOf({RecordingsManager? manager}) async {
     final temp = Directory.systemTemp.createTempSync('recordings_reload');
     PathProviderPlatform.instance = MockPathProvider()..tempPath = temp.path;
-    await ServiceManager.init();
-    addTearDown(() {
-      ServiceManager.instance().integrations.dispose();
-      temp.deleteSync(recursive: true);
-    });
+    addTearDown(() => temp.deleteSync(recursive: true));
     final coordinator = IntegrationCoordinator(
       connectors: const [],
       prefs: SharedPreferencesUtil(),
@@ -55,13 +79,19 @@ void main() {
       showUploadNotification: (_) {},
     );
     addTearDown(coordinator.dispose);
-    final controller = RecordingsController(integrations: coordinator, walSync: _IdleSync());
+    final controller = RecordingsController(integrations: coordinator, walSync: _IdleSync(), manager: manager);
     addTearDown(controller.dispose);
 
     controller.init();
     await controller.reloadBatchesSilently(); // the first list, after its spinner
     expect(controller.isLoading, isFalse);
     expect(controller.batches, isEmpty);
+    return controller;
+  }
+
+  test('a reload keeps the list on screen, and a burst of changes ends on the last one', () async {
+    final controller = await controllerOf();
+    final temp = Directory((await PathProviderPlatform.instance.getApplicationDocumentsPath())!);
 
     final spinner = <bool>[];
     controller.addListener(() => spinner.add(controller.isLoading));
@@ -77,5 +107,31 @@ void main() {
     await controller.reloadBatchesSilently();
     expect(spinner, isNot(contains(true)), reason: 'the list stays on screen while it reloads');
     expect(controller.batches.single.rawSegments, hasLength(1), reason: 'the last change is the one shown');
+  });
+
+  // Delete Day first works out what crosses midnight, which takes a while when audio has
+  // just arrived. A second Delete Day meanwhile is turned away, not queued behind it (on a
+  // device, one confirmed twice ran twice).
+  test('a second Delete Day while one runs is turned away; the page can say which day is deleting', () async {
+    final manager = _SlowDeleteManager();
+    final controller = await controllerOf(manager: manager);
+    final day = Batch(
+      dateString: '2026-11-11',
+      date: DateTime(2026, 11, 11),
+      rawSegments: const [],
+      draftRecordings: const [],
+      finalizedRecordings: const [],
+      markerTimestamps: const [],
+      discards: const [],
+    );
+    final first = controller.deleteDay(day);
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.deletingDay, '2026-11-11');
+    expect(await controller.deleteDay(day), isFalse);
+    manager.release.complete();
+    expect(await first, isTrue);
+    expect(manager.deleted, ['2026-11-11'], reason: 'deleted once');
+    expect(controller.deletingDay, isNull);
+    expect(await controller.deleteDay(day), isTrue, reason: 'once it is done, Delete Day runs again');
   });
 }

@@ -1202,4 +1202,102 @@ void main() {
       expect(recordingsOf(planOf([a.file()])).single.closeType, CloseType.priorityStale);
     });
   });
+
+  // What a connect showed the Omi held: nothing unlisted before the mark. Auto mode splits
+  // on more than 110 s (120 s less the firmware hold), as for a gap to the next file.
+  group('the quiet mark', () {
+    test('closes the last conversation once the silence up to it is a split', () {
+      final a = Bin(t0).frames(500, p: speech);
+      final p = planOf([a.file()], quiet: quietAfter(a, 111000));
+      final r = recordingsOf(p).single;
+      expect(r.closeType, CloseType.quiet);
+      expect(r.pieces, [frames(a, 0, 500)]);
+      expect(p.open, isEmpty);
+      expect(p.describe(), contains('+10s quiet'));
+    });
+
+    test('leaves it open while the silence is no split, or the mark is before its last audio', () {
+      final a = Bin(t0).frames(500, p: speech);
+      for (final afterMs in [110000, 30000, 0, -30000]) {
+        final p = planOf([a.file()], quiet: quietAfter(a, afterMs));
+        expect(p.items, isEmpty, reason: '$afterMs ms');
+        expect(p.open.single.frameCount, 500);
+      }
+    });
+
+    test('counts the silence already there, as the gap to the next file does', () {
+      // A trailing resume: 60 s of silence the file itself shows, then 51 s to the mark.
+      final a = Bin(t0).frames(500, p: speech).resume(60000);
+      expect(recordingsOf(planOf([a.file()], quiet: quietAfter(a, 51000))).single.closeType, CloseType.quiet);
+      expect(planOf([a.file()], quiet: quietAfter(a, 49000)).open, hasLength(1));
+    });
+
+    test('takes the shorter of the clock and the uptime: a clock behind does not lengthen it', () {
+      final a = Bin(t0).frames(500, p: speech);
+      expect(planOf([a.file()], quiet: quietAfter(a, 3600000, uptimeMs: 60000)).open, hasLength(1));
+      expect(planOf([a.file()], quiet: quietAfter(a, 3600000, clockMs: 60000)).open, hasLength(1));
+    });
+
+    test('reads an uptime behind the audio as behind, across the 32-bit wrap too', () {
+      const wrap = 0x100000000;
+      final a = Bin(t0, uptimeMs: wrap - 5000).frames(500, p: speech);
+      expect(recordingsOf(planOf([a.file()], quiet: quietAfter(a, 200000))).single.closeType, CloseType.quiet);
+      expect(planOf([a.file()], quiet: quietAfter(a, 200000, uptimeMs: -100000)).open, hasLength(1),
+          reason: 'the uptime says the mark is before the last audio, whatever the clock says');
+      final b = Bin(t0).frames(500, p: speech);
+      expect(planOf([b.file()], quiet: quietAfter(b, 200000, uptimeMs: -100000)).open, hasLength(1));
+    });
+
+    test('closes nothing without the session\'s uptime there', () {
+      final a = Bin(t0).frames(500, p: speech);
+      expect(planOf([a.file()], quiet: QuietMark(a.clockMs + 3600000, const {})).open, hasLength(1));
+      expect(planOf([a.file()], quiet: QuietMark(a.clockMs + 3600000, {99: a.uptimeMs + 3600000})).open, hasLength(1));
+    });
+
+    test('never closes a Priority Recording, nor what a tap still protects', () {
+      final a = Bin(t0).priority().frames(500, p: speech);
+      expect(planOf([a.file()], quiet: quietAfter(a, 3600000)).open.single.inPriority, isTrue);
+      // A tap whose own clock is 100 s past the audio protects up to 150 s past it.
+      final b = Bin(t0).frames(500, p: speech);
+      final end = b.clockMs;
+      b.tap(atMs: end + 100000);
+      expect(planOf([b.file()], quiet: quietAfter(b, 120000)).open, hasLength(1));
+      expect(recordingsOf(planOf([b.file()], quiet: quietAfter(b, 151000))).single.closeType, CloseType.quiet);
+    });
+
+    test('below the minimum speech, what it closes is a discard', () {
+      final a = Bin(t0).frames(500, p: quiet);
+      final p = planOf([a.file()], quiet: quietAfter(a, 111000));
+      expect(recordingsOf(p), isEmpty);
+      expect(discardsOf(p).single.closeType, CloseType.quiet);
+      expect(p.open, isEmpty);
+    });
+
+    test('waits behind a hole: what the Omi listed is not all here', () {
+      final a = Bin(t0).frames(500, p: speech);
+      final b = a.next(gapMs: 1000).frames(10, p: speech);
+      final p = planOf([a.file()], missing: [b.key], quiet: quietAfter(b, 3600000));
+      expect(p.items, isEmpty);
+      expect(p.stoppedAt[7], PlanPosition(b.key, -1));
+    });
+
+    test('a session that ended closes at its end; the one still running at the mark', () {
+      final a = Bin(t0).frames(500, p: speech);
+      final b = Bin(t0 + 3600000, session: 8, uptimeMs: 5000).frames(500, p: speech);
+      final q = QuietMark(b.clockMs + 111000, {7: a.uptimeMs + 3600000, 8: b.uptimeMs + 111000});
+      final p = planOf([a.file(), b.file()], quiet: q);
+      expect(recordingsOf(p).map((r) => (r.sessionId, r.closeType)), [(7, CloseType.sessionEnd), (8, CloseType.quiet)]);
+    });
+
+    test('what it closes is what the gap to the next file would: audio after it is a recording of its own', () {
+      final a = Bin(t0).frames(500, p: speech);
+      final first = planOf([a.file()], quiet: quietAfter(a, 150000));
+      final b = a.next(gapMs: 200000).frames(300, p: speech);
+      final whole = planOf([a.file(), b.file()], boundaries: [b.force]);
+      expect(recordingsOf(whole).map((r) => r.closeType), [CloseType.fileGap, CloseType.force]);
+      expect(recordingsOf(first).single.pieces, recordingsOf(whole).first.pieces);
+      final later = planOf([a.file(), b.file()], owned: ownershipOf(first.items), boundaries: [b.force]);
+      expect(recordingsOf(later).single.pieces, recordingsOf(whole).last.pieces);
+    });
+  });
 }
