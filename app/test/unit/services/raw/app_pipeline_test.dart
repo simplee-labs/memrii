@@ -9,8 +9,6 @@ import 'package:omi/services/raw/app_pipeline.dart';
 import 'package:omi/services/raw/chunk_download.dart';
 import 'package:omi/services/raw/coordinator.dart';
 import 'package:omi/services/raw/gate.dart';
-import 'package:omi/services/raw/pipeline.dart';
-import 'package:omi/services/raw/plan.dart';
 import 'package:omi/services/raw/raw_chunks.dart';
 import 'package:omi/services/set_aside_bins.dart';
 import 'package:omi/services/wals/wal.dart';
@@ -29,67 +27,6 @@ class _MockPathProvider extends Fake with MockPlatformInterfaceMixin implements 
 }
 
 void main() {
-  group('Delete Day keeps what crosses midnight, as the plan stands now', () {
-    final midnight = DateTime(2026, 9, 12).millisecondsSinceEpoch;
-
-    Plan planOf(List<Bin> bins) => plan(PlanInput(
-          files: [for (final b in bins) b.file()],
-          policies: const PolicyHistory(autoPolicy),
-          caps: CapHistory.constant(120),
-        ));
-
-    test('a conversation open past midnight keeps its files', () {
-      final a = Bin(midnight - 5000)..frames(600, p: speech);
-      expect(AppPipeline.crossingMidnight(planOf([a]), midnight, {a.key}), {a.key});
-    });
-
-    test('one open before midnight keeps its files when its session has a file from midnight on', () {
-      final a = Bin(midnight - 600000)..frames(300, p: speech);
-      final later = RawFileKey(midnight ~/ 1000 + 30, a.key.sessionId);
-      expect(AppPipeline.crossingMidnight(planOf([a]), midnight, {a.key, later}), {a.key, later},
-          reason: 'its end is not known yet');
-      expect(AppPipeline.crossingMidnight(planOf([a]), midnight, {a.key}), isEmpty,
-          reason: 'nothing of its session after midnight: it is the day\'s');
-    });
-
-    test('a closed item not yet published that runs past midnight keeps its files', () {
-      final a = Bin(midnight - 5000)
-        ..frames(600, p: speech)
-        ..resume(300000)
-        ..frames(10, p: speech);
-      final p = planOf([a]);
-      expect(p.items.whereType<PlannedRecording>(), isNotEmpty);
-      expect(AppPipeline.crossingMidnight(p, midnight, {a.key}), {a.key});
-    });
-
-    test('nothing is deleted when the plan was not made', () {
-      expect(() => AppPipeline.keptByDeleteDay(const PassReport(PassStop.cancelled), midnight, {}, {}),
-          throwsA(isA<StateError>()));
-    });
-
-    test('a file not arrived yet is kept when it starts close enough to midnight to run past it', () {
-      final near = RawFileKey(midnight ~/ 1000 - 300, 7); // 23:55
-      final early = RawFileKey(midnight ~/ 1000 - 1800, 7); // 23:30
-      final after = RawFileKey(midnight ~/ 1000 + 60, 7); // the next day's
-      final all = {near, early, after};
-      expect(AppPipeline.keptByDeleteDay(const PassReport(PassStop.done), midnight, all, all), {near});
-    });
-
-    test('an open conversation that runs into such a file keeps its files too', () {
-      final a = Bin(midnight - 1800000)..frames(300, p: speech); // 23:30
-      final near = RawFileKey(midnight ~/ 1000 - 300, a.key.sessionId);
-      final p = plan(PlanInput(
-        files: [a.file()],
-        missing: [near],
-        policies: const PolicyHistory(autoPolicy),
-        caps: CapHistory.constant(120),
-      ));
-      expect(p.open, isNotEmpty);
-      expect(AppPipeline.keptByDeleteDay(PassReport(PassStop.done, plan: p), midnight, {a.key, near}, {near}),
-          {a.key, near});
-    });
-  });
-
   group('startup and Reprocess all', () {
     late Directory root;
 
@@ -153,7 +90,7 @@ void main() {
           reason: 'the rebuild skips a set-aside file: nothing would be rebuilt');
     });
 
-    test('Delete Day after a Stop still plans, and keeps a file still arriving that may run past midnight', () async {
+    test('Delete Day after a Stop leaves a file on its first transfer alone', () async {
       final start = DateTime(2026, 11, 10, 23, 58).millisecondsSinceEpoch;
       final b = Bin(start)..frames(6000, p: speech);
       final app = AppPipeline.forTest();
@@ -167,7 +104,7 @@ void main() {
       expect(part.existsSync(), isTrue);
     });
 
-    test('a file that arrives during Delete Day and runs past midnight is kept and not deleted after', () async {
+    test('a file that arrives during Delete Day is left alone', () async {
       final start = DateTime(2026, 11, 10, 23, 59).millisecondsSinceEpoch;
       final b = Bin(start)..frames(6000, p: speech);
       final app = AppPipeline.forTest();

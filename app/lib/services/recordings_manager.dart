@@ -4123,8 +4123,9 @@ class RecordingsManager {
   /// Deletes processed recordings (.m4a/.wav/.meta/.bin) for a day.
 
   /// Safe to call while nothing is playing.
-  /// Delete Day (§7): what lies wholly inside the day goes; anything that crosses midnight
-  /// stays. The connectors forget the recordings it deleted.
+  /// Delete Day (§7): what is saved under the day goes, except what crosses midnight;
+  /// nothing in progress, on the Omi or downloading. The connectors forget the
+  /// recordings it deleted.
   Future<void> deleteDay(Batch batch) async {
     Batch current = batch;
     for (final b in await getBatches()) {

@@ -305,42 +305,27 @@ class ArchiveActions {
     }
   }
 
-  /// Delete Day (§7): what lies wholly inside the day goes; anything that crosses
-  /// midnight stays exactly as it is, unless it is all that is left of the day: then it
-  /// goes too (Delete Day asked again), its raw files still kept.
+  /// Delete Day (§7): what is saved under the day goes — its recordings, discards and
+  /// markers — and nothing else. A conversation still in progress, audio still on the Omi
+  /// or still downloading, and files set aside are left alone: what they hold is saved
+  /// when it comes, and a set-aside file keeps its own Delete. What runs past midnight
+  /// stays exactly as it is, unless it is all that is left of the day: then it goes too
+  /// (Delete Day asked again).
   ///
-  /// The recordings and discards listed under the day go, with their markers, unless they
-  /// run past the day's end: those stay, and so do the raw files they come from, as do
-  /// those of the previous day's items that run into this one (§7). Then
-  /// every raw file holding the day's audio is tombstoned (R5) — those the Omi dated that
-  /// day, a first transfer still running and [listed] (the Omi's listing, not arrived yet)
-  /// included, and those the deleted items came from — except the files of what stays and
-  /// [keep]: files holding audio not yet saved that lies outside the day, such as a
-  /// conversation still in progress across midnight (the planner knows; step 6 passes it).
-  /// Another day's saved recordings are untouched: a tombstone never changes a published
-  /// recording. The gate then releases the tombstoned files.
+  /// Nothing is tombstoned. As with a single delete, a deleted recording keeps its claim
+  /// on its audio, so that audio is never saved again; a deleted discard's audio is handed
+  /// to [deletedDiscard], as Delete Discard does. The gate then releases each raw file
+  /// once all of it is owned for good, so a file shared with a conversation still in
+  /// progress stays until that conversation is saved.
   ///
   /// Returns what was deleted, relative to the documents directory: each recording's audio,
   /// or its meta when passthrough left no audio.
-  Future<List<String>> deleteDay(
-    String date, {
-    required int nowMs,
-    Iterable<RawFileKey> listed = const [],
-    Set<RawFileKey> keep = const {},
-  }) =>
-      coordinator.transact('deleteDay', () async {
+  Future<List<String>> deleteDay(String date) => coordinator.transact('deleteDay', () async {
         final folder = Directory('$_docs/recordings/$date');
-        final dayStart = _dayStartMs(date);
         final dayEnd = _dayEndMs(date);
         final deletedPaths = <String>[];
         final deletedFiles = <String>[];
         final deletedIds = <String>[];
-        final candidates = <RawFileKey>{};
-        final protect = <RawFileKey>{
-          ...keep,
-          // The previous day's recordings and discards that run past midnight into this one.
-          ...await _filesOfItemsEndingAfter(localDateOf(dayStart - 1), dayStart),
-        };
         var keptAny = false;
         final keptItems = <String>[];
         final crossingDeleted = <String>[];
@@ -370,16 +355,12 @@ class ArchiveActions {
           final rows = await coordinator.readDiscardLines(date);
           // When all that is left of the day runs past midnight (the rest deleted before, or
           // never there), Delete Day deletes that too: the user asked again, and nothing
-          // else of the day remains to delete. Its raw files still stay, for any audio after
-          // midnight not saved yet.
+          // else of the day remains to delete.
           final onlyCrossing = !convs.values.any((c) => c.$2.endTime.millisecondsSinceEpoch <= dayEnd) &&
               !rows.any((r) => (r['endMs'] as int? ?? 0) <= dayEnd);
-          final deletedAudio = <String>{};
           final keptAudio = <String>{};
           for (final MapEntry(key: stem, value: (audio, conv)) in convs.entries) {
-            final bins = conv.relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>();
             if (conv.endTime.millisecondsSinceEpoch > dayEnd) {
-              protect.addAll(bins);
               if (!onlyCrossing) {
                 keptAny = true;
                 keptItems.add(audio ?? '$stem.meta');
@@ -388,10 +369,8 @@ class ArchiveActions {
               }
               crossingDeleted.add(audio ?? '$stem.meta');
             }
-            candidates.addAll(bins);
             final shown = audio ?? '$stem.meta';
             deletedPaths.add('recordings/$date/$shown');
-            if (audio != null) deletedAudio.add(audio);
             final sidecar =
                 RecordingSidecars.opusFramesPathFor('${folder.path}/${audio ?? '$stem.wav'}').split('/').last;
             for (final n in [audio, '$stem.meta', sidecar]) {
@@ -410,15 +389,7 @@ class ArchiveActions {
           }
           for (final r in rows) {
             final id = r['id'];
-            final keys = <RawFileKey>{
-              if (id is String) ..._Discard(id, date, r).keys,
-              ...((r['binRanges'] as Map?) ?? const {})
-                  .keys
-                  .map((k) => RawFileKey.fromRel(k as String))
-                  .whereType<RawFileKey>(),
-            };
             if ((r['endMs'] as int? ?? 0) > dayEnd) {
-              protect.addAll(keys);
               if (!onlyCrossing) {
                 keptAny = true;
                 keptItems.add('discard $id');
@@ -426,31 +397,22 @@ class ArchiveActions {
               }
               crossingDeleted.add('discard $id');
             }
-            candidates.addAll(keys);
             if (id is String) {
               deletedIds.add(id);
               droppedDiscards.add(_Discard(id, date, r));
             }
           }
         }
-        for (final k in {...await coordinator.store.listKeys(), ...listed}) {
-          if (k.timerStart >= _minValidEpochSeconds && localDateOf(k.timerStart * 1000) == date) candidates.add(k);
-        }
-        final tombstoned = candidates.difference(protect);
         Logger.debug('ArchiveActions: Delete Day $date: ${deletedPaths.length} recording(s), ${deletedIds.length} '
             'discard(s) and ${deletedFiles.where((n) => n.startsWith('marker_')).length} marker(s) go; '
             '${keptItems.isEmpty ? 'nothing crosses midnight' : 'kept across midnight: ${keptItems.join(', ')}'}'
             '${crossingDeleted.isEmpty ? '' : '; all that was left ran past midnight, deleted too: ${crossingDeleted.join(', ')}'}; '
-            'raw files: ${tombstoned.length} tombstoned, ${candidates.intersection(protect).length} kept'
-            '${keep.isEmpty ? '' : ' (${keep.length} held for audio not saved yet)'}');
-        final tombstone = Tombstone(nowMs, 'deleteDay');
+            'raw files left to the gate, none tombstoned');
         return (
           <JournalOp>[
-            for (final e in _byDay(tombstoned).entries) TombstoneOp(e.key, e.value, tombstone),
-            StreamOp(release: tombstoned.toList()),
             // A deleted discard's audio is owned for good, as Delete Discard leaves it: in a
-            // file that stays (it holds audio after midnight) it must not wait for an expiry
-            // its record, gone, will never have.
+            // file that stays (it holds audio not saved yet, or after midnight) it must not
+            // wait for an expiry its record, gone, will never have.
             ..._handOn(droppedDiscards),
             if (!keptAny)
               DeletePathsOp(['recordings/$date'])
@@ -463,39 +425,10 @@ class ArchiveActions {
         );
       });
 
-  /// When the local day [date] (`YYYY-MM-DD`) starts, and when it ends.
-  static int _dayStartMs(String date) {
-    final p = date.split('-').map(int.parse).toList();
-    return DateTime(p[0], p[1], p[2]).millisecondsSinceEpoch;
-  }
-
+  /// When the local day [date] (`YYYY-MM-DD`) ends.
   static int _dayEndMs(String date) {
     final p = date.split('-').map(int.parse).toList();
     return DateTime(p[0], p[1], p[2] + 1).millisecondsSinceEpoch;
-  }
-
-  /// The raw files of the recordings and discards listed under [date] that end after [ms].
-  Future<Set<RawFileKey>> _filesOfItemsEndingAfter(String date, int ms) async {
-    final folder = Directory('$_docs/recordings/$date');
-    final out = <RawFileKey>{};
-    if (!await folder.exists()) return out;
-    await for (final e in folder.list(followLinks: false)) {
-      if (e is! File || !e.path.endsWith('.meta')) continue;
-      final conv = Conversation.fromFile(e);
-      if (conv.endTime.millisecondsSinceEpoch > ms) {
-        out.addAll(conv.relativeBins.map(RawFileKey.fromRel).whereType<RawFileKey>());
-      }
-    }
-    for (final r in await coordinator.readDiscardLines(date)) {
-      if ((r['endMs'] as int? ?? 0) <= ms) continue;
-      final id = r['id'];
-      if (id is String) out.addAll(_Discard(id, date, r).keys);
-      out.addAll(((r['binRanges'] as Map?) ?? const {})
-          .keys
-          .map((k) => RawFileKey.fromRel(k as String))
-          .whereType<RawFileKey>());
-    }
-    return out;
   }
 
   /// Delete, for a raw or set-aside file: tombstoned, and out of the set-aside list.

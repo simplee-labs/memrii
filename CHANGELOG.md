@@ -4,8 +4,9 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## App
 
-### memrii 0.2.9 (build 22)
+### memrii 0.2.9 (build 26)
 
+- **Delete Day deletes only what is already saved.** It deletes the day's recordings, discarded clips and markers, and leaves a conversation still in progress, audio still on the Omi or downloading, and set-aside files alone: they are saved, or stay set aside, as before. Before, it also deleted the day's audio not saved yet, except what the phone had not yet seen on the Omi, which came back later as recordings.
 - **A conversation that ends in silence is saved at the next sync.** When the phone connects, the Omi lists everything it has recorded, so memrii can now tell that a silence has lasted long enough and save the conversation then. Before, it stayed in progress until you spoke again, sometimes for hours. This needs memrii to have been opened once since the Omi last restarted; until then, a conversation waits for the next audio as before.
 - **Delete Day shows that it is working.** The page says it is deleting the day until it is done, and turns away a second Delete Day meanwhile. Before, nothing showed for several seconds when audio had just arrived, and confirming again ran it a second time.
 - **The recordings list keeps updating while a day is deleted.** Before, a folder removed while the list loaded could stop it updating until the next change.

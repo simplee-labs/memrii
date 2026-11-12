@@ -394,120 +394,25 @@ class AppPipeline {
     return result;
   }
 
-  /// Delete Day (§7). Returns the deleted recordings' paths relative to the documents
+  /// Delete Day (§7): what is saved under the day, and nothing still in progress, on the
+  /// Omi or downloading. Returns the deleted recordings' paths relative to the documents
   /// directory (audio, or the meta of a passthrough recording).
   Future<List<String>> deleteDay(String date) async {
     await start();
-    // What is unsaved now, not as the last pass saw it: no pass runs meanwhile, and the
-    // plan is made afresh from everything on the phone.
+    // A pass going now may still save some of the day: wait for it, so that goes with the
+    // rest of what is saved, and start none meanwhile.
     while (_running) {
       await Future<void>.delayed(const Duration(milliseconds: 250));
     }
     _running = true;
-    // A Stop tapped earlier, with no pass since to take it, is not this one's: it would
-    // stop the plan below before it starts.
-    _cancelRequested = false;
     try {
-      final holes = await _holes();
-      final p = date.split('-').map(int.parse).toList();
-      final dayEnd = DateTime(p[0], p[1], p[2] + 1).millisecondsSinceEpoch;
-      final PassReport report;
-      try {
-        report = await _pass(planOnly: true);
-      } finally {
-        if (!_recovering) await _releaseVad();
-      }
-      final known = {...await coordinator.store.listKeys(), ...holes.listed};
-      // Files whose end is not known yet: still on the Omi, or still arriving.
-      final near = [
-        for (final k in known)
-          if (startsNearMidnight(k, dayEnd)) k
-      ];
-      final entries = await coordinator.ledger.entriesFor(near);
-      final unfinished = <RawFileKey>{
-        for (final k in near)
-          if (entries[k]?.receipt == null && !_finished(await coordinator.store.load(k))) k
-      };
-      final keep = keptByDeleteDay(report, dayEnd, known, unfinished);
-      if (keep.isNotEmpty) {
-        Logger.debug('AppPipeline: Delete Day $date keeps ${[for (final k in keep) k.stem]}'
-            '${unfinished.isEmpty ? '' : '; not arrived yet near midnight: ${[for (final k in unfinished) k.stem]}'}');
-      }
-      final deleted =
-          await actions.deleteDay(date, nowMs: DateTime.now().millisecondsSinceEpoch, listed: holes.listed, keep: keep);
+      final deleted = await actions.deleteDay(date);
       await gate.release();
       return deleted;
     } finally {
       _running = false;
     }
   }
-
-  static bool _finished(LogicalRawFile f) => f.chunks.isNotEmpty && f.lifecycle.isTerminal;
-
-  /// What Delete Day keeps of the day ending at [dayEnd], from [report], its plan made
-  /// just before: what [crossingMidnight] keeps, and each [unfinished] file (its end not
-  /// known yet: still on the Omi, or still arriving) that starts close enough to midnight
-  /// to run past it. Better kept, and its minutes before midnight back on the deleted day,
-  /// than its minutes after midnight lost with it. Throws, so that nothing is deleted,
-  /// when the plan was not made (a Stop during it).
-  @visibleForTesting
-  static Set<RawFileKey> keptByDeleteDay(
-      PassReport report, int dayEnd, Set<RawFileKey> known, Set<RawFileKey> unfinished) {
-    if (report.stop != PassStop.done) {
-      throw StateError('Delete Day stopped (${report.stop.name}) before it could see what crosses midnight; '
-          'nothing was deleted');
-    }
-    final mayCross = {
-      for (final k in unfinished)
-        if (startsNearMidnight(k, dayEnd)) k
-    };
-    final plan = report.plan;
-    return {...mayCross, if (plan != null) ...crossingMidnight(plan, dayEnd, known, unresolved: mayCross)};
-  }
-
-  /// The Omi starts a new file every ten minutes, so a file that starts this close to
-  /// [dayEnd] or closer may run past it.
-  static const Duration longestFile = Duration(minutes: 15);
-
-  @visibleForTesting
-  static bool startsNearMidnight(RawFileKey k, int dayEnd) =>
-      k.timerStart >= _minValidEpochSeconds &&
-      k.timerStart * 1000 < dayEnd &&
-      k.timerStart * 1000 >= dayEnd - longestFile.inMilliseconds;
-
-  /// The files of what is not saved yet and crosses the midnight at [dayEnd], or may: a
-  /// closed item that runs past it, and a conversation still open that started before it
-  /// and either runs past it already or whose session has a file from midnight on or one
-  /// of [unresolved] (its end is unresolved). Delete Day keeps them, so that audio after
-  /// midnight is never lost with the day.
-  @visibleForTesting
-  static Set<RawFileKey> crossingMidnight(Plan plan, int dayEnd, Set<RawFileKey> known,
-      {Set<RawFileKey> unresolved = const {}}) {
-    final keep = <RawFileKey>{};
-    for (final item in plan.items) {
-      final (int start, int end) = switch (item) {
-        final PlannedRecording r => (r.startMs, r.startMs + r.durationMs),
-        final PlannedDiscard d => (d.startMs, d.endMs),
-        PlannedOrphans() => (0, 0),
-      };
-      if (start < dayEnd && end > dayEnd) keep.addAll(item.spans.map((s) => s.key));
-    }
-    for (final o in plan.open) {
-      final first = o.firstKey;
-      final start = o.startMs;
-      if (first == null || start == null || start >= dayEnd) continue;
-      final session = [
-        for (final k in known)
-          if (k.sessionId == first.sessionId && compareKeys(k, first) >= 0) k
-      ];
-      final open = session.any(
-          (k) => (k.timerStart >= _minValidEpochSeconds && k.timerStart * 1000 >= dayEnd) || unresolved.contains(k));
-      if (start + o.durationMs > dayEnd || open) keep.addAll(session);
-    }
-    return keep;
-  }
-
-  static const int _minValidEpochSeconds = 946684800;
 
   /// Save original file: [key]'s chunks, in order, into [out].
   Future<void> exportRaw(RawFileKey key, File out) async {

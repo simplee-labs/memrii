@@ -554,9 +554,10 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
     }
   }
 
-  /// "Delete Day" is a whole-day action: it removes everything for the date —
-  /// recordings of any length, priority recordings, markers and discards
-  /// (ghosts) — regardless of the active filter tab or the hide-ghosts toggle.
+  /// "Delete Day" removes everything saved for the date — recordings of any length,
+  /// priority recordings, markers and discards (ghosts) — regardless of the active
+  /// filter tab or the hide-ghosts toggle. A conversation still in progress and audio
+  /// not synced or processed yet are left alone (see [AppPipeline.deleteDay]).
   /// (Partial deletes go through multi-select or the "Delete Discards" action.)
   Future<void> _deleteDayConversations(Batch batch) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -572,15 +573,15 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
         () => Navigator.of(c).pop(false),
         () => Navigator.of(c).pop(true),
         'Delete Day',
-        'This will permanently delete everything for ${batch.dateString} — recordings, priority recordings, '
-            'markers and discards. This cannot be undone.',
+        'This will permanently delete everything saved for ${batch.dateString} — recordings, priority recordings, '
+            'markers and discards. A conversation still in progress and audio not synced yet are kept. '
+            'This cannot be undone.',
         confirmText: 'Delete',
       ),
     );
     if (confirm != true) return;
-    // Shown until it is done: it first works out what crosses midnight, which takes a
-    // while when audio has just arrived. It also waits for a run going now, which could
-    // otherwise turn the day's waiting audio back into recordings as it goes. A spinner,
+    // Shown until it is done: it waits for a run going now, so what that run saves of
+    // the day is deleted with the rest. A spinner,
     // not a trailing ellipsis, says it is still going: "…" read as text cut short.
     messenger.hideCurrentSnackBar();
     messenger.showSnackBar(SnackBar(
@@ -608,7 +609,7 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
       final left = _controller.batches.where((b) => b.dateString == batch.dateString).firstOrNull;
       if (mounted && left != null && (left.finalizedRecordings.isNotEmpty || left.discards.isNotEmpty)) {
         messenger.showSnackBar(const SnackBar(
-          content: Text('Kept what runs past midnight. Delete Day again to delete it too.'),
+          content: Text('Recordings past midnight need another Delete Day'),
         ));
       }
     } catch (e) {

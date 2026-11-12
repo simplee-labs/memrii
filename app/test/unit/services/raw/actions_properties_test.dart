@@ -264,7 +264,7 @@ class _Run {
           3,
           () async {
             final date = g.pick(dates);
-            await step('delete day', (_) => ArchiveActions(c).deleteDay(date, nowMs: now), crash: crash);
+            await step('delete day', (_) => ArchiveActions(c).deleteDay(date), crash: crash);
           }
         ),
       if (arrived.isNotEmpty)
