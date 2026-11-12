@@ -580,12 +580,21 @@ class _RecordingsPageState extends State<RecordingsPage> with SingleTickerProvid
     if (confirm != true) return;
     // Shown until it is done: it first works out what crosses midnight, which takes a
     // while when audio has just arrived. It also waits for a run going now, which could
-    // otherwise turn the day's waiting audio back into recordings as it goes.
+    // otherwise turn the day's waiting audio back into recordings as it goes. A spinner,
+    // not a trailing ellipsis, says it is still going: "…" read as text cut short.
     messenger.hideCurrentSnackBar();
     messenger.showSnackBar(SnackBar(
-      content: Text(RecordingsManager.isProcessingAny
-          ? 'Deleting ${batch.dateString} after processing finishes…'
-          : 'Deleting ${batch.dateString}…'),
+      content: Row(
+        children: [
+          const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(RecordingsManager.isProcessingAny
+                ? 'Deleting ${batch.dateString} once processing finishes'
+                : 'Deleting ${batch.dateString}'),
+          ),
+        ],
+      ),
       duration: const Duration(minutes: 10),
     ));
     try {

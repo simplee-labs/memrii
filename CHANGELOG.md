@@ -4,7 +4,7 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## App
 
-### memrii 0.2.9 (build 21)
+### memrii 0.2.9 (build 22)
 
 - **A conversation that ends in silence is saved at the next sync.** When the phone connects, the Omi lists everything it has recorded, so memrii can now tell that a silence has lasted long enough and save the conversation then. Before, it stayed in progress until you spoke again, sometimes for hours. This needs memrii to have been opened once since the Omi last restarted; until then, a conversation waits for the next audio as before.
 - **Delete Day shows that it is working.** The page says it is deleting the day until it is done, and turns away a second Delete Day meanwhile. Before, nothing showed for several seconds when audio had just arrived, and confirming again ran it a second time.
