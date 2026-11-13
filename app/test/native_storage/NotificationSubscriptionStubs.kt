@@ -11,7 +11,10 @@ object android {
         }
     }
 }
-object BluetoothStatusCodes { const val SUCCESS = 0 }
+object BluetoothStatusCodes {
+    const val SUCCESS = 0
+    const val ERROR_UNKNOWN = Int.MAX_VALUE
+}
 class FlutterError(val code: String, override val message: String?, val details: Any?) : Throwable()
 object Log {
     fun i(tag: String, message: String) {}
@@ -26,7 +29,12 @@ object BluetoothDevice {
 class Device(val address: String) { var bondState = BluetoothDevice.BOND_NONE }
 class Service(val uuid: UUID)
 class BluetoothGattCharacteristic(val service: Service, val uuid: UUID) {
-    companion object { const val WRITE_TYPE_NO_RESPONSE = 1 }
+    companion object {
+        const val WRITE_TYPE_NO_RESPONSE = 1
+        const val WRITE_TYPE_DEFAULT = 2
+        const val PROPERTY_WRITE_NO_RESPONSE = 4
+    }
+    var properties = 0
     var descriptor: BluetoothGattDescriptor? = BluetoothGattDescriptor(this)
     var value: ByteArray = byteArrayOf()
     var writeType = 0
@@ -74,6 +82,8 @@ class BluetoothGatt(val device: Device) {
     }
     fun writeCharacteristic(characteristic: BluetoothGattCharacteristic): Boolean =
         writeCharacteristic(characteristic, characteristic.value, characteristic.writeType) == 0
+    val reads = mutableListOf<UUID>()
+    fun readCharacteristic(characteristic: BluetoothGattCharacteristic): Boolean { reads.add(characteristic.uuid); return true }
     fun getService(uuid: UUID): ServiceView? = if (characteristic.service.uuid == uuid) ServiceView(this) else null
 }
 class TestHandler {
@@ -108,7 +118,7 @@ class OmiBleManager {
     val connectionListener: ConnectionListener? = ConnectionListener()
     val servicesDiscoveredFor = mutableSetOf<String>()
     val discoveryTimeouts = mutableMapOf<String, Runnable>()
-    val readCompletions = ConcurrentHashMap<String, (Result<Unit>) -> Unit>()
+    val readCompletions = ConcurrentHashMap<String, (Result<ByteArray>) -> Unit>()
     val writeCompletions = ConcurrentHashMap<String, (Result<Unit>) -> Unit>()
     val activeDownloads = ConcurrentHashMap<String, Download>()
     var completedCommands = 0
@@ -127,6 +137,8 @@ class OmiBleManager {
         cleanupPeripheral(address)
         gatt?.close()
     }
+    // PRODUCTION_INFLIGHT
+    // PRODUCTION_OPERATIONS
     // PRODUCTION_QUEUE
     // PRODUCTION_SUBSCRIPTIONS
     // PRODUCTION_WRITE_HELPER

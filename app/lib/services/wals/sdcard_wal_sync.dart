@@ -598,7 +598,9 @@ class SDCardWalSyncImpl implements SDCardWalSync {
   /// `allDeleted` is false while any of them is still on the device: the card is not
   /// drained, so the cycle is partial. `uncertain` is true when a delete failed: one whose
   /// reply was lost may still have taken, which moves every later file down a place, so
-  /// the indices no longer say where the files are. The caller lists again.
+  /// the indices no longer say where the files are. No further delete is sent then —
+  /// on firmware that deletes by index alone, the next would land on the file after the
+  /// one meant, which may not have downloaded — and the caller lists again.
   Future<({bool allDeleted, bool uncertain})> _retryPendingDeletesLocked(
       DeviceConnection connection, String deviceId, List<int> deletedListIndices) async {
     final pending = _wals.where((w) => w.storage == WalStorage.sdcard && w.status == WalStatus.synced).toList()
@@ -625,9 +627,11 @@ class SDCardWalSyncImpl implements SDCardWalSync {
         // next storage command, matching the download loop's post-delete pause.
         await Future.delayed(const Duration(milliseconds: 200));
       } catch (e) {
-        Logger.error('SDCardWalSync: delete retry still failing for ts=${wal.timerStart}: $e');
+        Logger.error('SDCardWalSync: delete retry still failing for ts=${wal.timerStart}: $e — no more deletes '
+            'until the files are listed again');
         allDeleted = false;
         uncertain = true;
+        break;
       }
     }
     if (anyDeleted) {
@@ -1372,8 +1376,14 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       // Do not let a failed STOP replace the typed integrity error, which is what
       // the caller classifies this read by. No new read starts this cycle after it,
       // though: the device may still be sending the old file.
+      // A STOP that was refused, timed out or never sent reports false rather than
+      // throwing (DeviceConnection.stopStorageSync); after a gap either one means the
+      // device may still be sending the old file.
       try {
-        await connection.stopStorageSync();
+        if (!await connection.stopStorageSync() && integrityFailed) {
+          _stopFailedAfterIntegrityGap = true;
+          Logger.warning('SDCardWalSync: STOP after an integrity gap was not confirmed');
+        }
       } catch (e) {
         if (!integrityFailed) rethrow;
         _stopFailedAfterIntegrityGap = true;
@@ -1962,6 +1972,14 @@ class SDCardWalSyncImpl implements SDCardWalSync {
       return w.status == WalStatus.miss && w.storage == WalStorage.sdcard;
     }).toList();
 
+    // The listing is the device's own word on what it still holds, so it is saved before
+    // anything else can end this cycle. Unsaved, a file that had left the device since
+    // (cleared, or overwritten while stuck) stayed in wals.json as still waiting whenever
+    // the cycle read nothing — an empty card, or a disconnect before the first read — and
+    // heldBackBinRelPaths, which reads it, kept holding the newer audio of that boot back,
+    // with no failures to give up on, until a later sync saved the list.
+    await WalFileManager.saveWals(_wals, deviceId: deviceId).catchError((_) => Future.value(false));
+
     // Non-null: the device WAS asked (CMD_LIST_FILES went out above) and holds
     // nothing syncable. That is a completed sync, and it must not be reported as
     // a skip — null is reserved for "the sync never ran", which is what the
@@ -1997,11 +2015,19 @@ class SDCardWalSyncImpl implements SDCardWalSync {
     int failuresInARow = 0;
     for (int i = 0; i < wals.length; i++) {
       final wal = wals[i];
-      if (_isCancelled) break;
+      // Stopping with files still to read leaves them on the device: partial, never
+      // Complete. A disconnect in the moment after the listing used to report a sync that
+      // had read nothing as complete — and a Force Sync then closed the conversation that
+      // the rest of the audio still belonged to.
+      if (_isCancelled) {
+        anyPartial = true;
+        break;
+      }
 
       // Abort if device disconnected between files
       if (!await connection.isConnected()) {
         Logger.debug('SDCardWalSync: Connection lost during syncAll, aborting loop');
+        anyPartial = true;
         break;
       }
 

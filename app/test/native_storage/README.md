@@ -64,15 +64,18 @@ python app/test/native_storage/run.py --notifications --java <path-to-java>
 ```
 
 It extracts production subscription setup and unsubscribe, the storage keep-alive,
-disconnect cleanup, and the descriptor and characteristic-write callbacks.
-Thirty cases exercise descriptor confirmation, missing resources,
+disconnect cleanup, the characteristic read/write entry points with their per-operation
+completion keys, and the descriptor and characteristic-write callbacks.
+Thirty-two cases exercise descriptor confirmation, missing resources,
 registration/write rejection, callback failure, cleanup, retry, stale GATT and
 preceding-operation callbacks, unsubscribe ordering, both Android descriptor API
 paths, the marker on a failure native caused by its own teardown, the watchdog
 waiting out a pairing prompt (bounded, and still failing a declined one), and the queued
 keep-alive: it waits behind an operation in flight, only its own callback retires
 it, one beat waits at a time, a teardown that discards it does not silence the next
-link, and it stands down for a transfer that started while it waited. Android
+link, and it stands down for a transfer that started while it waited. Two writes
+queued on one characteristic are each answered by their own callback, and a stray
+callback answers no write that has not been sent. Android
 objects and handler scheduling are simulated; the test does not exercise a radio.
 
 ## Extraction guards

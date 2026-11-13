@@ -3,7 +3,7 @@ description: "memrii — own your conversations. Local-first capture app."
 
 publish_to: "none" # Remove this line if you wish to publish to pub.dev
 
-version: 0.2.9+27
+version: 0.2.9+28
 
 
 environment:

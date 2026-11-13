@@ -54,6 +54,8 @@ def replace_seam(template, marker, source):
 
 def notification_source(source, template):
     sections = {
+        "INFLIGHT": section(source, "    private val operationSequence", "    private val servicesDiscoveredFor", "In-flight key"),
+        "OPERATIONS": section(source, "    fun readCharacteristic(address", "    private class PendingSubscription", "Read/write"),
         "SUBSCRIPTIONS": section(source, "    private class PendingSubscription", "    fun startRssiKeepAlive", "Subscription"),
         "WRITE_HELPER": section(source, '    @Suppress("DEPRECATION")\n    private fun writeDescriptorCompat', "    private fun failPendingSubscriptions", "Descriptor write"),
         "CLEANUP": section(source, "    private fun failPendingSubscriptions", "    private fun createGattCallback", "Cleanup"),

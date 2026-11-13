@@ -160,18 +160,27 @@ class MockDeviceConnection implements DeviceConnection {
   @override
   Future<void> unsubscribeDropStats() async {}
 
+  /// Older firmware: CMD_DELETE_FILE removes whatever is at the index it names, and the
+  /// listing closes up behind it. Off (the default), the timestamp decides, as on
+  /// current firmware, and only a lost reply changes the listing.
+  bool deletesByIndexOnly = false;
+
   @override
   Future<bool> deleteFile(StorageFile file, {int? timestamp}) async {
-    globalDeletedTimestamps.add(file.timestamp);
-    if (globalLostDeleteReplyTimestamps.contains(file.timestamp)) {
-      final kept = files.where((f) => f.timestamp != file.timestamp).toList();
+    final target = deletesByIndexOnly ? (file.index < files.length ? files[file.index] : null) : file;
+    if (target == null) return false;
+    globalDeletedTimestamps.add(target.timestamp);
+    final lost = globalLostDeleteReplyTimestamps.contains(target.timestamp);
+    final rejected = globalRejectDeleteTimestamps.contains(target.timestamp);
+    if (lost || (deletesByIndexOnly && !rejected)) {
+      final kept = files.where((f) => f.timestamp != target.timestamp).toList();
       files = [
         for (var i = 0; i < kept.length; i++)
           StorageFile(index: i, timestamp: kept[i].timestamp, size: kept[i].size, sessionId: kept[i].sessionId),
       ];
-      return false;
     }
-    return !globalRejectDeleteTimestamps.contains(file.timestamp);
+    if (lost) return false;
+    return !rejected;
   }
 
   List<StorageFile> files = [];
@@ -193,6 +202,10 @@ class MockDeviceConnection implements DeviceConnection {
   @override
   bool lastListingHeardDevice = false;
 
+  /// Runs once a listing has been answered, before syncAll goes on: to drop the link in
+  /// the moment between the listing and the first read, say.
+  void Function()? onListed;
+
   @override
   int link = 1;
 
@@ -208,7 +221,9 @@ class MockDeviceConnection implements DeviceConnection {
     if (!await isConnected()) return null;
     if (relinkWhileListing) link++;
     lastListingHeardDevice = !listFilesUnanswered || listFilesRefused;
-    return listFilesUnanswered ? null : (files: files, complete: !listFilesTruncated);
+    final answer = listFilesUnanswered ? null : (files: files, complete: !listFilesTruncated);
+    onListed?.call();
+    return answer;
   }
 
   @override
@@ -1195,21 +1210,25 @@ void main() {
       expect(globalDeletedTimestamps, isEmpty);
     });
 
-    test('a failed STOP after an integrity gap ends the cycle, and still deletes nothing', () async {
-      await seed(wal(offset: 4, version: 1, strikes: 4), original.sublist(0, 4));
-      connection.files.add(StorageFile(index: 1, timestamp: ts + 60, size: 12));
-      receiver = (_) async => gap(4, 8);
-      connection.onStop = () async => throw StateError('STOP failed');
-      await run(true);
-      // The file without earlier failures goes first, and is the only one read: the device
-      // may still be sending it when its STOP did not take.
-      expect(requests, hasLength(1));
-      final saved = await WalFileManager.loadWals();
-      expect(saved.firstWhere((w) => w.timerStart == ts + 60).syncFailCount, 0,
-          reason: 'the attempt is judged by the gap, not the STOP, and a first gap is the link\'s');
-      expect(saved.firstWhere((w) => w.timerStart == ts).syncFailCount, 4, reason: 'not tried this cycle');
-      expect(globalDeletedTimestamps, isEmpty);
-    });
+    // The real STOP reports a refusal, a timeout or a failed write as false; a throw is
+    // the rarer case. Either way the device may still be sending the old file.
+    for (final answer in ['false', 'a throw']) {
+      test('a failed STOP after an integrity gap ends the cycle, and still deletes nothing ($answer)', () async {
+        await seed(wal(offset: 4, version: 1, strikes: 4), original.sublist(0, 4));
+        connection.files.add(StorageFile(index: 1, timestamp: ts + 60, size: 12));
+        receiver = (_) async => gap(4, 8);
+        connection.onStop = answer == 'false' ? () async => false : () async => throw StateError('STOP failed');
+        await run(true);
+        // The file without earlier failures goes first, and is the only one read: the device
+        // may still be sending it when its STOP did not take.
+        expect(requests, hasLength(1));
+        final saved = await WalFileManager.loadWals();
+        expect(saved.firstWhere((w) => w.timerStart == ts + 60).syncFailCount, 0,
+            reason: 'the attempt is judged by the gap, not the STOP, and a first gap is the link\'s');
+        expect(saved.firstWhere((w) => w.timerStart == ts).syncFailCount, 4, reason: 'not tried this cycle');
+        expect(globalDeletedTimestamps, isEmpty);
+      });
+    }
 
     test('disconnect during failure cleanup keeps prefix for reconnect', () async {
       receiver = (args) async {
@@ -1827,6 +1846,60 @@ void main() {
       expect(secondResp!.isPartial, isFalse, reason: 'the second listing shows the card drained');
     }, timeout: const Timeout(Duration(seconds: 30)));
 
+    // On firmware that deletes by index alone, a retried delete that took but lost its
+    // reply moved every later file down a place, and the next retry, sent at the old
+    // index, removed a file that had never downloaded.
+    test('after a retried delete fails, nothing more is deleted until the files are listed again', () async {
+      final tsA = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 3200;
+      final tsB = tsA + 300;
+      final tsC = tsB + 300;
+      globalRejectDeleteTimestamps = {};
+      globalLostDeleteReplyTimestamps = {tsA};
+      globalDeletedTimestamps = [];
+      mockConn.deletesByIndexOnly = true;
+      mockConn.files = [
+        StorageFile(index: 0, timestamp: tsA, size: 10),
+        StorageFile(index: 1, timestamp: tsB, size: 10),
+        StorageFile(index: 2, timestamp: tsC, size: 10),
+      ];
+      Wal received(int ts, int index) => Wal(
+            device: 'test',
+            fileNum: index,
+            walOffset: 10,
+            storageTotalBytes: 10,
+            timerStart: ts,
+            storage: WalStorage.sdcard,
+            status: WalStatus.synced,
+          );
+      // A and B arrived in full on an earlier sync, but their deletes did not take.
+      await WalFileManager.saveWals([received(tsA, 0), received(tsB, 1)], deviceId: 'test');
+      final fresh = SDCardWalSyncImpl(
+        MockWalSyncListener(),
+        connectionProvider: (_) async => mockConn,
+        inactivityTimeout: const Duration(seconds: 1),
+      );
+      await fresh.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
+      await pump(10);
+
+      final run = fresh.syncAll();
+      await mockConn.waitForWrite(1);
+      await pump(10);
+      expect(globalCurrentFileNum, 1, reason: 'A is gone and B is still listed, so C is second');
+      expect(globalDeletedTimestamps, [tsA], reason: 'B was not retried at an index that now names C');
+      mockConn.add(ackPacket(0x00));
+      await pump();
+      mockConn.add(dataPacket(0, List<int>.filled(10, 0xC0)));
+      await pump();
+      mockConn.add(eotPacket());
+      await pump(10);
+      await run;
+      globalLostDeleteReplyTimestamps = {};
+
+      expect(File('${tempDir.path}/raw_segments/$tsC/${tsC}_0.bin').readAsBytesSync(), List<int>.filled(10, 0xC0));
+      expect(globalDeletedTimestamps, [tsA, tsC], reason: 'C only once it had arrived');
+      expect(mockConn.files.map((f) => f.timestamp), [tsB], reason: 'B waits for the next sync');
+    }, timeout: const Timeout(Duration(seconds: 30)));
+
     test('deleting one pre-time-sync bin keeps its id-colliding sibling tracked', () async {
       // Wal.id is `$device-$timerStart`, and pre-time-sync segments key timerStart on
       // UPTIME seconds, which restart at 0 each boot — so two bins recorded before the
@@ -2290,6 +2363,51 @@ void main() {
               'and callers key their "Skipped" state and lastSyncCompletedMs stamp off null');
       expect(result!.newConversationIds, isEmpty);
       expect(result.isPartial, isFalse);
+    });
+
+    // A disconnect in the moment between the listing and the first read ended the loop
+    // without marking it partial: the notification said Complete with nothing read, and a
+    // Force Sync closed the conversation whose rest was still on the Omi.
+    test('a disconnect before the first read is partial, never complete', () async {
+      await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
+      final ts = (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 3600;
+      mockConn.files = [StorageFile(index: 0, timestamp: ts, size: 100)];
+      mockConn.onListed = () => mockConn.connected = false;
+
+      final result = await sync.syncAll();
+
+      expect(result, isNotNull, reason: 'the device was asked, and answered');
+      expect(result!.isPartial, isTrue, reason: 'the listed file never reached the phone');
+      expect(globalDeletedTimestamps, isEmpty);
+    });
+
+    // The listing is the device's word on what it holds. Not saved when the card turned
+    // out empty, a file that had left it (cleared, or overwritten while stuck) stayed in
+    // wals.json as waiting, and the newer audio of its boot stayed held behind it.
+    test('an empty card lets go of the newer audio held behind a file that has left it', () async {
+      const ts = 1789100000;
+      await WalFileManager.saveWals([
+        Wal(
+          device: 'test',
+          fileNum: 0,
+          walOffset: 0,
+          storageTotalBytes: 100,
+          timerStart: ts,
+          sessionId: 7,
+          storage: WalStorage.sdcard,
+        ),
+      ], deviceId: 'test');
+      File('${tempDir.path}/raw_segments/${ts + 600}/${ts + 600}_7.bin')
+        ..createSync(recursive: true)
+        ..writeAsBytesSync(List<int>.filled(40, 0));
+      await sync.setDevice(BtDevice(id: 'test', name: 'test', type: DeviceType.omi, rssi: -50));
+      expect(await sync.heldBackBinRelPaths(), isNotEmpty, reason: 'the older file is still thought to be waiting');
+      mockConn.files = [];
+
+      final result = await sync.syncAll();
+
+      expect(result!.isPartial, isFalse);
+      expect(await sync.heldBackBinRelPaths(), isEmpty);
     });
 
     test('no registered device returns null — this is the 4.7s connect-setup window', () async {

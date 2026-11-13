@@ -20,6 +20,8 @@ class ExtractionTest(unittest.TestCase):
         result = notification_source(source, template)
         self.assertIn("fun subscribeCharacteristic", result)
         self.assertIn("fun processNextCommand", result)
+        self.assertIn("fun writeCharacteristic", result)
+        self.assertIn("fun <T> answerInFlight", result)
         self.assertNotIn("// PRODUCTION_", result)
 
     def test_missing_duplicate_and_reversed_boundaries_fail(self):

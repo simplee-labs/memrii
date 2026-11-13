@@ -174,6 +174,36 @@ fun main() {
         var next = false
         f.manager.enqueueCommand("next") { next = true }; f.manager.issue(); check(next)
     }
+    // Two writes queued on one characteristic: answered by characteristic alone, the first
+    // callback went to whichever completion was registered last, so the first caller waited
+    // out its timeout although its write had gone through.
+    case("each queued write on a characteristic is answered by its own callback") {
+        val f = Fixture()
+        var first: Result<Unit>? = null
+        var second: Result<Unit>? = null
+        f.manager.writeCharacteristic(ADDRESS, SERVICE, CHAR, byteArrayOf(1)) { first = it }
+        f.manager.writeCharacteristic(ADDRESS, SERVICE, CHAR, byteArrayOf(2)) { second = it }
+        f.manager.issue()
+        check(f.gatt.characteristicWrites == listOf(listOf<Byte>(1)))
+        f.manager.onCharacteristicWrite(f.gatt, f.gatt.characteristic, 0)
+        check(first?.isSuccess == true) { "the first write's callback did not answer it" }
+        check(second == null) { "the first write's callback answered the second caller" }
+        f.manager.issue()
+        check(f.gatt.characteristicWrites == listOf(listOf<Byte>(1), listOf<Byte>(2)))
+        f.manager.onCharacteristicWrite(f.gatt, f.gatt.characteristic, 0)
+        check(second?.isSuccess == true)
+    }
+    case("a write callback with nothing in flight answers no waiting write") {
+        val f = Fixture()
+        var answered = false
+        f.manager.writeCharacteristic(ADDRESS, SERVICE, CHAR, byteArrayOf(1)) { answered = true }
+        // A stray callback (a late one from a torn-down operation) before the write is sent.
+        f.manager.onCharacteristicWrite(f.gatt, f.gatt.characteristic, 0)
+        check(!answered) { "a write was reported done before it was sent" }
+        f.manager.issue()
+        f.manager.onCharacteristicWrite(f.gatt, f.gatt.characteristic, 0)
+        check(answered)
+    }
     case("only one keep-alive waits in the queue") {
         val f = Fixture()
         f.subscribe(); f.manager.issue()

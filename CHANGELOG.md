@@ -4,8 +4,12 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## App
 
-### memrii 0.2.9 (build 27)
+### memrii 0.2.9 (build 28)
 
+- **Sync sends no more deletes after one fails.** If removing a downloaded recording from the Omi still fails when sync tries it again, sync now sends no further deletes and lists the Omi's recordings again before reading any. Before, the next delete could land on the recording after the one meant.
+- **A sync cut off before it read anything is no longer reported as complete.** A disconnect just after the Omi listed its recordings now counts as a partial sync. Before, a Force Sync then could close a conversation whose remaining audio was still on the Omi.
+- **A recording that has left the Omi stops holding newer audio back.** The Omi's list is now saved as soon as it arrives, so a recording it no longer holds is not waited for when that sync reads nothing.
+- **A damaged transfer the Omi does not confirm stopping ends that sync's reads.** Before, only an error from the stop did; a stop that was refused or timed out let the next read start while the Omi might still be sending the old recording.
 - **Delete Day deletes only what is already saved.** It deletes the day's recordings, discarded clips and markers, and leaves a conversation still in progress, audio still on the Omi or downloading, and set-aside files alone: they are saved, or stay set aside, as before. Before, it also deleted the day's audio not saved yet, except what the phone had not yet seen on the Omi, which came back later as recordings.
 - **A conversation that ends in silence is saved at the next sync.** When the phone connects, the Omi lists everything it has recorded, so memrii can now tell that a silence has lasted long enough and save the conversation then. Before, it stayed in progress until you spoke again, sometimes for hours. This needs memrii to have been opened once since the Omi last restarted; until then, a conversation waits for the next audio as before.
 - **Delete Day shows that it is working.** The page says it is deleting the day until it is done, and turns away a second Delete Day meanwhile. Before, nothing showed for several seconds when audio had just arrived, and confirming again ran it a second time.
