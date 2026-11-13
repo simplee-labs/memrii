@@ -4,8 +4,10 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ## App
 
-### memrii 0.2.9 (build 28)
+### memrii 0.2.9 (build 31)
 
+- **Debug Tools: the Omi's event log is pulled once the page is open and the Omi is ready.** The page waits until the Omi is connected, capture is on and no sync or firmware update is running, then pulls. Events already shown stay when the Omi holds no new ones.
+- **Debug Tools: the Omi's event log is pulled after every sync.** The pull on connect is skipped when a sync starts straight away, which is every background sync, so events could sit on the Omi until its small log overflowed. The capture switch is sent again then too.
 - **Sync sends no more deletes after one fails.** If removing a downloaded recording from the Omi still fails when sync tries it again, sync now sends no further deletes and lists the Omi's recordings again before reading any. Before, the next delete could land on the recording after the one meant.
 - **A sync cut off before it read anything is no longer reported as complete.** A disconnect just after the Omi listed its recordings now counts as a partial sync. Before, a Force Sync then could close a conversation whose remaining audio was still on the Omi.
 - **A recording that has left the Omi stops holding newer audio back.** The Omi's list is now saved as soon as it arrives, so a recording it no longer holds is not waited for when that sync reads nothing.

@@ -139,6 +139,7 @@ class _SyncPageState extends State<SyncPage> implements IWalSyncProgressListener
     _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       final processing = RecordingsManager.isProcessingAny;
       if (processing != _isProcessing) setState(() => _isProcessing = processing);
+      _pullDiagLogWhenReady();
     });
     // Diagnostics poll only runs when the user opts in via the Diagnostics switch
     // (which also gates the on-device event log — see _setDiagnosticsEnabled). Logs
@@ -147,10 +148,42 @@ class _SyncPageState extends State<SyncPage> implements IWalSyncProgressListener
     if (SharedPreferencesUtil().devLogsToFileEnabled) _startLogPolling();
     // Refresh the Adjustment Mode bin count whenever the Debug menu is opened.
     unawaited(_refreshAdjustmentBinCount());
+    // The Events list is brought up to date by _pullDiagLogWhenReady, from the poll above.
     // Nothing to kick off here: _wals is populated by setDevice() when the device
     // connected, and syncAll() refreshes it internally if empty. (This used to warn
     // against calling IWalSync.start(), whose .then() raced syncAll() for _wals —
     // that method is gone now, deleted for exactly that reason.)
+  }
+
+  /// Opening Debug Tools owes the Events list one pull. It waits, on the page's poll,
+  /// until the Omi is connected, known to keep an event log, capturing, and not in a
+  /// sync or a firmware update; then pulls once. A pull the Omi does not answer is
+  /// tried again after [_diagOpenPullRetryTicks] polls.
+  bool _diagOpenPullOwed = true;
+  bool _diagOpenPullRunning = false;
+  int _diagOpenPullWaitTicks = 0;
+  static const int _diagOpenPullRetryTicks = 10; // 5 s at the 500 ms poll
+
+  void _pullDiagLogWhenReady() {
+    if (!_diagOpenPullOwed || _diagOpenPullRunning || _diagLogBusy || !mounted) return;
+    if (_diagOpenPullWaitTicks > 0) {
+      _diagOpenPullWaitTicks--;
+      return;
+    }
+    final devProvider = Provider.of<DeviceProvider>(context, listen: false);
+    if (!devProvider.isConnected || !devProvider.diagLogSupported || devProvider.isFirmwareUpdateInProgress) return;
+    if (!SharedPreferencesUtil().diagLogEnabled) return;
+    if (ServiceManager.instance().wal.getSyncs().isSyncing) return;
+    _diagOpenPullRunning = true;
+    unawaited(
+      devProvider.refreshDiagLog(why: 'on opening Debug Tools').then((pulled) {
+        if (pulled) {
+          _diagOpenPullOwed = false;
+        } else {
+          _diagOpenPullWaitTicks = _diagOpenPullRetryTicks;
+        }
+      }).whenComplete(() => _diagOpenPullRunning = false),
+    );
   }
 
   void _startDropPolling() {

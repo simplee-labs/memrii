@@ -838,7 +838,10 @@ class DeviceProvider extends ChangeNotifier
   /// device clears what it sent, log every record to the debug log, and cache the
   /// batch for the Debug Tools viewer. Returns the record count, or -1 when not
   /// connected / the feature is unavailable / a sync holds the storage lock.
-  Future<int> pullDiagLog() async {
+  ///
+  /// [keepShownWhenEmpty] is for the pull after a sync: an empty ring then leaves the
+  /// viewer's list as it is, so it does not blank what the connect's pull just showed.
+  Future<int> pullDiagLog({bool keepShownWhenEmpty = false}) async {
     final dev = connectedDevice;
     if (dev == null) return -1;
     final connection = await ServiceManager.instance().device.ensureConnection(dev.id);
@@ -847,8 +850,10 @@ class DeviceProvider extends ChangeNotifier
     // while the toggle is OFF must not re-enable on-device logging via the ack write.
     final result = await connection.drainDiagLog(keepEnabled: SharedPreferencesUtil().diagLogEnabled);
     if (result == null) return -1;
-    diagLogRecords = result.records;
-    diagLogDroppedCount = result.droppedCount;
+    if (!keepShownWhenEmpty || result.records.isNotEmpty || result.droppedCount > 0) {
+      diagLogRecords = result.records;
+      diagLogDroppedCount = result.droppedCount;
+    }
     diagLogLastPulledAt = DateTime.now();
     // The ack write carries the gate byte, so a drain that acked anything is also a
     // confirmed push. Only then: performDrainDiagLog() breaks out of its loop BEFORE
@@ -2120,6 +2125,27 @@ class DeviceProvider extends ChangeNotifier
     // body, so cancelling/recreating the timer here can't re-enter it.
     if (_disposed) return;
     _startBackgroundSyncTimer();
+    // The WAL layer calls this just before it releases the storage lock, so the pull
+    // runs on a later turn, with the lock free.
+    unawaited(Future(() => refreshDiagLog(why: 'after the sync')));
+  }
+
+  /// The connect's gate push and pull are skipped when a sync already holds the
+  /// storage lock, which is every scheduled and resumed sync. Do both again once the
+  /// sync is over, while the link is still up, and when Debug Tools opens. True when
+  /// the Omi answered the pull.
+  Future<bool> refreshDiagLog({required String why}) async {
+    if (_disposed || !isConnected || !diagLogSupported || isFirmwareUpdateInProgress) return false;
+    try {
+      if (diagLogGateOnDevice == null) await pushDiagLogEnabled();
+      if (!SharedPreferencesUtil().diagLogEnabled) return false;
+      final pulled = await pullDiagLog(keepShownWhenEmpty: true);
+      if (pulled < 0) Logger.debug('Diag-log: the pull $why was skipped (link busy or gone)');
+      return pulled >= 0;
+    } catch (e) {
+      Logger.debug('Diag-log: the pull $why failed: $e');
+      return false;
+    }
   }
 
   @override
