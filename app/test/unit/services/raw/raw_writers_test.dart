@@ -23,7 +23,7 @@ Map<String, List<String>> _sources() => {
 void main() {
   final sources = _sources();
 
-  test('only sealing and the old pipeline write or delete under the raw roots', () {
+  test('only sealing, the pipeline and the debug tools write or delete under the raw roots', () {
     final writers = {
       for (final MapEntry(key: path, value: lines) in sources.entries)
         if (lines.any(_rawRoot.hasMatch) && lines.any(_mutation.hasMatch)) path
@@ -33,12 +33,10 @@ void main() {
       'lib/services/raw/actions.dart', // Delete Phone Segments; Save original file writes elsewhere
       'lib/services/raw/legacy_update.dart', // the update: discarded_segments back to raw_segments, once
       'lib/services/raw/app_pipeline.dart', // Reprocess all: Adjustment Mode copies of released files back
-      // Today's pipeline; step 6 removes these writers or routes them through the new one.
+      // Names a raw root and writes other files: the recordings list and the archive edits.
       'lib/services/recordings_manager.dart',
-      'lib/services/discard_store.dart',
-      'lib/services/vad_audio_processor.dart',
-      'lib/services/wals/sdcard_wal_sync.dart',
-      'lib/pages/settings/sync_page.dart',
+      'lib/services/wals/sdcard_wal_sync.dart', // downloads into part files; Adjustment Mode's copies
+      'lib/pages/settings/sync_page.dart', // the debug tools
     });
   });
 

@@ -136,6 +136,10 @@ class AppPipeline {
 
   bool get isRunning => _running;
 
+  /// Tests replace the Opus decoder, the speech model and the encoder with fakes.
+  @visibleForTesting
+  ({String decoderId, FrameDecoder Function() newDecoder, SpeechModel? model, AudioEncoder? encoder})? engines;
+
   /// Startup, before any download or processing: the update from an earlier build, once,
   /// then journal recovery. Every entry point awaits it.
   Future<void> start() => _started ??= _start();
@@ -227,11 +231,13 @@ class AppPipeline {
     final (quiet, quietWhy) = quietOf(holes.listedOn, _clockAnchors());
     Logger.debug('AppPipeline: ${quiet == null ? 'no quiet mark' : 'quiet mark'} ($quietWhy)');
     final live = ProcessingSettings.fromPrefs();
+    final engines = this.engines;
+    final newDecoder = engines?.newDecoder ?? OpusFrameDecoder.new;
     final cards = CardBuilder(
       store: coordinator.store,
-      decoderId: OpusFrameDecoder.id,
-      newDecoder: OpusFrameDecoder.new,
-      model: SileroBatchModel(await _vadRunner()),
+      decoderId: engines?.decoderId ?? OpusFrameDecoder.id,
+      newDecoder: newDecoder,
+      model: engines != null ? engines.model : SileroBatchModel(await _vadRunner()),
       onLiveness: onLiveness,
       isCancelled: () => _cancelRequested,
     );
@@ -243,8 +249,8 @@ class AppPipeline {
       book: PrefsSetAsideBook(),
       newJob: () => PublishJob(
         coordinator: coordinator,
-        newDecoder: OpusFrameDecoder.new,
-        encoder: AacAudioEncoder(),
+        newDecoder: newDecoder,
+        encoder: engines != null ? engines.encoder : AacAudioEncoder(),
         freeBytes: RecordingsManager.freeBytes,
         isCancelled: () => _cancelRequested,
         onLiveness: onLiveness,

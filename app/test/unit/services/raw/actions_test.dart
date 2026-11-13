@@ -508,6 +508,19 @@ void main() {
     await expectNothingPublished(world, c, boundaries: [a.force]);
   });
 
+  test('Delete Phone Segments takes a file on its first transfer too: what arrives later is never processed',
+      () async {
+    final b = Bin(1789100000000)..frames(300, p: speech);
+    // The first transfer is running: a part, nothing sealed.
+    final part = world.store.partFile(b.key, 0);
+    await part.parent.create(recursive: true);
+    await part.writeAsBytes(b.bytes);
+    await actions.deletePhoneSegments(nowMs: 3);
+    expect((await ledgerOf(root.path))[b.key]?.tombstone, isNotNull);
+    await world.arrive(b);
+    await expectNothingPublished(world, c, boundaries: [b.force]);
+  });
+
   test('Reprocess all: a released file whose copy is put back is planned from it again', () async {
     final a = Bin(1789100000000)..frames(300, p: speech);
     await world.arrive(a);

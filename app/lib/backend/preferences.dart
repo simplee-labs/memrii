@@ -217,10 +217,9 @@ class SharedPreferencesUtil {
   // So every switch appends {at, outgoing settings} here, and the processing run
   // cuts each bin with the settings that were live when it was recorded. A LIST,
   // not a single previous-mode snapshot: flip twice before the backlog drains and
-  // the audio has two boundaries in it, each needing its own settings. Entries
-  // retire from the front once no bin on disk predates them. JSON array; '' =
-  // no switch pending, which is the steady state. See [ModeSwitchRecord] and
-  // RecordingsController._drainModeSwitchBacklog.
+  // the audio has two boundaries in it, each needing its own settings. The newest
+  // entries are kept ([ModeSwitchRecord.maxEntries]). JSON array; '' = no switch
+  // recorded. The planner reads it as each file's policy (AppPipeline._policies).
   String get processingModeSwitchHistory => getString('processingModeSwitchHistory');
   set processingModeSwitchHistory(String v) => saveString('processingModeSwitchHistory', v);
 

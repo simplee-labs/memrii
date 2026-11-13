@@ -5,10 +5,6 @@
 // nothing writes again. A device file's logical file is its chunks in offset order, and
 // every offset outside this file is logical. Only part files are ever cut: a reader can
 // never see bytes change under it.
-//
-// Not switched on yet. The current pipeline reads every `.bin` as a whole file and cannot
-// read continuation chunks, so downloads keep writing whole bins until the new pipeline
-// replaces it (step 6). Until then this runs only in tests.
 
 import 'dart:async';
 import 'dart:convert';

@@ -100,28 +100,6 @@ void main() {
     expect(SetAsideBins.relBins(), isEmpty, reason: 'three more failures before it is set aside again');
   });
 
-  // The bin stays set aside, and so protected from the prune, until the retry has saved
-  // its audio (RecordingsManager.retrySetAsideBin).
-  test('a new build owes what an older one set aside one retry, and keeps it set aside meanwhile', () async {
-    await failRuns(bad, 3);
-    await SetAsideBins.releaseAfterUpdate();
-    expect(SetAsideBins.list().single.retryPending, isFalse, reason: 'same build — nothing changed');
-
-    build = '16';
-    await SetAsideBins.releaseAfterUpdate();
-    expect(SetAsideBins.relBins(), {bad});
-    expect(SetAsideBins.list().single.retryPending, isTrue);
-
-    await failRuns(other, 3);
-    expect(SetAsideBins.relBins(), {bad, other},
-        reason: 'the owed retry is not this build\'s, so it leaves the new build its own allowance');
-
-    await SetAsideBins.retryFailed(bad);
-    final retried = SetAsideBins.list().firstWhere((e) => e.relBin == bad);
-    expect(retried.retryPending, isFalse, reason: 'not tried again until a newer build');
-    expect(retried.build, '16');
-  });
-
   test('where the unsaved audio begins goes with the bin from its failures to its entry', () async {
     await SetAsideBins.recordFailure(bad, startByte: 400, startMs: 1789551900000);
     await SetAsideBins.recordFailure(bad, startByte: 400, startMs: 1789551900000);

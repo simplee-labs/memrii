@@ -261,14 +261,6 @@ class SetAsideBins {
     _clearFailureFor(relBin);
   }
 
-  /// A retry of [relBin] failed: it stays set aside, now on this build's account, so
-  /// it is not retried again until a newer one.
-  static Future<void> retryFailed(String relBin) async {
-    final build = await currentBuild();
-    _save([for (final e in list()) e.relBin == relBin ? e.copyWith(build: build, retryPending: false) : e]);
-    _clearFailureFor(relBin);
-  }
-
   /// Startup: a build other than the one that set a bin aside gets one more try at it,
   /// on the next processing run (see `RecordingsManager.retryPendingSetAsideBins`). The
   /// bin stays set aside, and protected, until that try saves its audio.

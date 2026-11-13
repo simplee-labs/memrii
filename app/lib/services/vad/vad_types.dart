@@ -1,52 +1,10 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/capture/capture_policy.dart';
 import 'package:omi/integrations/connector_registry.dart';
 
-/// Thrown from inside the `VadAudioProcessor` decode loop when the caller-supplied
-/// `isCancelled` callback flips to true. The isolate entry catches this as a
-/// clean abort (no error message, no draft flush) so the watchdog never has to
-/// force-kill the isolate — an `Isolate.kill(immediate)` while parked in an
-/// ONNX/Opus FFI call corrupts native state and takes the whole app down.
-class VadProcessingCancelled implements Exception {
-  const VadProcessingCancelled();
-  @override
-  String toString() => 'VadProcessingCancelled';
-}
-
-/// A recording's audio could not be written. Thrown out of the run instead of being
-/// logged and dropped: the buffered frames are the only record of audio whose source
-/// bins become deletable the moment the buffer clears, so the run has to stop with
-/// them still pending. That is the state a kill leaves, and the checkpoint already
-/// resumes from it.
-class RecordingWriteFailed implements Exception {
-  final Object cause;
-
-  /// The phone is out of space, as opposed to something wrong with this audio.
-  final bool storageFull;
-
-  const RecordingWriteFailed(this.cause, {required this.storageFull});
-
-  /// ENOSPC, or EDQUOT where a storage quota applies — the Linux codes Android reports.
-  /// Android is the only platform this runs on, and there Windows' disk-full codes, 39
-  /// and 112, mean "directory not empty" and "host is down"; counting them misread those
-  /// failures as a full phone, pausing processing behind the wrong banner.
-  static bool isStorageFull(Object error) {
-    if (error is RecordingWriteFailed) return error.storageFull;
-    if (error is! FileSystemException) return false;
-    final code = error.osError?.errorCode;
-    return code == 28 || code == 122;
-  }
-
-  @override
-  String toString() => 'RecordingWriteFailed(${storageFull ? 'storage full' : 'write failed'}): $cause';
-}
-
-/// All VAD/processing settings captured from SharedPreferences in the main isolate
-/// before spawning the processing isolate. All fields are primitives — safe to send
-/// across isolate boundaries.
+/// The processing settings as SharedPreferences has them when a pass starts.
 class ProcessingSettings {
   final bool vadEnabled;
   final double speechThreshold;
@@ -62,8 +20,8 @@ class ProcessingSettings {
   /// than the finished audio. Decided by the connector registry, never by naming a destination.
   final bool writeOpusFrameSidecar;
   // Firmware Priority Recording safety cap in minutes (0x19B10014); 0 = no cap.
-  // Bounds a restored priority latch whose 0xFFFFFFFC stop was lost, so a runaway
-  // force-capture can't keep swallowing auto recordings. See VadAudioProcessor.
+  // Bounds a Priority Recording whose 0xFFFFFFFC stop was lost, so a runaway
+  // force-capture can't keep swallowing auto recordings (the planner's cap history).
   final int priorityRecordCapMinutes;
 
   /// Descriptive recording-mode metadata for list labels, never a processing input. Flat vad* fields above
@@ -97,33 +55,6 @@ class ProcessingSettings {
         minSpeechMs: minSpeechMs,
         maxChunkMs: maxChunkMs,
         manual: manual,
-      );
-
-  /// These settings with the mode-shaped fields replaced by [m].
-  ///
-  /// The remaining fields — device id, save format, sidecar flag, priority
-  /// cap — are global, not per-mode, so they always come from the LIVE values
-  /// here. Freezing them alongside the mode would keep processing a backlog with
-  /// a replaced Omi's id, or writing a file format the user has since changed
-  /// away from.
-  ///
-  /// [manual] comes from [m], not from here: it is the most mode-shaped field
-  /// there is, and the whole point of a pass is that its audio predates the
-  /// switch. Taking the live value would label a pre-switch backlog with the
-  /// mode the user just moved to — the exact mislabelling the history exists to
-  /// stop, only in the sidecar instead of the cut.
-  ProcessingSettings withMode(ModeSettings m) => ProcessingSettings(
-        vadEnabled: m.vadEnabled,
-        speechThreshold: m.speechThreshold,
-        silenceDurationToSplitMs: m.silenceDurationToSplitMs,
-        minDurationMs: m.minDurationMs,
-        minSpeechMs: m.minSpeechMs,
-        maxChunkMs: m.maxChunkMs,
-        deviceId: deviceId,
-        audioSaveFormat: audioSaveFormat,
-        writeOpusFrameSidecar: writeOpusFrameSidecar,
-        priorityRecordCapMinutes: priorityRecordCapMinutes,
-        manual: m.manual,
       );
 
   /// The settings for a processing run now: the effective [CapturePolicy] (read from the
@@ -297,29 +228,6 @@ class ModeSwitchRecord {
     } catch (_) {
       return const [];
     }
-  }
-
-  /// Drops every entry at or before [watermarkUtcSeconds] — the point before
-  /// which no audio can still need its own settings. Null means there is no
-  /// evidence yet and nothing is dropped.
-  ///
-  /// An entry governs only audio recorded strictly BEFORE its stamp, so an entry
-  /// AT the watermark governs nothing and goes too. Ascending order makes this a
-  /// prefix drop.
-  ///
-  /// The caller supplies the watermark; see
-  /// RecordingsController.\_retirementWatermarkUtcSeconds for the two things that
-  /// can establish one. What matters here is the shape of the guarantee: this is
-  /// the safe form of a rule an earlier design got wrong. That version retired an
-  /// entry as soon as its backlog *looked* processed, so a late arrival — a bin
-  /// still downloading, or one the Omi had not handed over — was cut by the wrong
-  /// mode and KEPT. A watermark is a statement that no such late arrival is
-  /// possible, or that if one comes it will be deleted rather than kept. Retire
-  /// only on evidence of that kind.
-  static List<ModeSwitchRecord> retireBefore(List<ModeSwitchRecord> history, int? watermarkUtcSeconds) {
-    if (watermarkUtcSeconds == null || history.isEmpty) return history;
-    final kept = history.where((e) => e.atUtcSeconds > watermarkUtcSeconds).toList();
-    return kept.length == history.length ? history : kept;
   }
 
   /// Appends [entry] and re-sorts. Sorting rather than trusting append order

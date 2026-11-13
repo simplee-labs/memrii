@@ -8,7 +8,7 @@
 //   resume, tap protection, Priority Recording, mute and the AAD flood guard. It reads
 //   the stream alone, never how audio was split or saved (R1), so it is the same whether
 //   or not anything has been published.
-// - The conversation layer applies today's rules (VadAudioProcessor) to the frames:
+// - The conversation layer applies the rules of the processor it replaced to the frames:
 //   speech, silence split, minimum speech, length cap, gaps, priority spans and marker
 //   closes. It starts fresh at every close, from the event layer alone, so publishing a
 //   closed item leaves the plan of everything after it unchanged (I8).

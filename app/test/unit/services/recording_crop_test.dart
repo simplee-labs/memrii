@@ -110,8 +110,6 @@ void main() {
     expect(sourceMeta.readAsBytesSync(), orderedEquals(originalMeta));
     final meta = File(p.setExtension(saved.file.path, '.meta')).readAsBytesSync();
     expect(meta.sublist(8, 408).any((b) => b != 0), isTrue, reason: 'the crop has its own waveform');
-    expect(RecordingsManager.metaMarksHardStart(meta), isTrue);
-    expect(RecordingsManager.metaMarksHardEnd(meta), isTrue);
     final batches = await manager.getBatches();
     expect(batches.single.finalizedRecordings, hasLength(2));
     expect(batches.single.finalizedRecordings.where((c) => c.isCropped), hasLength(1));

@@ -10,10 +10,6 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Today's pipeline behaviour this tests was replaced in step 6 of the recordings
-/// pipeline redesign; test/unit/services/raw covers what replaced it.
-const _replacedByPipeline = 'replaced by the new pipeline (step 6)';
-
 class MockPathProvider extends Fake with MockPlatformInterfaceMixin implements PathProviderPlatform {
   String? tempPath;
   @override
@@ -282,47 +278,6 @@ void main() {
       expect(loaded.length, 1, reason: 'within 30s gap → one row');
       expect(loaded.single.duration, const Duration(seconds: 43), reason: 'span includes the 25s silent gap');
       expect(loaded.single.audioDuration, const Duration(seconds: 18), reason: 'audio is additive, no gap');
-    });
-  });
-
-  group('sibling-bin protection (discardedRelBinPathsExcludingSpan)', () {
-    test('a bin shared by a sibling discard outside the span is protected', skip: _replacedByPipeline, () async {
-      final base = DateTime(2026, 4, 7, 9).millisecondsSinceEpoch;
-      final dateStr = dateOf(base);
-      await writeJsonl(dateStr, [
-        // Record A (being recovered): a HEAD slice of shared.bin + its own bin.
-        rec(startMs: base, endMs: base + 1000, relativeBins: [
-          's/shared.bin',
-          's/onlyA.bin'
-        ], binRanges: {
-          's/shared.bin': [56, 56900],
-          's/onlyA.bin': [0, 100],
-        }),
-        // Record B (sibling, later span): a TAIL slice of the SAME bin.
-        rec(startMs: base + 5000, endMs: base + 6000, relativeBins: [
-          's/shared.bin'
-        ], binRanges: {
-          's/shared.bin': [56920, 60712]
-        }),
-      ]);
-
-      // Recovering A's span must protect the shared bin (B still needs its tail)
-      // but NOT A's exclusive bin (safe to delete once A is recovered).
-      final protectedSiblings = await RecordingsManager.discardedRelBinPathsExcludingSpan(base, base + 1000);
-      expect(protectedSiblings, {'s/shared.bin'});
-      expect(protectedSiblings.contains('s/onlyA.bin'), isFalse);
-    });
-
-    test('recovering the whole coalesced span protects nothing of its own', () async {
-      final base = DateTime(2026, 4, 8, 9).millisecondsSinceEpoch;
-      final dateStr = dateOf(base);
-      await writeJsonl(dateStr, [
-        rec(startMs: base, endMs: base + 1000, relativeBins: ['s/a.bin']),
-        rec(startMs: base + 1000, endMs: base + 2000, relativeBins: ['s/b.bin']),
-      ]);
-      // Both records fall inside [base, base+2000] → both are constituents → none protected.
-      final protectedSiblings = await RecordingsManager.discardedRelBinPathsExcludingSpan(base, base + 2000);
-      expect(protectedSiblings, isEmpty);
     });
   });
 }

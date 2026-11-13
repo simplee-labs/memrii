@@ -174,8 +174,8 @@ Future<void> _launchHousekeeping() async {
   await _attachmentHousekeeping();
 }
 
-/// Safe on startup and genuine attachment: stamp logs and reclaim expired
-/// discarded bins. runRecoverySweep yields while processing is active.
+/// Safe on startup and genuine attachment: stamp the log. Discarded clips expire in
+/// every processing pass.
 Future<void> _attachmentHousekeeping() async {
   // Version stamp, heading this open's log lines. Firmware is the last-read value
   // (nothing is connected yet); the connect that follows confirms it with a
@@ -188,11 +188,6 @@ Future<void> _attachmentHousekeeping() async {
   unawaited(DebugLogManager.logAppStart(
     lastKnownFirmware: SharedPreferencesUtil().lastLoggedFirmwareRevision,
   ));
-  try {
-    await RecordingsManager.runRecoverySweep();
-  } catch (e) {
-    Logger.error('main: launch housekeeping failed: $e');
-  }
 }
 
 class MyApp extends StatefulWidget {

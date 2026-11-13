@@ -230,12 +230,11 @@ void main() {
     meta.writeAsBytesSync(bytes);
     released.file.deleteSync();
     File(RecordingsManager.opusFrameSidecarPathFor(released.file)).writeAsBytesSync([4, 5]);
-    await manager.writeMarkerEdlTest(docs.path, {
-      'filename': 'recording_1234567890000.wav',
-      'markerMs': 1234567890000,
-      'offsetMs': 0,
-      'durationMs': 0,
-    });
+    File(p.join(original.file.parent.path, 'marker_1234567890000.edl')).writeAsStringSync(jsonEncode({
+      'markerTimestampMs': 1234567890000,
+      'segmentFilename': 'recording_1234567890000.wav',
+      'markerOffsetMs': 0,
+    }));
     final markersBefore = (await manager.getMarkerConversations()).map((m) => m.edlFile.path).toSet();
     await RecordingsManager.cleanupOrphanedTempFiles();
     for (final copy in copies) {
@@ -363,52 +362,6 @@ void main() {
     expect(moved.startTime, DateTime(2026, 9, 30, 12));
     expect(RecordingFilename.cropSuffix(moved.file.path), '_${copy.uploadKey}');
     expect((await manager.getMarkerConversations()).single.isPending, isFalse);
-  });
-
-  test('saved copies do not become hard boundaries for unrelated late drafts', () async {
-    final original = source();
-    final copy =
-        await manager.saveCroppedConversation(original, const Duration(seconds: 2), const Duration(seconds: 5));
-    final draftStart = original.startTime.subtract(const Duration(seconds: 1)).millisecondsSinceEpoch;
-    final draft = File(p.join(original.file.parent.path, 'recording_${draftStart}_draft.wav'))
-      ..writeAsBytesSync(pcmRecording(seconds: 2));
-    File(p.setExtension(draft.path, '.meta'))
-        .writeAsBytesSync((ByteData(8)..setUint32(4, 2000, Endian.little)).buffer.asUint8List());
-    await manager.stitchDraftRecordingsForTest();
-    expect(draft.existsSync(), isTrue, reason: 'the crop is an edit, not a device boundary');
-    expect(copy.file.existsSync(), isTrue);
-  });
-
-  test('priority removal resolves cross-folder draft aliases and reuses hidden markers', () async {
-    final original = source();
-    final later = Directory(p.join(docs.path, 'recordings', '2026-10-01'))..createSync(recursive: true);
-    final markerMs = DateTime(2026, 10, 1).millisecondsSinceEpoch;
-    final edl = File(p.join(later.path, 'marker_$markerMs.edl'))
-      ..writeAsStringSync(jsonEncode({
-        'markerTimestampMs': markerMs,
-        'segmentFilename': 'recording_later.wav',
-        'markerOffsetMs': 0,
-        'cropStartMs': 100,
-        'cropEndMs': 900,
-        'userSaved': true,
-        'isHighPriority': true,
-      }));
-    await manager.reanchorMarkerEdlsTest(
-        fromFilename: 'recording_later.wav',
-        toFilename: p.basename(original.file.path).replaceFirst('.wav', '_draft.wav'),
-        offsetShiftMs: 1000,
-        newDurationMs: 10000,
-        folders: [original.file.parent, later]);
-    expect((await manager.getMarkerConversations()).single.isHighPriority, isTrue);
-    await manager.setConversationPriority(original, false);
-    expect(await manager.getMarkerConversations(), isEmpty);
-    final hidden = jsonDecode(edl.readAsStringSync()) as Map;
-    expect(hidden['priorityOverride'], isFalse);
-    expect(hidden['cropStartMs'], 1100);
-    expect(hidden['cropEndMs'], 1900);
-    await manager.setConversationPriority(original, true);
-    expect((await manager.getMarkerConversations()).single.isHighPriority, isTrue);
-    expect(later.listSync().whereType<File>().where((f) => f.path.endsWith('.edl')), hasLength(1));
   });
 
   test('a later failed overlapping save cannot remove the successful copy', () async {

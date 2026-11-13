@@ -22,9 +22,7 @@ class Conversation {
   final bool passthrough;
   final bool forceSynced;
   // True iff VAD ended this recording at the max-duration cap (vadMaxConversationMinutes)
-  // rather than because of detected silence. pruneConsumedBins uses this to decide whether
-  // raw bin files extending past rec_end may be safely deleted (silence-ended) or must be
-  // preserved (cap-ended, since bin tail may hold the post-cap continuation).
+  // rather than because of detected silence.
   //
   // Defaults to true so that old recordings whose .meta predates the flag are treated
   // conservatively (no aggressive pruning past rec_end).
@@ -32,7 +30,7 @@ class Conversation {
   final bool? isSilero;
 
   /// The recording mode this audio was captured in: true manual, false auto,
-  /// null "not recorded". Stamped by `VadAudioProcessor._saveMetadata` into flag
+  /// null "not recorded". Stamped into flag
   /// byte [3] as a modeKnown/manual pair — two bits precisely so null stays
   /// expressible, since every `.meta` written before this reads 0 and a single
   /// bit would relabel the whole back catalogue as one mode.
@@ -169,8 +167,7 @@ class Conversation {
           String? uploadKey;
           bool passthrough = false;
           bool forceSynced = false;
-          // Default true so recordings whose .meta predates the capEnded byte are treated
-          // conservatively by pruneConsumedBins (no aggressive prune past rec_end).
+          // Default true for recordings whose .meta predates the capEnded byte.
           bool capEnded = true;
           bool? isSilero;
           bool? recordedManual;
@@ -406,8 +403,7 @@ class Conversation {
           String? uploadKey;
           bool passthrough = false;
           bool forceSynced = false;
-          // Default true so recordings whose .meta predates the capEnded byte are treated
-          // conservatively by pruneConsumedBins (no aggressive prune past rec_end).
+          // Default true for recordings whose .meta predates the capEnded byte.
           bool capEnded = true;
           bool? isSilero;
           bool? recordedManual;

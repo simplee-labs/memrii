@@ -109,7 +109,7 @@ String? uploadKeyOf(String deviceId, int nameMs, String extension) {
   return '${id.substring(0, 6)}_recording_$nameMs.$extension';
 }
 
-/// A recording's `.meta`, as VadAudioProcessor._saveMetadata writes it: samples, duration,
+/// A recording's `.meta`, in the format earlier builds wrote too: samples, duration,
 /// 200 peaks, session, start uptime (whole seconds), the upload key, four flag bytes, then
 /// the source files as a length-prefixed JSON list. Never a fifth flag byte.
 Uint8List buildMeta({

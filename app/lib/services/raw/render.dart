@@ -37,7 +37,7 @@ const int _m4aShrink = 8;
 const int _writeBlock = 64 * 1024;
 
 /// ENOSPC, or EDQUOT where a quota applies: the Linux codes Android reports (the rule
-/// RecordingWriteFailed.isStorageFull uses today).
+/// the processor it replaced used).
 bool isStorageFullError(Object e) {
   if (e is RenderFailed) return e.storageFull;
   if (e is! FileSystemException) return false;
