@@ -539,6 +539,12 @@ Recent app releases are listed by patch version. Older app and firmware releases
 
 ### memrii-fw-3.2
 
+- **memrii-fw-3.2.1: only the phone paired with the Omi can update its firmware.** Installing firmware over Bluetooth, and the update service's erase and restart commands, now need a paired connection; before, any phone in range could use them without pairing. Updating from the app works as before. If the Omi's pairing goes stale, tap its button 5 times, holding the last tap for 10 seconds, pair again, then update.
+
+- **memrii-fw-3.2.1: the Omi keeps recording if Bluetooth fails to start.** It used to come up showing ready but record nothing until it was switched off and on. Now it restarts once to try Bluetooth again; if that fails too, it stays on and records, and the recordings sync once Bluetooth works again.
+
+- **memrii-fw-3.2.1: fix: with a full card, the start of the oldest recording could be overwritten while still listed.** When the card is full the Omi frees the oldest audio to make room, and it freed a few hundred bytes too few, so the oldest recording could download with a damaged start.
+
 - **The firmware is now memrii-fw-3.2.0.** Device Settings shows the new name; it behaves exactly like oo-3.1.5. The Omi still advertises itself as "Omi", so the app finds it as before, and flashing it re-pairs automatically, as every update does. The version numbers continue from the oo- series, so notes that say "oo-3.1.4 and later" include it.
 
 ### oo-3.1

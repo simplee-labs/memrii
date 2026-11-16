@@ -24,7 +24,7 @@ Settings → Firmware, pick the zip.
 ## Versioning
 
 The firmware's version is `CONFIG_BT_DIS_FW_REV_STR` in [`omi.conf`](omi.conf), e.g.
-`memrii-fw-3.2.0`. It is published in the Device Information Service, shown by the app,
+`memrii-fw-3.2.1`. It is published in the Device Information Service, shown by the app,
 stamped into the DFU zip as `version.txt`, and used to name that zip. The numbers
 continue the omi-offline lineage (`oo-3.1.5` was the last), so statements like "firmware
 oo-3.1.4 and later" keep their meaning. Bump it for every image that changes: the app
