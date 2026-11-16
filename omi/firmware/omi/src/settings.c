@@ -178,9 +178,14 @@ static bool dfu_wipe_scheme_seen = false;
  * headroom means moving the partition down. If you change that Kconfig, re-run
  * the table above by hand. Nothing else will catch it.
  *
- * The layout is chosen dynamically by Partition Manager (boards/omi/pm_static.yml
- * is NOT applied — PM reads pm_static.yml from the application directory), which
- * is exactly why this asserts the property rather than trusting the addresses. */
+ * Partition Manager does apply boards/omi/pm_static.yml (the application
+ * directory has none, so NCS falls back to the board directory's), but in internal
+ * flash that file fixes only mcuboot (0x0-0x10000) and mcuboot_pad
+ * (0x10000-0x10200), plus the primary-slot spans. The application and
+ * settings_storage are computed into the one gap left, 0x10200-0x100000; the
+ * file's own app address (0xf200) is never read. The settings_storage address is
+ * therefore an output, not something the file pins, which is exactly why this
+ * asserts the property rather than trusting the address. */
 #if defined(PM_SETTINGS_STORAGE_END_ADDRESS) && defined(PM_MCUBOOT_PRIMARY_END_ADDRESS)
 BUILD_ASSERT(PM_SETTINGS_STORAGE_END_ADDRESS <= PM_MCUBOOT_PRIMARY_END_ADDRESS - 0x2000,
              "settings_storage is within two sectors of the top of the MCUboot primary slot, "

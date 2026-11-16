@@ -122,30 +122,23 @@ If the workspace already exists and is properly configured, you can skip to step
 
 ### 1. Build Command
 
-Two equivalent options — both produce the same output:
-
-**Option A: CMake preset (recommended, run from `omi/firmware/omi/`)**
+Build with `west` and sysbuild, from `omi/firmware/v2.9.0/` (the workspace from step 3):
 
 ```bash
 nrfutil toolchain-manager launch --ncs-version v2.9.0 --shell
 
-# In the SDK environment:
-cmake --preset OMI
-cmake --build build/omi
+# In the SDK environment, from omi/firmware/v2.9.0/, with MEMRII_MCUBOOT_KEY_FILE
+# already set (see Prerequisites):
+west build --sysbuild -b omi/nrf5340/cpuapp -d ../omi/build/omi ../omi -- \
+  -DBOARD_ROOT=/path/to/omi/firmware \
+  -DCONF_FILE=/path/to/omi/firmware/omi/omi.conf
 ```
 
-The `CMakePresets.json` in `omi/firmware/omi/` already sets the board (`omi/nrf5340/cpuapp`), conf file (`omi.conf`), and build directory (`build/omi`). No extra flags needed.
+- `BOARD_ROOT` is the directory that holds `boards/`: the Omi board is not part of the SDK.
+- `CONF_FILE` selects `omi.conf`. There is no `prj.conf`; do not create one by copying `omi.conf`. Sysbuild applies an unprefixed `CONF_FILE` to the main application only, so MCUboot keeps `sysbuild/mcuboot.conf`.
+- `-d ../omi/build/omi` puts the output in `omi/firmware/omi/build/omi/`, where `package_firmware.sh` looks for it.
 
-**Option B: west build (run from `omi/firmware/v2.9.0/`)**
-
-```bash
-nrfutil toolchain-manager launch --ncs-version v2.9.0 --shell
-
-# In the SDK environment:
-west build -b omi/nrf5340/cpuapp ../omi --sysbuild -- -DBOARD_ROOT=/path/to/omi/firmware
-```
-
-> **Note:** Do not copy `omi.conf` to `prj.conf`. The build system is already configured to use `omi.conf` directly.
+> **`CMakePresets.json` is not a build recipe.** It records the same board, `omi.conf` and `build/omi` directory for editor tooling. Plain `cmake --preset OMI` configures the application on its own, outside sysbuild, so it produces no MCUboot-signed image, no network-core image and no `dfu_application.zip`, and the preset sets no `BOARD_ROOT`. Release images come from the `west build --sysbuild` command above.
 
 ### 2. Build Process Overview
 
@@ -168,7 +161,7 @@ Memory region         Used Size  Region Size  %age Used
 
 ## Build Outputs
 
-The build generates several important files in the `build/` directory:
+The build generates several important files in the build directory (`omi/firmware/omi/build/omi/` with the command above):
 
 ### OTA Files
 - **`dfu_application.zip`** (440 KB) - **Primary OTA package for nRF Connect app**
@@ -188,15 +181,16 @@ The build generates several important files in the `build/` directory:
 
 ### 1. Prepare the OTA Package
 
-The build automatically stamps `version.txt` into `dfu_application.zip` via `sysbuild/CMakeLists.txt`. The memrii app reads this to display the version when you load a local zip.
+The build automatically stamps `version.txt` into `dfu_application.zip` via `sysbuild/CMakeLists.txt`, and re-reads `omi.conf` whenever it changes, so the stamp follows a version bump. The memrii app reads this to display the version when you load a local zip.
 
 To produce a named release zip:
 
 ```bash
 cd omi/firmware/omi
-./package_firmware.sh
-# Reads version from CONFIG_BT_DIS_FW_REV_STR in omi.conf
-# Output: build/omi/dfu_application_release.zip
+./package_firmware.sh            # or: ./package_firmware.sh <name> <path/to/dfu_application.zip>
+# Checks version.txt against CONFIG_BT_DIS_FW_REV_STR in omi.conf: adds it if the
+# zip has none, fails if it differs, and never adds a second copy.
+# Output: build/omi/dfu_application_release.zip (written next to the input zip)
 ```
 
 Transfer `dfu_application_release.zip` (or `dfu_application.zip`) to your mobile device (email, cloud storage, etc.).
@@ -250,15 +244,17 @@ brew install ninja
 #### Board Not Found
 ```bash
 # Error: No board named 'omi' found
-# Ensure BOARD_ROOT is set correctly:
-west build -b omi/nrf5340/cpuapp ../omi --sysbuild -- -DBOARD_ROOT=/full/path/to/firmware
+# BOARD_ROOT must point at omi/firmware, the directory that holds boards/:
+west build --sysbuild -b omi/nrf5340/cpuapp -d ../omi/build/omi ../omi -- \
+  -DBOARD_ROOT=/full/path/to/omi/firmware \
+  -DCONF_FILE=/full/path/to/omi/firmware/omi/omi.conf
 ```
 
 #### Configuration Issues
 ```bash
 # Error: No prj.conf file found
-# This should not happen — CMakePresets.json sets CONF_FILE=omi.conf.
-# If building outside the preset, pass -DCONF_FILE=/path/to/omi/firmware/omi/omi.conf
+# The build ran without -DCONF_FILE. Pass it as in the build command above:
+#   -DCONF_FILE=/path/to/omi/firmware/omi/omi.conf
 ```
 
 #### Workspace Issues
@@ -299,13 +295,35 @@ west update
 
 ### Memory Layout
 
-Tracked `boards/omi/pm_static.yml`, DTS and sysbuild configuration are inputs,
-not proof of the active layout. Inspect generated `partitions.yml` and
-`pm_config.h` in the sysbuild output for flash slots, settings and retained RAM.
-The application, network core and bootloaders have separate image/configuration
-contexts. OTA preserves already-installed bootloaders; a freshly generated map
-does not prove their size/alignment/trailer assumptions. Confirm those properties
-against the installed bootloader before relying on an OTA slot layout.
+This is the application-core flash layout devices in the field run. An OTA cannot
+change it: MCUboot (overwrite-only) replaces the image in place, and the bootloader
+that defines the slots is never updated over the air. `BUILD_ASSERT`s in
+`omi/src/settings.c` fail any build whose generated layout differs.
+
+| Partition | Range | Set by |
+|---|---|---|
+| MCUboot | `0x00000`–`0x10000` | `boards/omi/pm_static.yml` |
+| MCUboot primary slot | `0x10000`–`0x100000`, image header `0x10000`–`0x10200` | `pm_static.yml`; asserted |
+| Application | linked at `0x10200` | Partition Manager; asserted |
+| `settings_storage` (NVS: BLE bonds, app settings) | `0xfc000`–`0xfe000` per `settings.c`, inside the primary slot | Partition Manager; asserted to end at or below `0xfe000` |
+| Secondary slots (OTA staging) | external flash: app `0x0`–`0xf0000`, network core `0xf0000`–`0x130000` | `pm_static.yml` |
+
+How that layout comes about (NCS v2.9.0):
+
+- Partition Manager **does** apply `boards/omi/pm_static.yml`. The application
+  directory has no `pm_static.yml`, so it falls back to the board directory's.
+  Removing the file would move the application; the `settings.c` asserts catch that.
+- In internal flash the file fixes only `mcuboot` and `mcuboot_pad` (plus the
+  primary-slot spans). The application and `settings_storage` are computed into the
+  one gap left after `mcuboot_pad`, `0x10200`–`0x100000`. The file's `app` entry
+  (`address: 0xf200`) is stale and never read; don't take the layout from it.
+- Leave the file byte-identical. NCS hashes it and asks for a pristine build when
+  it changes, and the addresses it fixes are the ones every device already has.
+- Why `settings_storage` sits inside the primary slot, and why an OTA does not
+  erase it, is worked through above the asserts in `omi/src/settings.c`.
+
+The file also places retained RAM (`sram_retained_mem`, `0x2006f000`–`0x20070000`).
+`partitions.yml` in the build directory shows the resolved map for a build.
 
 ### Security Features
 - **Signing**: Images are signed with the key in `MEMRII_MCUBOOT_KEY_FILE`, MCUboot's
