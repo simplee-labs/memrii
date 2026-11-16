@@ -7,6 +7,7 @@ memrii's Zephyr RTOS firmware for the Omi Consumer wearable (nRF5340). Handles a
 - `omi/` — Main application
   - `src/` — C source at the root (`main.c`, `sd_card.c`, `aad.c`, `mic.c`, `led.c`, `battery.c`, `haptic.c`, `imu.c`, `rtc.c`, `settings.c`, `spi_flash.c`, `wdog_facade.c`)
   - `src/lib/core/` — the rest (`transport.c`, `button.c`, `codec.c`, `storage.c`, `sd_ring.c`, `diag_log.c`, `monitor.c`) plus vendored `opus-1.2.1`
+  - `tests/host/` — host tests that need no SDK (SD ring backend, packaging); `scripts/check_build.py` checks a build's output. Both run in CI, see [Continuous Integration](BUILD_AND_OTA_FLASH.md#continuous-integration)
   - `CMakeLists.txt` / `CMakePresets.json` — Build configuration
 - `boards/` — Custom Zephyr board definitions, including `omi/pm_static.yml`, which
   Partition Manager applies to every build; its `app` address is stale and unused. The

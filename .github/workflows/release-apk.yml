@@ -11,9 +11,9 @@
 #   Run workflow with a tag
 #       builds that tag and attaches (or replaces) the APK on its release.
 #
-# Firmware is not built here: it needs the nRF Connect SDK, so the firmware zip
-# (memrii-fw-<version>.zip) is built locally with the firmware toolchain and uploaded to its own
-# memrii-fw-v<version> release. Firmware tags do not trigger this APK workflow.
+# Firmware is not built here: firmware.yml builds the firmware zip (memrii-fw-<version>.zip)
+# in Nordic's nRF Connect SDK container and attaches it to its own memrii-fw-v<version>
+# release. Firmware tags do not trigger this APK workflow.
 #
 # The build uses the public production entry point directly; owner scripts are local-only.
 

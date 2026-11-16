@@ -435,17 +435,20 @@ When publishing APK and firmware updates, use separate GitHub release entries an
   `memrii-v0.2.4+15`), titled `memrii APK 0.2.4`. Pushing an app tag runs the
   Release APK workflow, which creates an APK-only draft for release notes and publishing.
 - **Firmware:** `memrii-fw-v<firmware-version>` (e.g. `memrii-fw-v3.2.0`), titled
-  `memrii Firmware 3.2.0`. Build locally, then attach only the matching firmware ZIP
-  to that release. Firmware tags do not run the APK workflow.
+  `memrii Firmware 3.2.0`. Pushing a firmware tag runs the Firmware workflow, which
+  builds, checks and attaches only the matching firmware ZIP to a draft release.
+  Firmware tags do not run the APK workflow.
 
-For example, after building firmware 3.2.0, create its draft from the source commit
-used for the build (omit `--draft` when publishing):
+For example, to release firmware 3.2.1, set `CONFIG_BT_DIS_FW_REV_STR="memrii-fw-3.2.1"`
+in `omi/firmware/omi/omi.conf`, commit, then tag that commit (the workflow refuses a
+tag that does not match `omi.conf`):
 
 ```bash
-gh release create memrii-fw-v3.2.0 releases/memrii-fw-3.2.0.zip \
-  --target "$(git rev-parse HEAD)" --title "memrii Firmware 3.2.0" \
-  --draft --latest=false --notes-file firmware-release-notes.md
+git tag memrii-fw-v3.2.1 && git push origin memrii-fw-v3.2.1
 ```
+
+The workflow creates the draft with `memrii-fw-3.2.1.zip`, never marked latest. Add
+the release notes and publish it.
 
 Keep the latest APK marked as GitHub's latest release; firmware releases use
 `--latest=false`. An app-only update does not re-upload unchanged firmware.

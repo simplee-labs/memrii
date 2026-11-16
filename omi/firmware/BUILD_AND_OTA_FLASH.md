@@ -9,6 +9,7 @@ This guide builds the memrii firmware for the Omi Consumer hardware (nRF5340) wi
 - [Building the Firmware](#building-the-firmware)
 - [OTA Flashing Process](#ota-flashing-process)
 - [Build Outputs](#build-outputs)
+- [Continuous Integration](#continuous-integration)
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
 
@@ -228,6 +229,40 @@ During OTA update:
 - **Stage 2**: Verification and swap (automatic)
 - **Stage 3**: Device restart with new firmware
 - **Stage 4**: Confirmation of successful update
+
+## Continuous Integration
+
+`.github/workflows/firmware.yml` builds and checks the firmware on GitHub on every push
+that changes `omi/firmware/`, and drafts a release from each `memrii-fw-v<version>` tag
+(see the repository README).
+
+- **Host tests** (`omi/firmware/omi/tests/host/run.sh`): the SD ring backend driven over
+  an in-memory card through several wraps, and the packaging script. They need only a C
+  compiler and Python 3, so run them before pushing.
+- **Build**: the `west build --sysbuild` command above, in Nordic's
+  `ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.9.0` image, so the layout `BUILD_ASSERT`s in
+  `settings.c` run on every change, not only on someone's machine.
+- **Build checks** (`omi/firmware/omi/scripts/check_build.py`):
+  - the deployed flash layout, including the external-flash update slots the asserts do
+    not cover;
+  - the update service requires a paired link;
+  - MCUboot overwrite-only, with `CONFIG_BOOT_MAX_IMG_SECTORS` at most 678;
+  - the zip holds both core images, signed with the sample key, app image version
+    `0.0.0+0`, and exactly one `version.txt` matching `omi.conf`.
+
+  It works on a local build too, from the SDK environment:
+
+  ```bash
+  python3 omi/firmware/omi/scripts/check_build.py omi/firmware/omi/build/omi \
+    --key <NCS>/bootloader/mcuboot/root-rsa-2048.pem \
+    --imgtool <NCS>/bootloader/mcuboot/scripts/imgtool.py
+  ```
+
+Each run keeps the packaged zip, and a build-info artifact with the resolved
+`partitions.yml`, both `.config` files and the zip manifest, for 14 days.
+
+CI checks what can be checked without hardware. It cannot tell whether an image boots,
+pairs and accepts the next update, so try every release on one device before the rest.
 
 ## Troubleshooting
 
