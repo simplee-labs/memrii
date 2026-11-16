@@ -13,11 +13,17 @@ CC="${CC:-cc}"
   -include "$HERE/stubs/prelude.h" -I"$HERE/stubs" -I"$SRC" \
   -o "$OUT/sd_ring_test" "$HERE/sd_ring_test.c" "$SRC/lib/core/sd_ring.c"
 
+"$CC" -std=c11 -O1 -Wall -Wextra -Werror -Wno-unused-parameter \
+  -include "$HERE/stubs/prelude.h" -I"$HERE/stubs" -I"$SRC" \
+  -o "$OUT/retained_test" "$HERE/retained_test.c" "$SRC/lib/core/retained.c"
+
 status=0
 for seed in 12345 1 7 99 2024; do
   echo -n "sd_ring seed $seed: "
   "$OUT/sd_ring_test" "$seed" || status=1
 done
+
+"$OUT/retained_test" || status=1
 
 python3 "$HERE/package_firmware_test.py" || status=1
 exit "$status"

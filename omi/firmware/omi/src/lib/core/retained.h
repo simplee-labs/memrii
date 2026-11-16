@@ -62,4 +62,12 @@ bool retained_mute_get(uint32_t *since_utc_s);
 /* The event ring's state. Always the same address; valid to call at any time. */
 struct retained_diag *retained_diag(void);
 
+/* Bluetooth bring-up retry (transport_start()). When bt_enable() fails, the device
+ * reboots once to retry, marking it here first; if Bluetooth fails again on the next
+ * boot the mark is still set, so it stays up without Bluetooth instead of rebooting
+ * again. A boot where Bluetooth comes up clears it. Retained RAM keeps the mark across
+ * the reboot and System OFF, and loses it only if the battery runs flat. */
+bool retained_bt_retry_used(void);
+void retained_bt_retry_set(bool used);
+
 #endif /* RETAINED_H */

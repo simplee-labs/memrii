@@ -42,6 +42,7 @@
 #endif
 #include "codec.h"
 #include "diag_log.h"
+#include "retained.h"
 #include "rtc.h"
 #include "sd_card.h"
 #include "settings.h"
@@ -3386,6 +3387,18 @@ int transport_start()
     err = bt_enable(NULL);
     if (err) {
         LOG_ERR("Transport bluetooth init failed (err %d)", err);
+        /* Without Bluetooth nothing can connect to fetch recordings or flash a fix, so
+         * reboot once to retry: a reboot repeats the whole start-up, which clears a radio
+         * that failed to come up once. Only once in a row: the mark is kept in retained
+         * RAM, so if Bluetooth fails again on the next boot the device stays up and
+         * records instead of rebooting in a loop. A boot where Bluetooth comes up clears
+         * the mark. Rebooting here costs no audio: main() has not started the mic yet,
+         * and the SD ring is built to survive a reset at any point. */
+        if (!retained_bt_retry_used()) {
+            retained_bt_retry_set(true);
+            LOG_ERR("Rebooting once to retry Bluetooth");
+            sys_reboot(SYS_REBOOT_COLD);
+        }
         /* Recording does not need the radio, so start the audio pipeline anyway.
          * Returning straight away used to skip it: the codec ring was never
          * initialised and the pusher never ran, so every captured frame was dropped
@@ -3396,6 +3409,8 @@ int transport_start()
         (void) start_audio_pipeline();
         return err;
     }
+    /* Bluetooth is up, so a later failure gets its one retry again. */
+    retained_bt_retry_set(false);
 
 #if defined(CONFIG_BT_SETTINGS)
     err = settings_load_subtree("bt");
