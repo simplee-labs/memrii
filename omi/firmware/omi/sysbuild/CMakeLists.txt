@@ -8,7 +8,11 @@ project(sysbuild LANGUAGES)
 # Stamp version.txt into dfu_application.zip after it is built so the
 # Omi app can display the version when the user picks a local zip file.
 if(TARGET dfu_application_zip)
-  file(STRINGS "${APP_DIR}/omi.conf" _conf_lines REGEX "CONFIG_BT_DIS_FW_REV_STR")
+  # The version is read here, at configure time, and baked into the stamping
+  # command below. Re-run this configure when omi.conf changes, or an incremental
+  # build after a version bump stamps the previous version onto the new image.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${APP_DIR}/omi.conf")
+  file(STRINGS "${APP_DIR}/omi.conf" _conf_lines REGEX "^CONFIG_BT_DIS_FW_REV_STR=")
   string(REGEX MATCH "\"([^\"]+)\"" _ "${_conf_lines}")
   set(_fw_version "${CMAKE_MATCH_1}")
 
