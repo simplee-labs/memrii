@@ -846,9 +846,25 @@ class _FirmwareUpdateState extends State<FirmwareUpdate> with FirmwareMixin {
                   const FaIcon(FontAwesomeIcons.circleExclamation, color: Color(0xFFFF6B6B), size: 18),
                   const SizedBox(width: 14),
                   Expanded(
-                    child: Text(
-                      installErrorMessage!,
-                      style: TextStyle(color: Colors.red.shade200, fontSize: 14, height: 1.4),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          installErrorMessage!,
+                          style: TextStyle(color: Colors.red.shade200, fontSize: 14, height: 1.4),
+                        ),
+                        const SizedBox(height: 8),
+                        // Firmware refuses update commands over an unpaired link
+                        // (CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT), so a broken
+                        // pairing shows up here as a failed or stalled update.
+                        Text(
+                          'Updates only work while your Omi is paired with this phone. If it keeps '
+                          'failing, reconnect your Omi first. If it won\'t pair, tap the button on your '
+                          'Omi 5 times, holding the last tap for 10 seconds, to clear its pairing, then '
+                          'pair again and retry.',
+                          style: TextStyle(color: Colors.grey.shade400, fontSize: 13, height: 1.4),
+                        ),
+                      ],
                     ),
                   ),
                 ],

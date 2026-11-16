@@ -3,8 +3,8 @@
 #   Push to any branch that changes omi/firmware/ (or this file)
 #       Host tests (no SDK), then a full nRF Connect SDK sysbuild build exactly as
 #       BUILD_AND_OTA_FLASH.md describes, then scripts/check_build.py on the output:
-#       deployed flash layout, MCUboot settings, both core images present and
-#       signed with the key field bootloaders trust,
+#       deployed flash layout, update service requires pairing, MCUboot settings,
+#       both core images present and signed with the key field bootloaders trust,
 #       image version 0.0.0+0, one version.txt matching omi.conf. The packaged zip is
 #       kept as a workflow artifact for 14 days. Nothing is released.
 #   Push a tag (git tag memrii-fw-v3.2.1 && git push origin memrii-fw-v3.2.1)
