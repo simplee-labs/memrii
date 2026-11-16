@@ -380,13 +380,27 @@ static void drop_reclaimed_segments(void)
 
 /* Keep-newest: force the tail forward so `need` more bytes fit, dropping the
  * oldest data. Only fires when the card is full of un-reclaimed audio (the
- * phone hasn't drained) — in normal use it never runs. */
+ * phone hasn't drained) — in normal use it never runs.
+ *
+ * The NAND is written in whole sectors: sd_ring_sync() writes the partial head
+ * sector padded to its end, so the write that lands the new head overwrites the
+ * old bytes sharing that physical sector all the way to the next sector boundary,
+ * not just `need` of them. Reclaim to that boundary, or up to 511 bytes at the
+ * tail stay claimed as live after the card has overwritten them.
+ *
+ * Rounded by hand: Zephyr's ROUND_UP() casts to unsigned long, 32 bits here, and
+ * head_abs passes 4 GB after about ten days of audio. */
 static void enforce_keep_newest(size_t need)
 {
-    if ((head_abs - tail_abs) + need <= ring_bytes) {
+    uint64_t write_end = head_abs + need;
+    uint64_t partial = write_end % RING_SECTOR_SIZE;
+    if (partial != 0) {
+        write_end += RING_SECTOR_SIZE - partial;
+    }
+    if (write_end - tail_abs <= ring_bytes) {
         return;
     }
-    uint64_t new_tail = (head_abs + need) - ring_bytes;
+    uint64_t new_tail = write_end - ring_bytes;
     if (new_tail > tail_abs) {
         tail_abs = new_tail;
         drop_reclaimed_segments();
