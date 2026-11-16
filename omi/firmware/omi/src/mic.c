@@ -222,14 +222,9 @@ int mic_start()
     }
 
     mic_running = true;
-    /* Inside the lock, like mic_on()'s. mic_off() holds this lock while it calls
-     * k_thread_abort(mic_thread_id), so unlocking first opens a window where a
-     * power-off aborts the thread between here and the start below — and
-     * k_thread_start() on an aborted thread does nothing, so the mic thread would
-     * never run again and no reset or resume could bring capture back. Reachable
-     * because transport_start() and button_init() both run BEFORE mic_start() in
-     * main(), so both power-off routes are already armed; the harm lands when
-     * turnoff_all() bails without the reboot recovery storage.c does. */
+    /* Inside the lock, like mic_on()'s, so no other mic call can act on mic_running
+     * before the thread that reads it exists. The thread is never aborted (see
+     * mic_off()), so this start is the only one it needs. */
     k_thread_start(mic_thread_id);
     k_mutex_unlock(&mic_state_lock);
 
@@ -353,8 +348,12 @@ void mic_off()
      * this stopped it. Irrelevant delay on the power-down path. */
     k_mutex_lock(&mic_state_lock, K_FOREVER);
     if (mic_running) {
+        /* Stop capture but keep the mic thread: with mic_running false it idles
+         * (mic_thread_function() sleeps instead of reading), exactly as during mute,
+         * so mic_on() can start capture again. This used to k_thread_abort() it, and
+         * k_thread_start() on an aborted thread does nothing, so after mic_off()
+         * nothing short of a reboot could bring capture back. */
         mic_running = false;
-        k_thread_abort(mic_thread_id);
 
         int ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_STOP);
         if (ret < 0) {
@@ -392,6 +391,9 @@ void mic_on()
         }
 
         mic_running = true;
+        /* A no-op once mic_start() has started the thread, which mic_off() no longer
+         * aborts. It matters only if mic_start()'s own START failed before it got that
+         * far, leaving the device configured but the thread never started. */
         k_thread_start(mic_thread_id);
 
         LOG_INF("Microphone restarted");

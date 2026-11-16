@@ -69,7 +69,7 @@ int watchdog_deinit(void)
      * a failure made turnoff_all() return TURNOFF_BAILED on EVERY power-off — so
      * the 4-tap-hold gesture and "Shutdown Omi" cold-rebooted instead of powering
      * off, and the critical-battery path (which deliberately does not reboot) left
-     * the device awake with BLE down and the mic thread aborted, i.e. permanently
+     * the device awake with BLE down and capture stopped, i.e. permanently
      * deaf on a nearly-flat cell.
      *
      * Nothing is lost by accepting it: sys_poweroff() enters System OFF, which

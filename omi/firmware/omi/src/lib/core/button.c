@@ -707,7 +707,7 @@ void check_button_level(struct k_work *work_item)
                 LOG_INF("Power off triggered via 4-tap-hold");
                 /* Match CMD_POWER_OFF (storage.c): a bailed teardown has already run
                  * transport_off() and mic_off(), so limping on leaves the device with
-                 * BLE down and the mic thread aborted by k_thread_abort(). A cold reboot
+                 * BLE down and capture stopped by mic_off(). A cold reboot
                  * restores those owners. Current firmware leaves PDM_EN undriven;
                  * this bailout no longer needs to restore a software-cut rail. */
                 if (turnoff_all() == TURNOFF_BAILED) {
