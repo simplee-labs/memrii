@@ -1,0 +1,174 @@
+# Builds and checks the firmware, and drafts firmware releases.
+#
+#   Push to any branch that changes omi/firmware/ (or this file)
+#       Host tests (no SDK), then a full nRF Connect SDK sysbuild build exactly as
+#       BUILD_AND_OTA_FLASH.md describes, then scripts/check_build.py on the output:
+#       deployed flash layout, update service requires pairing, MCUboot settings,
+#       both core images present and signed with the key field bootloaders trust,
+#       image version 0.0.0+0, one version.txt matching omi.conf. The packaged zip is
+#       kept as a workflow artifact for 14 days. Nothing is released.
+#   Push a tag (git tag memrii-fw-v3.2.1 && git push origin memrii-fw-v3.2.1)
+#       The same, then attaches memrii-fw-3.2.1.zip to a DRAFT release titled
+#       "memrii Firmware 3.2.1", created if it does not exist and never marked latest.
+#       The tag must match CONFIG_BT_DIS_FW_REV_STR in omi.conf. Add the release
+#       notes and publish it yourself.
+#   Actions tab → Firmware → Run workflow
+#       Builds and checks the branch you pick.
+#
+# The APK is built by release-apk.yml; firmware tags do not trigger it.
+
+name: Firmware
+
+on:
+  push:
+    branches: ['**']
+    tags: ['memrii-fw-v*']
+    paths: # not applied to tag pushes
+      - 'omi/firmware/**'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  NCS_VERSION: v2.9.0
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: sd_ring and packaging tests
+        run: omi/firmware/omi/tests/host/run.sh
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Nordic's toolchain image for this SDK version: toolchain only, no SDK sources.
+    container:
+      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.9.0
+    defaults:
+      run:
+        shell: bash # the toolchain environment is only loaded in bash sessions
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      # From $GITHUB_WORKSPACE, not ${{ github.workspace }}: in a container job the
+      # context holds the runner host's path, which does not exist in the container.
+      - name: Paths
+        run: |
+          {
+            echo "APP=$GITHUB_WORKSPACE/memrii/omi/firmware/omi"
+            echo "BUILD=$GITHUB_WORKSPACE/memrii/omi/firmware/omi/build/omi"
+            echo "NCS=$GITHUB_WORKSPACE/ncs"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          path: memrii
+
+      - name: Firmware version
+        id: version
+        run: |
+          version="$(tr -d '\r' < "$APP/omi.conf" | sed -n 's/^CONFIG_BT_DIS_FW_REV_STR="\(.*\)"$/\1/p')"
+          if [[ -z "$version" || "$version" == *$'\n'* ]]; then
+            echo "::error::omi.conf must set CONFIG_BT_DIS_FW_REV_STR exactly once."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            expected="memrii-fw-v${version#memrii-fw-}"
+            if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match omi.conf version $version (expected $expected)."
+              exit 1
+            fi
+          fi
+          echo "Firmware $version"
+
+      - name: nRF Connect SDK ${{ env.NCS_VERSION }}
+        run: |
+          git config --global --add safe.directory '*'
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr "$NCS_VERSION" "$NCS"
+          cd "$NCS"
+          west update --narrow -o=--depth=1
+
+      - name: Build
+        run: |
+          # MCUboot's public sample key, which installed bootloaders trust. It ships with the SDK.
+          export MEMRII_MCUBOOT_KEY_FILE="$NCS/bootloader/mcuboot/root-rsa-2048.pem"
+          cd "$NCS"
+          west build --sysbuild -b omi/nrf5340/cpuapp -d "$BUILD" "$APP" -- \
+            -DBOARD_ROOT="$(dirname "$APP")" \
+            -DCONF_FILE="$APP/omi.conf"
+
+      - name: Check the build
+        run: |
+          python3 "$APP/scripts/check_build.py" "$BUILD" \
+            --key "$NCS/bootloader/mcuboot/root-rsa-2048.pem" \
+            --imgtool "$NCS/bootloader/mcuboot/scripts/imgtool.py"
+
+      - name: Package
+        run: |
+          "$APP/package_firmware.sh" "${{ steps.version.outputs.version }}"
+          ls -l "$BUILD/${{ steps.version.outputs.version }}.zip"
+
+      # Paths relative to the workspace, for the same container reason as "Paths".
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.version }}
+          path: memrii/omi/firmware/omi/build/omi/${{ steps.version.outputs.version }}.zip
+          retention-days: 14
+          compression-level: 0 # already a zip
+
+      # The resolved layout and Kconfig of every build, also when a step failed: what
+      # to look at when a check fails, or when the layout needs reviewing.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: build-info-${{ github.run_id }}
+          path: |
+            memrii/omi/firmware/omi/build/omi/partitions*.yml
+            memrii/omi/firmware/omi/build/omi/omi/zephyr/.config
+            memrii/omi/firmware/omi/build/omi/mcuboot/zephyr/.config
+            memrii/omi/firmware/omi/build/omi/dfu_application.zip_manifest.json
+          retention-days: 14
+          if-no-files-found: ignore
+          include-hidden-files: true # .config
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [host-tests, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.build.outputs.version }}
+          path: release
+
+      - name: Attach to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          zip="release/$VERSION.zip"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$zip" --clobber --repo "$GITHUB_REPOSITORY"
+            echo "Attached $(basename "$zip") to release $GITHUB_REF_NAME"
+          else
+            gh release create "$GITHUB_REF_NAME" "$zip" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --latest=false \
+              --title "memrii Firmware ${VERSION#memrii-fw-}" \
+              --notes "Firmware built and checked by the Firmware workflow. Add the release notes, then publish."
+            echo "Created draft release $GITHUB_REF_NAME with $(basename "$zip")"
+          fi
