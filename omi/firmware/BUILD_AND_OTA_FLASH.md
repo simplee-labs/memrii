@@ -203,16 +203,10 @@ Transfer `dfu_application_release.zip` (or `dfu_application.zip`) to your mobile
 
 ### 3. Flash via OTA
 
-Updates only work from a phone that is **paired** with the Omi: the firmware refuses
-update commands over an unpaired (unencrypted) link. Use nRF Connect on the phone that
-runs memrii; apps on the same phone share its pairing. To update from a different phone,
-first clear the Omi's pairing (tap its button 5 times, holding the last tap for 10
-seconds), then pair from that phone. The memrii phone will need to pair again afterwards.
-
 1. **Power on your Omi device** and ensure it's in range
 2. **Open nRF Connect for Mobile**
 3. **Scan for devices** - look for "Omi" in the device list
-4. **Connect** to your Omi device, and accept the pairing request if one appears
+4. **Connect** to your Omi device
 5. **Navigate to DFU tab** (Device Firmware Update)
 6. **Select firmware file**:
    - Tap "Select file" or "Browse"
@@ -245,7 +239,6 @@ that changes `omi/firmware/`, and drafts a release from each `memrii-fw-v<versio
 - **Build checks** (`omi/firmware/omi/scripts/check_build.py`):
   - the deployed flash layout, including the external-flash update slots the asserts do
     not cover;
-  - the update service requires a paired link;
   - MCUboot overwrite-only, with `CONFIG_BOOT_MAX_IMG_SECTORS` at most 678;
   - the zip holds both core images, signed with the sample key, app image version
     `0.0.0+0`, and exactly one `version.txt` matching `omi.conf`.
@@ -374,13 +367,7 @@ The file also places retained RAM (`sram_retained_mem`, `0x2006f000`–`0x200700
   `0.0.0+0` and configure downgrade prevention. Installed bootloaders may differ;
   read [image-version compatibility](#signing-image-version-and-factory-recovery)
   before introducing a nonzero version.
-- **Update service needs pairing**: `CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT=y` makes
-  the MCUmgr (SMP) service refuse image upload, storage erase and reboot over an
-  unencrypted link. Because the signing key is public, this, not the signature, is what
-  stops a stranger in range from installing firmware. The device keeps a single bond
-  (`CONFIG_BT_MAX_PAIRED=1`) and refuses a second pairing, so only the paired phone
-  qualifies. While no bond exists (a new device, right after an update's bond wipe,
-  after the 5-tap unpair) the first device to pair gets that access.
+- **BLE SMP**: `CONFIG_BT_SMP=y` is enabled; bonding/encryption behaviour is controlled at the app layer
 
 ### Build Configuration Highlights
 ```

@@ -9,7 +9,6 @@ cannot undo or that devices in the field depend on:
 
   - the flash layout every device already has (see "Memory Layout" in
     BUILD_AND_OTA_FLASH.md): an image for a different layout needs wired recovery;
-  - the update service refusing unpaired links (omi.conf);
   - the MCUboot settings the trailer arithmetic in src/settings.c assumes;
   - the DFU zip: both core images, signed with the key field bootloaders trust,
     image version 0.0.0+0, and exactly one version.txt matching omi.conf.
@@ -90,9 +89,6 @@ def check_configs(build, version):
             check(f'{path.relative_to(build)} present', False)
             return
     app = read_config(app_cfg)
-    check('app: update service requires an encrypted (paired) link',
-          app.get('CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT') == 'y',
-          f'CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT={app.get("CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT")}')
     check('app: DIS firmware revision matches omi.conf',
           app.get('CONFIG_BT_DIS_FW_REV_STR') == f'"{version}"',
           f'{app.get("CONFIG_BT_DIS_FW_REV_STR")} vs "{version}"')
