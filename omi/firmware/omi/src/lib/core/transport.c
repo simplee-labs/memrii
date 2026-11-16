@@ -3268,6 +3268,63 @@ uint32_t transport_bond_count(void)
     return n;
 }
 
+/* Start the half of the audio pipeline this file owns: the codec thread and the pusher
+ * that carries its frames to the SD card. Called from transport_start() whether or not
+ * Bluetooth came up — see the bt_enable() failure path there. */
+static int start_audio_pipeline(void)
+{
+    ring_buf_init(&ring_buf, sizeof(tx_queue), tx_queue);
+    if (ring_buf_is_empty(&ring_buf)) {
+        LOG_INF("Ring buffer successfully initialized");
+    } else {
+        LOG_ERR("Ring buffer initialization failed");
+        return -1;
+    }
+
+    /* Priority 6: one step ABOVE the codec thread (7) that feeds it, since oo-3.1.4. At
+     * equal priority with no time slicing the codec encoded its whole backlog before
+     * the pusher ran once — the 40-frame pre-roll PLUS the live frames that kept
+     * arriving while it caught up, ~75-80 frames — so every frame past the ring's 32
+     * slots (each commits a full CODEC_OUTPUT_MAX_BYTES) died in write_to_tx_queue():
+     * 43 or 48 per speech onset, the lost ~0.9 s straddling the start of speech
+     * (DIAG_WRITE_BLOCKED_TX_RING_FULL; see diag_log.h). One step above, each
+     * k_sem_give() there readies the pusher, which preempts the codec and takes the
+     * frame at once. Still below the mic and AAD threads (5): the pusher must never
+     * delay capture. ring_buf needs no lock for this: one producer (the codec thread),
+     * one consumer (this thread). */
+    struct k_thread *thread = k_thread_create(&pusher_thread,
+                                              pusher_stack,
+                                              K_THREAD_STACK_SIZEOF(pusher_stack),
+                                              (k_thread_entry_t) pusher,
+                                              NULL,
+                                              NULL,
+                                              NULL,
+                                              K_PRIO_PREEMPT(6),
+                                              0,
+                                              K_NO_WAIT);
+    if (thread == NULL) {
+        LOG_ERR("Failed to create pusher thread");
+        return -1;
+    }
+    pusher_started = true;
+
+    LOG_INF("Pusher successfully started");
+
+    /* Wire the half of the audio pipeline this file owns: codec output → pusher ring
+     * buffer. The mic → codec half belongs to main.c, which registers mic_handler()
+     * after transport_start() returns and before mic_start(); see the note there. This
+     * used to also register an on_mic_audio() that fed the codec directly, and it was
+     * left here when AAD took the capture policy over in oo-1.4.0 — dead, because main.c
+     * overwrote it seven lines later, and removed in oo-3.1.3. Do not re-add a mic
+     * registration here: whichever of the two runs last wins, and this one bypasses the
+     * VAD gate entirely. */
+    set_codec_callback(on_codec_output);
+    codec_start();
+    LOG_INF("Audio pipeline wired: codec → pusher");
+
+    return 0;
+}
+
 // periodic advertising
 int transport_start()
 {
@@ -3329,6 +3386,14 @@ int transport_start()
     err = bt_enable(NULL);
     if (err) {
         LOG_ERR("Transport bluetooth init failed (err %d)", err);
+        /* Recording does not need the radio, so start the audio pipeline anyway.
+         * Returning straight away used to skip it: the codec ring was never
+         * initialised and the pusher never ran, so every captured frame was dropped
+         * as a codec drop and nothing reached the card — on a device whose job is
+         * offline recording, and with BLE down, no way to read the counters that
+         * would show it. A network core that does not answer after a dual-core
+         * update is one way to land here. The error still goes back to main(). */
+        (void) start_audio_pipeline();
         return err;
     }
 
@@ -3456,57 +3521,7 @@ int transport_start()
     k_work_schedule(&battery_work, K_MSEC(3000));
 #endif
 
-    // Start pusher
-    ring_buf_init(&ring_buf, sizeof(tx_queue), tx_queue);
-    if (ring_buf_is_empty(&ring_buf)) {
-        LOG_INF("Ring buffer successfully initialized");
-    } else {
-        LOG_ERR("Ring buffer initialization failed");
-        return -1;
-    }
-
-    /* Priority 6: one step ABOVE the codec thread (7) that feeds it, since oo-3.1.4. At
-     * equal priority with no time slicing the codec encoded its whole backlog before
-     * the pusher ran once — the 40-frame pre-roll PLUS the live frames that kept
-     * arriving while it caught up, ~75-80 frames — so every frame past the ring's 32
-     * slots (each commits a full CODEC_OUTPUT_MAX_BYTES) died in write_to_tx_queue():
-     * 43 or 48 per speech onset, the lost ~0.9 s straddling the start of speech
-     * (DIAG_WRITE_BLOCKED_TX_RING_FULL; see diag_log.h). One step above, each
-     * k_sem_give() there readies the pusher, which preempts the codec and takes the
-     * frame at once. Still below the mic and AAD threads (5): the pusher must never
-     * delay capture. ring_buf needs no lock for this: one producer (the codec thread),
-     * one consumer (this thread). */
-    struct k_thread *thread = k_thread_create(&pusher_thread,
-                                              pusher_stack,
-                                              K_THREAD_STACK_SIZEOF(pusher_stack),
-                                              (k_thread_entry_t) pusher,
-                                              NULL,
-                                              NULL,
-                                              NULL,
-                                              K_PRIO_PREEMPT(6),
-                                              0,
-                                              K_NO_WAIT);
-    if (thread == NULL) {
-        LOG_ERR("Failed to create pusher thread");
-        return -1;
-    }
-    pusher_started = true;
-
-    LOG_INF("Pusher successfully started");
-
-    /* Wire the half of the audio pipeline this file owns: codec output → pusher ring
-     * buffer. The mic → codec half belongs to main.c, which registers mic_handler()
-     * after this function returns and before mic_start(); see the note there. This used
-     * to also register an on_mic_audio() that fed the codec directly, and it was left
-     * here when AAD took the capture policy over in oo-1.4.0 — dead, because main.c
-     * overwrote it seven lines later, and removed in oo-3.1.3. Do not re-add a mic
-     * registration here: whichever of the two runs last wins, and this one bypasses the
-     * VAD gate entirely. */
-    set_codec_callback(on_codec_output);
-    codec_start();
-    LOG_INF("Audio pipeline wired: codec → pusher");
-
-    return 0;
+    return start_audio_pipeline();
 }
 
 struct bt_conn *get_current_connection()
